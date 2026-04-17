@@ -46,6 +46,10 @@ Open the folder in VS Code and press `F5` to launch the Extension Development Ho
 - Derives state from file mtime: `< 10s` → running, `> 24h` or terminator event → done, else idle
 - Stop uses `ps` + `lsof` to match the Claude process by `cwd`; POSIX only (macOS / Linux)
 
+## Privacy
+
+This extension reads the JSONL transcripts Claude Code writes to `~/.claude/projects/` — these may contain your prompts, assistant replies, and tool output (file contents, shell output, etc.). Everything stays local: no network calls, no telemetry, nothing is sent anywhere. The Stop action invokes `ps` / `lsof` locally to find the Claude process matching an agent's working directory.
+
 ## Limitations
 
 - macOS / Linux only for the Stop action. Everything else works cross-platform.
