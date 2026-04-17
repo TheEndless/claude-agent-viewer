@@ -19,16 +19,26 @@ Claude Code writes a JSONL transcript for each session under `~/.claude/projects
 
 ## Install
 
+Download the latest `.vsix` from the [Releases page](https://github.com/dipeshnx/agent-viewer/releases/latest), then install it:
+
 ```bash
-git clone git@github.com:dipeshnx/agent-viewer.git
+code --install-extension agent-viewer-<version>.vsix
+```
+
+Or from inside VS Code: `⌘⇧P` → **Extensions: Install from VSIX…** → select the downloaded file.
+
+Click the Agents icon in the Activity Bar once it's installed.
+
+## Build from source
+
+```bash
+git clone https://github.com/dipeshnx/agent-viewer.git
 cd agent-viewer
 npm install
 npm run build
 npx @vscode/vsce package
 code --install-extension agent-viewer-0.0.1.vsix
 ```
-
-Click the Agents icon in the Activity Bar.
 
 ## Develop
 
