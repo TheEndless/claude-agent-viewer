@@ -175,27 +175,23 @@ function labelFromEvent(evt: RawEvent): string | null {
   const type = typeof evt.type === 'string' ? evt.type : '';
   const content = evt.message?.content;
   if (type === 'assistant' && Array.isArray(content)) {
-    const toolUse = content.find(
-      (c): c is { type: 'tool_use'; name?: string; input?: Record<string, unknown> } =>
-        typeof c === 'object' && c !== null && (c as { type?: string }).type === 'tool_use',
-    );
+    const toolUse = content.find(isToolUse);
     if (toolUse?.name) return labelForToolUse(toolUse.name, toolUse.input);
-    const textPart = content.find(
-      (c): c is { type: 'text'; text?: string } =>
-        typeof c === 'object' && c !== null && (c as { type?: string }).type === 'text',
-    );
-    if (textPart) return 'Thinking';
+    if (content.some(isTextPart)) return 'Thinking';
   }
   if (type === 'user') {
-    if (Array.isArray(content) && content.some(
-      (c): boolean => typeof c === 'object' && c !== null && (c as { type?: string }).type === 'tool_result',
-    )) {
+    if (Array.isArray(content) && content.some(isPartOfType('tool_result'))) {
       return 'Processing tool result';
     }
     return 'Awaiting response';
   }
   if (type === 'summary') return 'Session ended';
   return null;
+}
+
+function isPartOfType(kind: string): (part: unknown) => boolean {
+  return (part) =>
+    typeof part === 'object' && part !== null && (part as { type?: string }).type === kind;
 }
 
 function labelForToolUse(name: string, input: Record<string, unknown> | undefined): string {
@@ -229,44 +225,34 @@ const MAX_TRAIL = 5;
 const MAX_FILES = 5;
 
 function extractDetails(events: RawEvent[]): AgentDetails {
-  let startedAt: number | null = null;
   const trail: ToolCallSummary[] = [];
   const files: string[] = [];
   let latestUserPrompt: string | null = null;
   let subagentCount = 0;
 
   for (const evt of events) {
-    const ts = parseTs(evt.timestamp);
-    if (ts !== null && (startedAt === null || ts < startedAt)) startedAt = ts;
-
     const type = typeof evt.type === 'string' ? evt.type : '';
     const content = evt.message?.content;
 
     if (type === 'assistant' && Array.isArray(content)) {
+      const ts = typeof evt.timestamp === 'string' ? Date.parse(evt.timestamp) || 0 : 0;
       for (const part of content) {
         if (!isToolUse(part)) continue;
         const name = typeof part.name === 'string' ? part.name : 'Tool';
-        trail.push({ name, summary: labelForToolUse(name, part.input), at: ts ?? 0 });
-        const filePath = pickFilePath(part.input);
-        if (filePath) files.push(filePath);
+        trail.push({ summary: labelForToolUse(name, part.input), at: ts });
+        const filePath = part.input?.file_path;
+        if (typeof filePath === 'string') files.push(filePath);
         if (name === 'Agent') subagentCount += 1;
       }
     }
 
-    if (type === 'user' && typeof evt.message?.content === 'string') {
-      const text = evt.message.content.trim();
+    if (type === 'user') {
+      const text = extractUserText(content);
       if (text) latestUserPrompt = truncate(text, 200);
-    } else if (type === 'user' && Array.isArray(content)) {
-      for (const part of content) {
-        if (isTextPart(part) && typeof part.text === 'string' && part.text.trim()) {
-          latestUserPrompt = truncate(part.text.trim(), 200);
-        }
-      }
     }
   }
 
   return {
-    startedAt,
     recentToolCalls: trail.slice(-MAX_TRAIL).reverse(),
     recentFiles: dedupeLastN(files, MAX_FILES),
     latestUserPrompt,
@@ -274,26 +260,28 @@ function extractDetails(events: RawEvent[]): AgentDetails {
   };
 }
 
-function parseTs(ts: unknown): number | null {
-  if (typeof ts !== 'string') return null;
-  const n = Date.parse(ts);
-  return Number.isFinite(n) ? n : null;
-}
-
 function isToolUse(
   part: unknown,
 ): part is { type: 'tool_use'; name?: string; input?: Record<string, unknown> } {
-  return typeof part === 'object' && part !== null && (part as { type?: string }).type === 'tool_use';
+  return isPartOfType('tool_use')(part);
 }
 
 function isTextPart(part: unknown): part is { type: 'text'; text?: string } {
-  return typeof part === 'object' && part !== null && (part as { type?: string }).type === 'text';
+  return isPartOfType('text')(part);
 }
 
-function pickFilePath(input: Record<string, unknown> | undefined): string | null {
-  if (!input) return null;
-  if (typeof input.file_path === 'string') return input.file_path;
-  return null;
+function extractUserText(content: unknown): string {
+  if (typeof content === 'string') return content.trim();
+  if (!Array.isArray(content)) return '';
+  // Last non-empty text part wins — matches the behavior the UI cares about
+  // (most recent prompt in a multi-part user message).
+  for (let i = content.length - 1; i >= 0; i--) {
+    const part = content[i];
+    if (isTextPart(part) && typeof part.text === 'string' && part.text.trim()) {
+      return part.text.trim();
+    }
+  }
+  return '';
 }
 
 function dedupeLastN(items: string[], n: number): string[] {

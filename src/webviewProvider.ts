@@ -313,11 +313,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       align-items: baseline;
       padding: 2px 0;
     }
-    .trail .trail-tool {
-      color: var(--vscode-symbolIcon-functionForeground, var(--vscode-foreground));
-      font-weight: 500;
-      flex-shrink: 0;
-    }
     .trail .trail-summary {
       color: var(--vscode-foreground);
       flex: 1;
@@ -466,57 +461,45 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return Math.floor(d / 86400000) + 'd ago';
     }
 
+    function detailRow(label, body) {
+      return \`<div class="detail-row"><div class="detail-label">\${label}</div>\${body}</div>\`;
+    }
+
+    function muted(text) {
+      return \`<div class="detail-value muted">\${text}</div>\`;
+    }
+
     function renderTrail(calls, now) {
-      if (!calls || calls.length === 0) {
-        return '<div class="detail-value muted">No recent tool calls</div>';
-      }
-      return '<ul class="trail">' + calls.map(c =>
-        '<li>' +
-          '<span class="trail-tool">' + esc(c.name) + '</span>' +
-          '<span class="trail-summary">' + esc(c.summary) + '</span>' +
-          (c.at ? '<span class="trail-time">' + esc(relTime(c.at, now)) + '</span>' : '') +
-        '</li>'
-      ).join('') + '</ul>';
+      if (!calls || calls.length === 0) return muted('No recent tool calls');
+      const items = calls.map(c => \`<li>
+        <span class="trail-summary">\${esc(c.summary)}</span>
+        \${c.at ? \`<span class="trail-time">\${esc(relTime(c.at, now))}</span>\` : ''}
+      </li>\`).join('');
+      return \`<ul class="trail">\${items}</ul>\`;
     }
 
     function renderFiles(files) {
-      if (!files || files.length === 0) {
-        return '<div class="detail-value muted">No files touched</div>';
-      }
-      return '<ul class="files">' + files.map(f => '<li>' + esc(f) + '</li>').join('') + '</ul>';
+      if (!files || files.length === 0) return muted('No files touched');
+      const items = files.map(f => \`<li>\${esc(f)}</li>\`).join('');
+      return \`<ul class="files">\${items}</ul>\`;
     }
 
     function renderDetails(a, now) {
       const d = a.details || {};
-      const started = d.startedAt
-        ? 'Started ' + esc(relTime(d.startedAt, now)) + ' · last activity ' + esc(relTime(a.mtimeMs, now))
-        : 'Last activity ' + esc(relTime(a.mtimeMs, now));
       const prompt = d.latestUserPrompt
-        ? '<div class="detail-value">' + esc(d.latestUserPrompt) + '</div>'
-        : '<div class="detail-value muted">No user prompt captured</div>';
+        ? \`<div class="detail-value">\${esc(d.latestUserPrompt)}</div>\`
+        : muted('No user prompt captured');
       const subagents = d.subagentCount > 0
-        ? '<div class="detail-row"><div class="detail-label">Subagents</div><div class="detail-value">' + d.subagentCount + ' spawned</div></div>'
+        ? detailRow('Subagents', \`<div class="detail-value">\${d.subagentCount} spawned</div>\`)
         : '';
-      return '<div class="card-details">' +
-        '<div class="detail-row">' +
-          '<div class="detail-label">Working directory</div>' +
-          '<div class="detail-value">' + esc(a.cwd) + '</div>' +
-        '</div>' +
-        '<div class="detail-row">' +
-          '<div class="detail-label">Timing</div>' +
-          '<div class="detail-value">' + started + '</div>' +
-        '</div>' +
-        '<div class="detail-row">' +
-          '<div class="detail-label">Latest user prompt</div>' + prompt +
-        '</div>' +
-        '<div class="detail-row">' +
-          '<div class="detail-label">Recent tool calls</div>' + renderTrail(d.recentToolCalls, now) +
-        '</div>' +
-        '<div class="detail-row">' +
-          '<div class="detail-label">Recent files</div>' + renderFiles(d.recentFiles) +
-        '</div>' +
-        subagents +
-      '</div>';
+      return \`<div class="card-details">
+        \${detailRow('Working directory', \`<div class="detail-value">\${esc(a.cwd)}</div>\`)}
+        \${detailRow('Last activity', \`<div class="detail-value">\${esc(relTime(a.mtimeMs, now))}</div>\`)}
+        \${detailRow('Latest user prompt', prompt)}
+        \${detailRow('Recent tool calls', renderTrail(d.recentToolCalls, now))}
+        \${detailRow('Recent files', renderFiles(d.recentFiles))}
+        \${subagents}
+      </div>\`;
     }
 
     function renderCard(a, now) {
@@ -559,6 +542,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function render(agents, now) {
+      // Drop expanded-state entries for agents that no longer exist.
+      const live = new Set(agents.map(a => a.sessionId));
+      for (const sid of expanded) if (!live.has(sid)) expanded.delete(sid);
+
       if (agents.length === 0) {
         root.className = 'empty-global';
         root.innerHTML = 'No agents yet \u2014 run <code>claude</code> in any project';
