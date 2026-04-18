@@ -60,7 +60,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       subagents: a.subagents.map(serialize),
     });
     const agents = this.agentService.getAgents().map(serialize);
-    this._view.webview.postMessage({ command: 'render', agents, now: Date.now() });
+    const ready = this.agentService.isReady();
+    this._view.webview.postMessage({ command: 'render', agents, ready, now: Date.now() });
   }
 
   private async handleMessage(message: { command: string; sessionId?: string }): Promise<void> {
@@ -605,7 +606,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       '</details>';
     }
 
-    function render(agents, now) {
+    function render(agents, now, ready) {
       // Drop expanded-state entries for agents that no longer exist (walk tree).
       const live = new Set();
       const collectIds = a => { live.add(a.sessionId); (a.subagents || []).forEach(collectIds); };
@@ -615,7 +616,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
       if (agents.length === 0) {
         root.className = 'empty-global';
-        root.innerHTML = 'No agents yet \u2014 run <code>claude</code> in any project';
+        root.innerHTML = ready
+          ? 'No agents yet \u2014 run <code>claude</code> in any project'
+          : 'Scanning\u2026';
         return;
       }
       root.className = '';
@@ -681,7 +684,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (msg && msg.command === 'render') render(msg.agents, msg.now);
+      if (msg && msg.command === 'render') render(msg.agents, msg.now, msg.ready);
     });
   </script>
 </body>

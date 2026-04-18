@@ -20,11 +20,15 @@ export class AgentService {
   private watcher?: chokidar.FSWatcher;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
+  private _ready = false;
   private _onDidChange = new vscode.EventEmitter<Agent[]>();
   readonly onDidChange = this._onDidChange.event;
 
+  isReady(): boolean { return this._ready; }
+
   start(): void {
     if (!fs.existsSync(PROJECTS_ROOT)) {
+      this._ready = true;
       this._onDidChange.fire([]);
       return;
     }
@@ -39,7 +43,8 @@ export class AgentService {
       .on('add', (p) => this.refreshFile(p))
       .on('change', (p) => this.refreshFile(p))
       .on('unlink', (p) => this.dropFile(p))
-      .on('error', (err) => console.error('[agent-viewer] watcher error:', err));
+      .on('error', (err) => console.error('[agent-viewer] watcher error:', err))
+      .on('ready', () => { this._ready = true; this.scheduleEmit(); });
 
     this.tickTimer = setInterval(() => this.reclassifyAll(), STATE_TICK_MS);
   }
