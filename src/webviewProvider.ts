@@ -189,13 +189,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 12px 0 8px;
+      padding: 8px 8px 6px;
       position: sticky;
       top: 0;
       background: var(--vscode-sideBar-background);
       z-index: 10;
     }
-
     .header h2 {
       font-size: 11px;
       font-weight: 600;
@@ -203,36 +202,36 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       letter-spacing: 0.5px;
       color: var(--vscode-sideBarSectionHeader-foreground);
     }
-
-    .auto-refresh-indicator {
-      font-size: 10px;
-      color: var(--vscode-disabledForeground);
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .pulse {
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      background: #3fb950;
-      animation: pulse 2s infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 0.3; }
-      50% { opacity: 1; }
-    }
-
-    .row-header {
-      display: flex;
-      align-items: center;
-      gap: 4px;
+    .header-refresh {
+      background: none;
+      border: none;
+      color: var(--vscode-icon-foreground);
       cursor: pointer;
-      user-select: none;
-      border-radius: 2px;
-      overflow: hidden;
+      padding: 2px 4px;
+      border-radius: 3px;
+      opacity: 0;
+      font-size: 13px;
+      transition: opacity 0.1s;
     }
-    .row-header:hover { background: var(--vscode-list-hoverBackground); }
+    .header:hover .header-refresh { opacity: 0.7; }
+    .header-refresh:hover { opacity: 1 !important; background: var(--vscode-toolbar-hoverBackground); }
+
+    .empty-global {
+      text-align: center;
+      padding: 24px 12px;
+      color: var(--vscode-disabledForeground);
+      font-size: 12px;
+    }
+
+    .status-dot {
+      flex-shrink: 0;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+    }
+    .status-dot.running { background: #3fb950; box-shadow: 0 0 4px rgba(63,185,80,0.5); }
+    .status-dot.idle    { background: #d29922; }
+    .status-dot.done    { background: #6e7681; }
 
     .row-caret {
       flex-shrink: 0;
@@ -245,36 +244,37 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-icon-foreground);
       opacity: 0.6;
     }
-    .row-group.open > .row-header > .row-caret { transform: rotate(90deg); }
+    .parent-row.open > .parent-header > .row-caret,
+    .archive-section.open > .archive-row > .row-caret { transform: rotate(90deg); }
 
-    .row-label {
+    .parent-header {
+      display: flex;
+      align-items: center;
+      height: 22px;
+      padding: 0 8px;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+      border-radius: 2px;
+    }
+    .parent-header:hover { background: var(--vscode-list-hoverBackground); }
+    .parent-header:hover .count-chip  { display: none; }
+    .parent-header:hover .row-time    { display: none; }
+    .parent-header:hover .row-actions { opacity: 1; }
+
+    .parent-prompt {
       flex: 1;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
       min-width: 0;
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--vscode-sideBarSectionHeader-foreground);
-    }
-    .row-label.proj {
-      font-weight: 400;
-      text-transform: none;
-      letter-spacing: 0;
-      color: var(--vscode-foreground);
-      direction: rtl;
-      unicode-bidi: plaintext;
-    }
-    .row-label.sub {
+      font-size: 13px;
       font-weight: 500;
-      text-transform: none;
-      letter-spacing: 0;
       color: var(--vscode-foreground);
     }
+    .parent-prompt.no-prompt { color: var(--vscode-disabledForeground); }
 
-    .row-count {
+    .count-chip {
       font-size: 10px;
       background: var(--vscode-badge-background);
       color: var(--vscode-badge-foreground);
@@ -286,180 +286,73 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       flex-shrink: 0;
     }
 
-    .row-body { display: none; }
-    .row-group.open > .row-body { display: block; }
-
-    .top-group > .row-header  { padding: 6px 8px; }
-    .proj-group > .row-header { padding: 3px 8px 3px 16px; }
-    .sub-group  > .row-header { padding: 3px 8px 3px 24px; }
-    .sub-group  > .row-body > .card { margin: 2px 8px 2px 32px; }
-
-    .empty {
-      padding: 4px 14px;
+    .row-time {
+      font-size: 10px;
       color: var(--vscode-disabledForeground);
-      font-size: 11px;
+      flex-shrink: 0;
     }
 
-    .card {
-      background: var(--vscode-editor-background);
-      border: 1px solid var(--vscode-widget-border, transparent);
-      border-radius: 4px;
-      padding: 5px 8px;
-      margin: 2px 0;
-      cursor: pointer;
-    }
-    .card:hover {
-      background: var(--vscode-list-hoverBackground);
-    }
-    .card:hover .card-actions { opacity: 1; }
+    .parent-body { display: none; }
+    .parent-row.open > .parent-body { display: block; }
 
-    .card-details {
-      display: none;
-      margin-top: 10px;
-      padding-top: 8px;
-      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      cursor: default;
-    }
-    .card.expanded .card-details { display: block; }
-
-    .detail-row {
-      margin-bottom: 6px;
-      line-height: 1.5;
-    }
-    .detail-label {
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      font-size: 9px;
-      color: var(--vscode-sideBarSectionHeader-foreground);
-      margin-bottom: 2px;
-    }
-    .detail-value {
-      color: var(--vscode-foreground);
-      word-break: break-all;
-    }
-    .detail-value.muted {
-      color: var(--vscode-descriptionForeground);
-    }
-
-    .trail {
-      list-style: none;
-      padding: 0;
-      margin: 0;
-    }
-    .trail li {
+    .parent-secondary {
       display: flex;
-      gap: 6px;
-      align-items: baseline;
-      padding: 2px 0;
+      align-items: center;
+      height: 18px;
+      padding: 0 8px 0 20px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      overflow: hidden;
+      white-space: nowrap;
     }
-    .trail .trail-summary {
-      color: var(--vscode-foreground);
+    .parent-secondary .proj-path {
       flex: 1;
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
+      direction: rtl;
+      unicode-bidi: plaintext;
     }
-    .trail .trail-time {
-      color: var(--vscode-disabledForeground);
-      font-size: 10px;
+    .parent-secondary .sep {
       flex-shrink: 0;
+      padding: 0 4px;
+      color: var(--vscode-disabledForeground);
+    }
+    .parent-secondary .p-mtime {
+      flex-shrink: 0;
+      color: var(--vscode-disabledForeground);
     }
 
-    .files {
-      list-style: none;
-      padding: 0;
-      margin: 0;
-    }
-    .files li {
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 10px;
-      color: var(--vscode-textLink-foreground);
-      padding: 1px 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .chev {
-      color: var(--vscode-icon-foreground);
-      opacity: 0.5;
-      font-size: 9px;
-      margin-left: 6px;
-      transition: transform 0.1s ease;
-      display: inline-block;
-    }
-    .card.expanded .chev { transform: rotate(90deg); }
-
-    .sub-toggle {
+    .subagent-row {
       display: flex;
       align-items: center;
+      height: 22px;
+      padding: 0 8px 0 20px;
       gap: 4px;
-      padding: 5px 2px 2px;
-      font-size: 10px;
-      color: var(--vscode-descriptionForeground);
       cursor: pointer;
       user-select: none;
-      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
-      margin-top: 6px;
+      border-radius: 2px;
     }
-    .sub-toggle:hover { color: var(--vscode-foreground); }
-    .sub-caret {
-      display: inline-block;
-      font-size: 8px;
-      transition: transform 0.1s ease;
-    }
-.card-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
+    .subagent-row:hover { background: var(--vscode-list-hoverBackground); }
+    .subagent-row:hover .row-time    { display: none; }
+    .subagent-row:hover .row-actions { opacity: 1; }
+    .subagent-row.done-sub { opacity: 0.6; }
 
-    .card-info { flex: 1; min-width: 0; }
-
-    .card-name {
-      font-size: 13px;
-      font-weight: 500;
+    .sub-task {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+      font-size: 12px;
       color: var(--vscode-foreground);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      display: flex;
-      align-items: center;
-    }
-    .card-meta {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      margin-top: 2px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
     }
 
-    .status-dot {
-      display: inline-block;
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      margin-right: 6px;
-      flex-shrink: 0;
-    }
-    .status-dot.running {
-      background: #3fb950;
-      box-shadow: 0 0 6px rgba(63, 185, 80, 0.4);
-    }
-    .status-dot.idle { background: #d29922; }
-    .status-dot.done { background: #6e7681; }
-
-    .card-actions {
+    .row-actions {
       display: flex;
       align-items: center;
       gap: 2px;
       opacity: 0;
-      transition: opacity 0.15s;
       flex-shrink: 0;
     }
     .action-btn {
@@ -479,12 +372,29 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
     .action-btn.danger:hover { color: #f85149; }
 
-    .empty-global {
-      text-align: center;
-      padding: 24px 12px;
-      color: var(--vscode-disabledForeground);
-      font-size: 12px;
+    .archive-divider {
+      border: none;
+      border-top: 1px solid var(--vscode-input-border, rgba(128,128,128,0.2));
+      margin: 6px 0 2px;
     }
+    .archive-row {
+      display: flex;
+      align-items: center;
+      height: 22px;
+      padding: 0 8px;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+      border-radius: 2px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .archive-row:hover { background: var(--vscode-list-hoverBackground); }
+    .archive-label { flex: 1; }
+    .archive-count { color: var(--vscode-disabledForeground); flex-shrink: 0; }
+
+    .archive-body { display: none; opacity: 0.6; }
+    .archive-section.open > .archive-body { display: block; }
   </style>
 </head>
 <body>
