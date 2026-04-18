@@ -442,77 +442,91 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     const CARET = '<span class="row-caret"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
 
-    function renderSubGroup(label, stateKey, agents, now, cwd) {
-      if (agents.length === 0) return '';
-      const key = 'sub:' + stateKey + ':' + cwd;
-      const open = openSections[key] !== undefined ? openSections[key] : (stateKey === 'active');
-      const dotCls = stateKey === 'active' ? 'running' : stateKey === 'idle' ? 'idle' : 'done';
-      const cards = agents.sort((a, b) => b.mtimeMs - a.mtimeMs).map(a => renderCard(a, now, 0)).join('');
-      return '<div class="row-group sub-group' + (open ? ' open' : '') + '" data-key="' + esc(key) + '">' +
-        '<div class="row-header">' +
-          CARET +
-          '<span class="status-dot ' + dotCls + '"></span>' +
-          '<span class="row-label sub">' + label + '</span>' +
-          '<span class="row-count">' + agents.length + '</span>' +
-        '</div>' +
-        '<div class="row-body">' + cards + '</div>' +
-      '</div>';
-    }
-
-    function renderProjectSection(cwd, agents, now) {
-      const key = 'proj:' + cwd;
-      const open = openSections[key] !== undefined ? openSections[key] : false;
-      const topState = agents.some(a => a.state === 'running') ? 'running'
-                     : agents.some(a => a.state === 'idle') ? 'idle' : 'done';
-      const active = agents.filter(a => a.state === 'running');
-      const idle   = agents.filter(a => a.state === 'idle');
-      const done   = agents.filter(a => a.state === 'done');
-      return '<div class="row-group proj-group' + (open ? ' open' : '') + '" data-key="' + esc(key) + '">' +
-        '<div class="row-header">' +
-          CARET +
-          '<span class="status-dot ' + topState + '"></span>' +
-          '<span class="row-label proj">' + esc(cwd) + '</span>' +
-          '<span class="row-count">' + agents.length + '</span>' +
-        '</div>' +
-        '<div class="row-body">' +
-          renderSubGroup('Active', 'active', active, now, cwd) +
-          renderSubGroup('Idle', 'idle', idle, now, cwd) +
-          renderSubGroup('Done', 'done', done, now, cwd) +
+    function renderSubagentRow(sub, now) {
+      const task = sub.taskDescription || (sub.details && sub.details.latestUserPrompt) || sub.sessionId.slice(0, 8);
+      const doneCls = sub.state === 'done' ? ' done-sub' : '';
+      const stopBtn = sub.state === 'running'
+        ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
+        : '';
+      return '<div class="subagent-row' + doneCls + '" data-sid="' + esc(sub.sessionId) + '">' +
+        '<span class="status-dot ' + esc(sub.state) + '"></span>' +
+        '<span class="sub-task">' + esc(task) + '</span>' +
+        '<span class="row-time">\u00b7 ' + relTimeShort(sub.mtimeMs, now) + '</span>' +
+        '<div class="row-actions">' +
+          '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+          '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
+          stopBtn +
+          '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
         '</div>' +
       '</div>';
     }
 
-    function renderTopSection(label, stateKey, projects, now) {
-      if (projects.length === 0) return '';
-      const key = 'top:' + stateKey;
-      const open = openSections[key] !== undefined ? openSections[key] : (stateKey === 'active');
-      const sorted = [...projects].sort((a, b) =>
-        Math.max(...b[1].map(x => x.mtimeMs)) - Math.max(...a[1].map(x => x.mtimeMs))
-      );
-      const dotCls = stateKey === 'active' ? 'running' : stateKey === 'idle' ? 'idle' : 'done';
-      const total = projects.reduce((s, [, a]) => s + a.length, 0);
-      return '<div class="row-group top-group' + (open ? ' open' : '') + '" data-key="' + esc(key) + '">' +
-        '<div class="row-header">' +
+    function renderParent(parent, now) {
+      const key = 'parent:' + parent.sessionId;
+      const subs = parent.subagents || [];
+      const effState = parentEffectiveState(parent);
+      const defaultOpen = effState === 'running' && subs.length > 0;
+      const open = openSections[key] !== undefined ? openSections[key] : defaultOpen;
+
+      const prompt = parent.details && parent.details.latestUserPrompt;
+      const promptHtml = prompt
+        ? '<span class="parent-prompt">' + esc(prompt) + '</span>'
+        : '<span class="parent-prompt no-prompt">(no prompt yet)</span>';
+
+      const countHtml = subs.length > 0
+        ? '<span class="count-chip">' + subs.length + '</span>'
+        : '';
+
+      const stopBtn = effState === 'running'
+        ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
+        : '';
+
+      const subRows = subs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .map(s => renderSubagentRow(s, now)).join('');
+
+      return '<div class="parent-row' + (open ? ' open' : '') + '" data-key="' + esc(key) + '" data-sid="' + esc(parent.sessionId) + '">' +
+        '<div class="parent-header">' +
           CARET +
-          '<span class="status-dot ' + dotCls + '"></span>' +
-          '<span class="row-label">' + label + '</span>' +
-          '<span class="row-count">' + total + '</span>' +
+          '<span class="status-dot ' + effState + '"></span>' +
+          promptHtml +
+          countHtml +
+          '<span class="row-time">\u00b7 ' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
+          '<div class="row-actions">' +
+            '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+            '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
+            stopBtn +
+            '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
+          '</div>' +
         '</div>' +
-        '<div class="row-body">' +
-          sorted.map(([cwd, proj]) => renderProjectSection(cwd, proj, now)).join('') +
+        '<div class="parent-body">' +
+          '<div class="parent-secondary">' +
+            '<span class="proj-path">' + esc(parent.cwd) + '</span>' +
+            '<span class="sep">\u00b7</span>' +
+            '<span class="p-mtime">' + relTimeShort(parent.mtimeMs, now) + '</span>' +
+          '</div>' +
+          subRows +
         '</div>' +
       '</div>';
+    }
+
+    function renderArchive(doneParents, now) {
+      const open = openSections['archive'] || false;
+      const count = doneParents.length;
+      return '<hr class="archive-divider">' +
+        '<div class="archive-section' + (open ? ' open' : '') + '" data-key="archive">' +
+          '<div class="archive-row">' +
+            CARET +
+            '<span class="archive-label">' + (open ? 'Hide archive' : 'Show archive') + '</span>' +
+            '<span class="archive-count">' + count + ' session' + (count !== 1 ? 's' : '') + '</span>' +
+          '</div>' +
+          '<div class="archive-body">' +
+            doneParents.map(p => renderParent(p, now)).join('') +
+          '</div>' +
+        '</div>';
     }
 
     function render(agents, now, ready) {
-      // Drop expanded-state entries for agents that no longer exist (walk tree).
-      const live = new Set();
-      const collectIds = a => { live.add(a.sessionId); (a.subagents || []).forEach(collectIds); };
-      agents.forEach(collectIds);
-      for (const sid of [...expanded]) if (!live.has(sid)) expanded.delete(sid);
-      for (const key of [...subExpanded]) if (!live.has(key.split(':')[0])) subExpanded.delete(key);
-
-      if (agents.length === 0) {
+      if (!agents || agents.length === 0) {
         root.className = 'empty-global';
         root.innerHTML = ready
           ? 'No agents yet \u2014 run <code>claude</code> in any project'
@@ -520,25 +534,20 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
       root.className = '';
-      const topLevel = agents.filter(a => !a.parentSessionId);
 
-      const projectMap = new Map();
-      topLevel.forEach(a => {
-        if (!projectMap.has(a.cwd)) projectMap.set(a.cwd, []);
-        projectMap.get(a.cwd).push(a);
-      });
+      const parents = agents.filter(a => !a.parentSessionId);
 
-      const activeProjects = [], idleProjects = [], doneProjects = [];
-      for (const entry of projectMap) {
-        if (entry[1].some(a => a.state === 'running')) activeProjects.push(entry);
-        else if (entry[1].some(a => a.state === 'idle')) idleProjects.push(entry);
-        else doneProjects.push(entry);
-      }
+      const primary = parents.filter(p =>
+        parentEffectiveState(p) !== 'done' || (p.subagents || []).some(s => s.state === 'running')
+      );
+      const archive = parents.filter(p =>
+        parentEffectiveState(p) === 'done' && !(p.subagents || []).some(s => s.state === 'running')
+      );
 
-      root.innerHTML =
-        renderTopSection('Active', 'active', activeProjects, now) +
-        renderTopSection('Idle', 'idle', idleProjects, now) +
-        renderTopSection('Done', 'done', doneProjects, now);
+      primary.sort((a, b) => parentMaxMtime(b) - parentMaxMtime(a));
+      archive.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      root.innerHTML = primary.map(p => renderParent(p, now)).join('') + renderArchive(archive, now);
     }
 
     root.addEventListener('click', (e) => {
