@@ -180,36 +180,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       padding: 0 0 16px;
     }
 
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 8px 6px;
-      position: sticky;
-      top: 0;
-      background: var(--vscode-sideBar-background);
-      z-index: 10;
-    }
-    .header h2 {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--vscode-sideBarSectionHeader-foreground);
-    }
-    .header-refresh {
-      background: none;
-      border: none;
-      color: var(--vscode-icon-foreground);
-      cursor: pointer;
-      padding: 2px 4px;
-      border-radius: 3px;
-      opacity: 0;
-      font-size: 13px;
-      transition: opacity 0.1s;
-    }
-    .header:hover .header-refresh { opacity: 0.7; }
-    .header-refresh:hover { opacity: 1 !important; background: var(--vscode-toolbar-hoverBackground); }
 
     .empty-global {
       text-align: center;
@@ -392,10 +362,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   </style>
 </head>
 <body>
-  <div class="header">
-    <h2>Agents</h2>
-    <button class="header-refresh" id="refresh-btn" title="Refresh">&#x21bb;</button>
-  </div>
   <div id="root" class="empty-global">Loading agents…</div>
 
   <script>
@@ -457,7 +423,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     function renderParent(parent, now) {
       const key = 'parent:' + parent.sessionId;
-      const subs = parent.subagents || [];
+      const allSubs = parent.subagents || [];
+      const subs = allSubs.filter(s => s.state !== 'done');
       const effState = parentEffectiveState(parent);
       const defaultOpen = effState === 'running' && subs.length > 0;
       const open = openSections[key] !== undefined ? openSections[key] : defaultOpen;
@@ -593,10 +560,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
         return;
       }
-    });
-
-    document.getElementById('refresh-btn')?.addEventListener('click', () => {
-      vscode.postMessage({ command: 'refresh' });
     });
 
     window.addEventListener('message', (event) => {

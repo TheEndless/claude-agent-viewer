@@ -9,6 +9,8 @@ import { buildTree } from './agentTree';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
+const HEAD_BYTES = 2 * 1024;
+const TITLE_EVENT_TYPES = new Set(['ai-title', 'custom-title']);
 const KEEP_EVENTS = 20;
 const RUNNING_WINDOW_MS = 5 * 60 * 1000;
 const DONE_AGE_MS = 6 * 60 * 60 * 1000;
@@ -75,26 +77,42 @@ export class AgentService {
   }
 
   private async tailEvents(filePath: string, size: number): Promise<RawEvent[]> {
-    const start = Math.max(0, size - TAIL_BYTES);
+    const tailStart = Math.max(0, size - TAIL_BYTES);
     const handle = await fsp.open(filePath, 'r');
     try {
-      const length = size - start;
-      const buf = Buffer.alloc(length);
-      await handle.read(buf, 0, length, start);
-      const text = buf.toString('utf8');
-      const lines = text.split('\n');
-      // If we're mid-file, the first line is partial — drop it.
-      if (start > 0) lines.shift();
-      const events: RawEvent[] = [];
-      for (const line of lines) {
+      const tailLen = size - tailStart;
+      const tailBuf = Buffer.alloc(tailLen);
+      await handle.read(tailBuf, 0, tailLen, tailStart);
+      const tailText = tailBuf.toString('utf8');
+      const tailLines = tailText.split('\n');
+      if (tailStart > 0) tailLines.shift(); // drop partial first line
+      const tailEvents: RawEvent[] = [];
+      for (const line of tailLines) {
         if (!line) continue;
-        try {
-          events.push(JSON.parse(line) as RawEvent);
-        } catch {
-          // Partial/malformed line — skip.
-        }
+        try { tailEvents.push(JSON.parse(line) as RawEvent); } catch { /* skip */ }
       }
-      return events.slice(-KEEP_EVENTS);
+
+      // For long files, also read the head to capture title events (ai-title, custom-title)
+      // that were written early in the session and fall outside the tail window.
+      if (tailStart > HEAD_BYTES) {
+        const headBuf = Buffer.alloc(HEAD_BYTES);
+        await handle.read(headBuf, 0, HEAD_BYTES, 0);
+        const headLines = headBuf.toString('utf8').split('\n');
+        headLines.pop(); // last line is likely partial
+        const titleEvents: RawEvent[] = [];
+        for (const line of headLines) {
+          if (!line) continue;
+          try {
+            const evt = JSON.parse(line) as RawEvent;
+            if (typeof evt.type === 'string' && TITLE_EVENT_TYPES.has(evt.type)) {
+              titleEvents.push(evt);
+            }
+          } catch { /* skip */ }
+        }
+        return [...titleEvents, ...tailEvents.slice(-KEEP_EVENTS)];
+      }
+
+      return tailEvents.slice(-KEEP_EVENTS);
     } finally {
       await handle.close();
     }
