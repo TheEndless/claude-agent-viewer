@@ -380,14 +380,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       transition: transform 0.1s ease;
     }
     .sub-group-label {
-      font-size: 9px;
+      font-size: 10px;
       font-weight: 600;
-      letter-spacing: 0.06em;
+      letter-spacing: 0.05em;
       text-transform: uppercase;
-      color: var(--vscode-descriptionForeground);
-      padding: 4px 2px 2px;
-      margin-top: 2px;
-      opacity: 0.7;
+      color: var(--vscode-foreground);
+      padding: 6px 2px 2px;
+      margin-top: 4px;
+      opacity: 0.55;
+      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
     }
 
     .card-top {
@@ -559,14 +560,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
             subs.length + ' subagent' + (subs.length > 1 ? 's' : '') +
           '</div>'
         : '';
-      const subGroupHtml = (label, list) =>
-        list.length === 0 ? '' :
-        '<div class="sub-group-label">' + label + '</div>' +
-        list.map(s => renderCard(s, now, indent + 1)).join('');
+      const activeHtml = activeSubs.length === 0 ? '' :
+        '<div class="sub-group-label">Active</div>' +
+        activeSubs.map(s => renderCard(s, now, indent + 1)).join('');
+      const inactiveHtml = inactiveSubs.length === 0 ? '' :
+        '<div class="sub-group-label">Inactive</div>' +
+        inactiveSubs.map(s => renderCard(s, now, indent + 1)).join('');
       const subListHtml = hasSubs
         ? '<div class="subagents-list"' + (subsExpanded ? '' : ' style="display:none"') + '>' +
-            subGroupHtml('Active', activeSubs) +
-            subGroupHtml('Inactive', inactiveSubs) +
+            activeHtml + inactiveHtml +
           '</div>'
         : '';
       return '<div class="card' + (isOpen ? ' expanded' : '') + (indent > 0 ? ' subagent-card' : '') + '" data-sid="' + esc(a.sessionId) + '" style="' + (indent > 0 ? 'margin-left:16px;border-left:2px solid var(--vscode-panel-border);' : '') + '">' +
