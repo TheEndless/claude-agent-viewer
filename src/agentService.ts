@@ -152,9 +152,11 @@ function assignTaskDescriptions(agents: Map<string, Agent>): void {
     const descs = parent.agentCallDescs ?? [];
     const sorted = [...parent.subagents].sort((a, b) => a.mtimeMs - b.mtimeMs);
     sorted.forEach((sub, i) => {
-      sub.taskDescription = descs[i]
-        ?? sub.details.latestUserPrompt
-        ?? sub.sessionId.slice(0, 8);
+      if (!sub.taskDescription) {
+        sub.taskDescription = descs[i]
+          ?? sub.details.latestUserPrompt
+          ?? sub.sessionId.slice(0, 8);
+      }
     });
   }
 }

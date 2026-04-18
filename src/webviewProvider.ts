@@ -84,9 +84,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       case 'previewTranscript':
         openTranscriptPreview(agent);
         return;
-      case 'viewTranscript':
-        await this.viewTranscript(agent);
-        return;
       case 'openFolder':
         await this.openFolder(agent);
         return;
@@ -99,14 +96,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async viewTranscript(agent: Agent): Promise<void> {
-    try {
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(agent.transcriptPath));
-      await vscode.window.showTextDocument(doc, { preview: true });
-    } catch (err) {
-      vscode.window.showErrorMessage(`Could not open transcript: ${(err as Error).message}`);
-    }
-  }
 
   private async openFolder(agent: Agent): Promise<void> {
     const uri = vscode.Uri.file(agent.cwd);
@@ -493,7 +482,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return '<div class="parent-row' + (open ? ' open' : '') + '" data-key="' + esc(key) + '" data-sid="' + esc(parent.sessionId) + '">' +
         '<div class="parent-header">' +
           CARET +
-          '<span class="status-dot ' + effState + '"></span>' +
+          '<span class="status-dot ' + esc(effState) + '"></span>' +
           promptHtml +
           countHtml +
           '<span class="row-time">\u00b7 ' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
@@ -606,7 +595,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    document.getElementById('refresh-btn').addEventListener('click', () => {
+    document.getElementById('refresh-btn')?.addEventListener('click', () => {
       vscode.postMessage({ command: 'refresh' });
     });
 
