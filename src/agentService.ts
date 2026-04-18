@@ -128,7 +128,7 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[]): Agen
   const state = classifyState(mtimeMs, Date.now(), terminated);
   const activity = deriveActivity(events, state);
   const details = extractDetails(events);
-  return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details };
+  return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details, subagents: [] };
 }
 
 function sessionIdFromPath(filePath: string): string {
