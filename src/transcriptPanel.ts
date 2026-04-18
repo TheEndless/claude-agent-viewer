@@ -93,7 +93,7 @@ function renderAssistantTurn(turn: Turn): string {
 function renderEntry(entry: TurnEntry): string {
   const kindClass = entry.kind.replace('_', '-');
   const icon = entryIcon(entry.kind);
-  return `<div class="entry ${kindClass}" onclick="toggle(event,this)">
+  return `<div class="entry ${kindClass}">
     <div class="entry-row">
       <span class="entry-caret"><svg><use href="#icon-chevron"/></svg></span>
       <div class="pill"><span>${icon}</span><span class="p-text">${esc(entry.label)}</span><span class="p-ts" data-iso="${esc(entry.timestamp)}"></span></div>
@@ -115,7 +115,7 @@ function renderAttachment(att: TurnAttachment): string {
   if (att.type === 'image' && att.data && att.mediaType) {
     const src = `data:${esc(att.mediaType)};base64,${att.data}`;
     const name = esc(att.name ?? 'image');
-    return `<div class="attach-image" onclick="openLightbox(this)">
+    return `<div class="attach-image">
       <img src="${src}" alt="${name}">
       <span class="img-badge">${name}</span>
     </div>`;
@@ -259,7 +259,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
   </symbol>
 </svg>
 
-<div class="lightbox" id="lightbox" onclick="closeLightbox()">
+<div class="lightbox" id="lightbox">
   <img id="lightbox-img" src="" alt="">
 </div>
 
@@ -305,7 +305,15 @@ ${turnsHtml}
       }
       if (line.trim() === '') { i++; continue; }
       const para = [];
-      while (i < lines.length && lines[i].trim() !== '' && !/^[#>\`*+\-\d]/.test(lines[i])) { para.push(lines[i]); i++; }
+      while (i < lines.length
+             && lines[i].trim() !== ''
+             && !lines[i].startsWith('\`\`\`')
+             && !/^#{1,3}\s/.test(lines[i])
+             && !lines[i].startsWith('> ')
+             && !/^[-*+]\s/.test(lines[i])
+             && !/^\d+\.\s/.test(lines[i])) {
+        para.push(lines[i]); i++;
+      }
       if (para.length) result.push('<p>' + inlineMd(para.join(' ')) + '</p>');
       else i++;
     }
@@ -359,18 +367,25 @@ ${turnsHtml}
   document.querySelectorAll('.turn-ts[data-iso]').forEach(el => el.textContent = fmtFull(el.dataset.iso));
   document.querySelectorAll('.p-ts[data-iso]').forEach(el => el.textContent = fmtTime(el.dataset.iso));
 
-  function toggle(e, el) {
-    if (e.target.closest('.entry-body')) return;
-    el.classList.toggle('open');
-  }
-
-  function openLightbox(el) {
-    document.getElementById('lightbox-img').src = el.querySelector('img').src;
-    document.getElementById('lightbox').classList.add('open');
-  }
-  function closeLightbox() {
+  document.getElementById('scroll').addEventListener('click', e => {
+    const target = e.target;
+    // Entry expand/collapse
+    const entryRow = target.closest('.entry-row');
+    if (entryRow && !target.closest('.entry-body')) {
+      entryRow.closest('.entry').classList.toggle('open');
+      return;
+    }
+    // Lightbox open
+    const img = target.closest('.attach-image');
+    if (img) {
+      document.getElementById('lightbox-img').src = img.querySelector('img').src;
+      document.getElementById('lightbox').classList.add('open');
+      return;
+    }
+  });
+  document.getElementById('lightbox').addEventListener('click', () => {
     document.getElementById('lightbox').classList.remove('open');
-  }
+  });
 </script>
 </body>
 </html>`;
