@@ -408,12 +408,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
 
-    // Preserve <details> open state across re-renders, keyed by project name.
+    // Preserved expand state: keys are 'parent:<sessionId>' and 'archive'.
     const openSections = {};
-    // Preserve per-card expanded state across re-renders.
-    const expanded = new Set();
-    // Tracks which parent cards have their subagent list expanded (collapsed by default).
-    const subExpanded = new Set();
 
     function esc(s) {
       return String(s)
@@ -423,99 +419,25 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         .replace(/"/g, '&quot;');
     }
 
-    function relTime(ms, now) {
+    function relTimeShort(ms, now) {
       const d = now - ms;
       if (d < 10000) return 'now';
-      if (d < 60000) return Math.floor(d / 1000) + 's ago';
-      if (d < 3600000) return Math.floor(d / 60000) + 'm ago';
-      if (d < 86400000) return Math.floor(d / 3600000) + 'h ago';
-      return Math.floor(d / 86400000) + 'd ago';
+      if (d < 60000) return Math.floor(d / 1000) + 's';
+      if (d < 3600000) return Math.floor(d / 60000) + 'm';
+      if (d < 86400000) return Math.floor(d / 3600000) + 'h';
+      return Math.floor(d / 86400000) + 'd';
     }
 
-    function detailRow(label, body) {
-      return \`<div class="detail-row"><div class="detail-label">\${label}</div>\${body}</div>\`;
+    function parentEffectiveState(p) {
+      const subs = p.subagents || [];
+      if (p.state === 'running' || subs.some(s => s.state === 'running')) return 'running';
+      if (p.state === 'idle'    || subs.some(s => s.state === 'idle'))    return 'idle';
+      return 'done';
     }
 
-    function muted(text) {
-      return \`<div class="detail-value muted">\${text}</div>\`;
-    }
-
-    function renderTrail(calls, now) {
-      if (!calls || calls.length === 0) return muted('No recent tool calls');
-      const items = calls.map(c => \`<li>
-        <span class="trail-summary">\${esc(c.summary)}</span>
-        \${c.at ? \`<span class="trail-time">\${esc(relTime(c.at, now))}</span>\` : ''}
-      </li>\`).join('');
-      return \`<ul class="trail">\${items}</ul>\`;
-    }
-
-    function renderFiles(files) {
-      if (!files || files.length === 0) return muted('No files touched');
-      const items = files.map(f => \`<li>\${esc(f)}</li>\`).join('');
-      return \`<ul class="files">\${items}</ul>\`;
-    }
-
-    function renderDetails(a, now) {
-      const d = a.details || {};
-      const prompt = d.latestUserPrompt
-        ? \`<div class="detail-value">\${esc(d.latestUserPrompt)}</div>\`
-        : muted('No user prompt captured');
-      const subagents = d.subagentCount > 0
-        ? detailRow('Subagents', \`<div class="detail-value">\${d.subagentCount} spawned</div>\`)
-        : '';
-      return \`<div class="card-details">
-        \${detailRow('Working directory', \`<div class="detail-value">\${esc(a.cwd)}</div>\`)}
-        \${detailRow('Last activity', \`<div class="detail-value">\${esc(relTime(a.mtimeMs, now))}</div>\`)}
-        \${detailRow('Latest user prompt', prompt)}
-        \${detailRow('Recent tool calls', renderTrail(d.recentToolCalls, now))}
-        \${detailRow('Recent files', renderFiles(d.recentFiles))}
-        \${subagents}
-      </div>\`;
-    }
-
-    function renderCard(a, now, indent) {
-      indent = indent || 0;
-      const stopBtn = a.state === 'running'
-        ? '<button class="action-btn danger" data-act="stop" title="Stop agent">\u25a0</button>'
-        : '';
-      const isOpen = expanded.has(a.sessionId);
-      const subs = a.subagents || [];
-      const activeSubs = subs.filter(s => s.state === 'running');
-      const inactiveSubs = subs.filter(s => s.state !== 'running');
-      function subSection(key, label, list) {
-        if (list.length === 0) return '';
-        const open = subExpanded.has(key);
-        return '<div class="sub-toggle" data-toggle-subs="' + esc(key) + '">' +
-            '<span class="sub-caret" style="' + (open ? 'transform:rotate(90deg)' : '') + '">\u25b8</span>' +
-            list.length + ' ' + label + (list.length > 1 ? 's' : '') +
-          '</div>' +
-          '<div class="subagents-list"' + (open ? '' : ' style="display:none"') + '>' +
-            list.map(s => renderCard(s, now, indent + 1)).join('') +
-          '</div>';
-      }
-      const subHtml = subSection(a.sessionId + ':active', 'active subagent', activeSubs) +
-                      subSection(a.sessionId + ':inactive', 'inactive subagent', inactiveSubs);
-      return '<div class="card' + (isOpen ? ' expanded' : '') + (indent > 0 ? ' subagent-card' : '') + '" data-sid="' + esc(a.sessionId) + '" style="' + (indent > 0 ? 'margin-left:16px;border-left:2px solid var(--vscode-panel-border);' : '') + '">' +
-        '<div class="card-top">' +
-          '<div class="card-info">' +
-            '<div class="card-name">' +
-              '<span class="status-dot ' + esc(a.state) + '"></span>' +
-              esc(a.activity) +
-              '<span class="chev">\u25b8</span>' +
-            '</div>' +
-            '<div class="card-meta">' + esc(relTime(a.mtimeMs, now)) + '</div>' +
-          '</div>' +
-          '<div class="card-actions">' +
-            '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">\u{1f4ac}</button>' +
-            '<button class="action-btn" data-act="viewTranscript" title="View raw JSONL">\u{1f4c4}</button>' +
-            '<button class="action-btn" data-act="openFolder" title="Open project folder">\u{1f4c1}</button>' +
-            stopBtn +
-            '<button class="action-btn danger" data-act="delete" title="Delete transcript">\u2715</button>' +
-          '</div>' +
-        '</div>' +
-        renderDetails(a, now) +
-        subHtml +
-      '</div>';
+    function parentMaxMtime(p) {
+      const subs = p.subagents || [];
+      return subs.reduce((m, s) => Math.max(m, s.mtimeMs), p.mtimeMs);
     }
 
     const CARET = '<span class="row-caret"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
