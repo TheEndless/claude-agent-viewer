@@ -104,6 +104,7 @@ export class AgentService {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
       buildTree(this.agents);
+      assignTaskDescriptions(this.agents);
       this._onDidChange.fire(this.getAgents());
     }, DEBOUNCE_MS);
   }
@@ -121,6 +122,7 @@ export class AgentService {
     }
     if (changed) {
       buildTree(this.agents);
+      assignTaskDescriptions(this.agents);
       this._onDidChange.fire(this.getAgents());
     }
   }
