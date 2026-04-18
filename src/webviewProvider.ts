@@ -537,18 +537,18 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         ? '<button class="action-btn danger" data-act="stop" title="Stop agent">\u25a0</button>'
         : '';
       const isOpen = expanded.has(a.sessionId);
-      const runningSubs = (a.subagents || []).filter(s => s.state === 'running');
-      const hasSubs = runningSubs.length > 0;
+      const subs = a.subagents || [];
+      const hasSubs = subs.length > 0;
       const subsExpanded = subExpanded.has(a.sessionId);
       const subToggleHtml = hasSubs
         ? '<div class="sub-toggle" data-toggle-subs="' + esc(a.sessionId) + '">' +
             '<span class="sub-caret" style="' + (subsExpanded ? 'transform:rotate(90deg)' : '') + '">\u25b8</span>' +
-            runningSubs.length + ' subagent' + (runningSubs.length > 1 ? 's' : '') +
+            subs.length + ' subagent' + (subs.length > 1 ? 's' : '') +
           '</div>'
         : '';
       const subListHtml = hasSubs
         ? '<div class="subagents-list"' + (subsExpanded ? '' : ' style="display:none"') + '>' +
-            runningSubs.map(s => renderCard(s, now, indent + 1)).join('') +
+            subs.map(s => renderCard(s, now, indent + 1)).join('') +
           '</div>'
         : '';
       return '<div class="card' + (isOpen ? ' expanded' : '') + (indent > 0 ? ' subagent-card' : '') + '" data-sid="' + esc(a.sessionId) + '" style="' + (indent > 0 ? 'margin-left:16px;border-left:2px solid var(--vscode-panel-border);' : '') + '">' +
