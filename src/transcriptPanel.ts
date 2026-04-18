@@ -10,6 +10,10 @@ const openPanels = new Map<string, vscode.WebviewPanel>();
 export function openTranscriptPreview(agent: Agent): void {
   const existing = openPanels.get(agent.sessionId);
   if (existing) {
+    const cached = parseCache.get(agent.sessionId);
+    if (!cached || cached.mtimeMs !== agent.mtimeMs) {
+      existing.webview.html = buildWebviewHtml(getTurns(agent), agent.projectName);
+    }
     existing.reveal(vscode.ViewColumn.One);
     return;
   }
@@ -312,11 +316,11 @@ ${turnsHtml}
     const esc = t => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     return s
       .replace(/\`([^\`]+)\`/g, (_, c) => '<code>' + esc(c) + '</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/__([^_]+)__/g, '<strong>$1</strong>')
-      .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-      .replace(/_([^_]+)_/g, '<em>$1</em>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+      .replace(/\*\*([^*]+)\*\*/g, (_, t) => '<strong>' + esc(t) + '</strong>')
+      .replace(/__([^_]+)__/g, (_, t) => '<strong>' + esc(t) + '</strong>')
+      .replace(/\*([^*]+)\*/g, (_, t) => '<em>' + esc(t) + '</em>')
+      .replace(/_([^_]+)_/g, (_, t) => '<em>' + esc(t) + '</em>')
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => '<a href="' + esc(url) + '">' + esc(text) + '</a>');
   }
 
   function jsonHL(str) {

@@ -554,9 +554,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function render(agents, now) {
-      // Drop expanded-state entries for agents that no longer exist.
-      const live = new Set(agents.map(a => a.sessionId));
-      for (const sid of expanded) if (!live.has(sid)) expanded.delete(sid);
+      // Drop expanded-state entries for agents that no longer exist (walk tree).
+      const live = new Set();
+      const collectIds = a => { live.add(a.sessionId); (a.subagents || []).forEach(collectIds); };
+      agents.forEach(collectIds);
+      for (const sid of [...expanded]) if (!live.has(sid)) expanded.delete(sid);
 
       if (agents.length === 0) {
         root.className = 'empty-global';
