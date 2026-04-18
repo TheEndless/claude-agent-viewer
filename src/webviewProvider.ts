@@ -264,7 +264,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       white-space: nowrap;
       min-width: 0;
       font-size: 13px;
-      font-weight: 500;
+      font-weight: 400;
       color: var(--vscode-foreground);
     }
     .parent-prompt.no-prompt { color: var(--vscode-disabledForeground); }
