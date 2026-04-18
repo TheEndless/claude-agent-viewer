@@ -470,8 +470,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const openSections = { running: true, idle: true, done: false };
     // Preserve per-card expanded state across re-renders.
     const expanded = new Set();
-    // Tracks which parent cards have their subagent list collapsed.
-    const subCollapsed = new Set();
+    // Tracks which parent cards have their subagent list expanded (collapsed by default).
+    const subExpanded = new Set();
 
     function esc(s) {
       return String(s)
@@ -539,15 +539,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const isOpen = expanded.has(a.sessionId);
       const runningSubs = (a.subagents || []).filter(s => s.state === 'running');
       const hasSubs = runningSubs.length > 0;
-      const subsCollapsed = subCollapsed.has(a.sessionId);
+      const subsExpanded = subExpanded.has(a.sessionId);
       const subToggleHtml = hasSubs
         ? '<div class="sub-toggle" data-toggle-subs="' + esc(a.sessionId) + '">' +
-            '<span class="sub-caret" style="' + (subsCollapsed ? '' : 'transform:rotate(90deg)') + '">\u25b8</span>' +
+            '<span class="sub-caret" style="' + (subsExpanded ? 'transform:rotate(90deg)' : '') + '">\u25b8</span>' +
             runningSubs.length + ' subagent' + (runningSubs.length > 1 ? 's' : '') +
           '</div>'
         : '';
       const subListHtml = hasSubs
-        ? '<div class="subagents-list"' + (subsCollapsed ? ' style="display:none"' : '') + '>' +
+        ? '<div class="subagents-list"' + (subsExpanded ? '' : ' style="display:none"') + '>' +
             runningSubs.map(s => renderCard(s, now, indent + 1)).join('') +
           '</div>'
         : '';
@@ -594,7 +594,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const collectIds = a => { live.add(a.sessionId); (a.subagents || []).forEach(collectIds); };
       agents.forEach(collectIds);
       for (const sid of [...expanded]) if (!live.has(sid)) expanded.delete(sid);
-      for (const sid of [...subCollapsed]) if (!live.has(sid)) subCollapsed.delete(sid);
+      for (const sid of [...subExpanded]) if (!live.has(sid)) subExpanded.delete(sid);
 
       if (agents.length === 0) {
         root.className = 'empty-global';
@@ -631,12 +631,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         const sid = subToggle.getAttribute('data-toggle-subs');
         const card = subToggle.closest('.card[data-sid]');
         if (!sid || !card) return;
-        if (subCollapsed.has(sid)) subCollapsed.delete(sid);
-        else subCollapsed.add(sid);
+        if (subExpanded.has(sid)) subExpanded.delete(sid);
+        else subExpanded.add(sid);
         const caret = subToggle.querySelector('.sub-caret');
         const list = card.querySelector('.subagents-list');
-        if (list) list.style.display = subCollapsed.has(sid) ? 'none' : '';
-        if (caret) caret.style.transform = subCollapsed.has(sid) ? '' : 'rotate(90deg)';
+        if (list) list.style.display = subExpanded.has(sid) ? '' : 'none';
+        if (caret) caret.style.transform = subExpanded.has(sid) ? 'rotate(90deg)' : '';
         return;
       }
 
