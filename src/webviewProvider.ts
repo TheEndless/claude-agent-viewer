@@ -70,6 +70,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   private async handleMessage(message: { command: string; sessionId?: string }): Promise<void> {
     const { command, sessionId } = message;
+
+    if (command === 'refresh') {
+      this.postAgents();
+      return;
+    }
+
     if (!sessionId) return;
     const agent = this.agentService.getAgents().find((a) => a.sessionId === sessionId);
     if (!agent) return;
@@ -400,7 +406,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 <body>
   <div class="header">
     <h2>Agents</h2>
-    <span class="auto-refresh-indicator" title="Auto-refreshing every 5s"><span class="pulse"></span></span>
+    <button class="header-refresh" id="refresh-btn" title="Refresh">&#x21bb;</button>
   </div>
   <div id="root" class="empty-global">Loading agents…</div>
 
@@ -554,53 +560,54 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
 
-      // Row-group toggle (custom collapsibles).
-      const rowHeader = target.closest('.row-header');
-      if (rowHeader && !target.closest('[data-act]') && !target.closest('[data-toggle-subs]')) {
-        const group = rowHeader.closest('.row-group');
-        if (group) {
-          const key = group.dataset.key;
-          const isOpen = group.classList.toggle('open');
+      // Action buttons — handled first so they don't fall through to row clicks.
+      const btn = target.closest('[data-act]');
+      if (btn) {
+        const sidEl = btn.closest('[data-sid]');
+        const sid = sidEl ? sidEl.getAttribute('data-sid') : null;
+        if (sid) vscode.postMessage({ command: btn.getAttribute('data-act'), sessionId: sid });
+        return;
+      }
+
+      // Archive toggle row.
+      const archiveRow = target.closest('.archive-row');
+      if (archiveRow) {
+        const section = archiveRow.closest('.archive-section');
+        if (!section) return;
+        const isOpen = section.classList.toggle('open');
+        openSections['archive'] = isOpen;
+        const lbl = archiveRow.querySelector('.archive-label');
+        if (lbl) lbl.textContent = isOpen ? 'Hide archive' : 'Show archive';
+        return;
+      }
+
+      // Parent header: caret toggles expand; everything else opens preview.
+      const parentHeader = target.closest('.parent-header');
+      if (parentHeader) {
+        const parentRow = parentHeader.closest('.parent-row');
+        if (!parentRow) return;
+        if (target.closest('.row-caret')) {
+          const key = parentRow.dataset.key;
+          const isOpen = parentRow.classList.toggle('open');
           if (key) openSections[key] = isOpen;
           return;
         }
-      }
-
-      // Sub-toggle: each toggle is immediately followed by its own subagents-list.
-      const subToggle = target.closest('[data-toggle-subs]');
-      if (subToggle) {
-        const key = subToggle.getAttribute('data-toggle-subs');
-        if (!key) return;
-        if (subExpanded.has(key)) subExpanded.delete(key);
-        else subExpanded.add(key);
-        const open = subExpanded.has(key);
-        const caret = subToggle.querySelector('.sub-caret');
-        const list = subToggle.nextElementSibling;
-        if (list && list.classList.contains('subagents-list')) list.style.display = open ? '' : 'none';
-        if (caret) caret.style.transform = open ? 'rotate(90deg)' : '';
+        const sid = parentRow.getAttribute('data-sid');
+        if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
         return;
       }
 
-      const btn = target.closest('[data-act]');
-      if (btn) {
-        const card = btn.closest('[data-sid]');
-        if (!card) return;
-        vscode.postMessage({ command: btn.getAttribute('data-act'), sessionId: card.getAttribute('data-sid') });
+      // Subagent row click opens preview.
+      const subRow = target.closest('.subagent-row');
+      if (subRow) {
+        const sid = subRow.getAttribute('data-sid');
+        if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
         return;
       }
-      const card = target.closest('.card[data-sid]');
-      if (!card) return;
-      // Clicks inside the details pane or subagent area shouldn't toggle card expand.
-      if (target.closest('.card-details') || target.closest('.subagents-list')) return;
-      const sid = card.getAttribute('data-sid');
-      if (!sid) return;
-      if (expanded.has(sid)) {
-        expanded.delete(sid);
-        card.classList.remove('expanded');
-      } else {
-        expanded.add(sid);
-        card.classList.add('expanded');
-      }
+    });
+
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+      vscode.postMessage({ command: 'refresh' });
     });
 
     window.addEventListener('message', (event) => {
