@@ -5,6 +5,7 @@ import * as fsp from 'fs/promises';
 import * as vscode from 'vscode';
 import chokidar from 'chokidar';
 import { Agent, AgentDetails, AgentState, RawEvent, ToolCallSummary } from './types';
+import { buildTree } from './agentTree';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
@@ -96,7 +97,10 @@ export class AgentService {
 
   private scheduleEmit(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
-    this.debounceTimer = setTimeout(() => this._onDidChange.fire(this.getAgents()), DEBOUNCE_MS);
+    this.debounceTimer = setTimeout(() => {
+      buildTree(this.agents);
+      this._onDidChange.fire(this.getAgents());
+    }, DEBOUNCE_MS);
   }
 
   private reclassifyAll(): void {
@@ -109,7 +113,10 @@ export class AgentService {
         changed = true;
       }
     }
-    if (changed) this._onDidChange.fire(this.getAgents());
+    if (changed) {
+      buildTree(this.agents);
+      this._onDidChange.fire(this.getAgents());
+    }
   }
 
   dispose(): void {
