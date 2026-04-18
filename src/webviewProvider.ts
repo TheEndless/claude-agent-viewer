@@ -360,6 +360,25 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
     .card.expanded .chev { transform: rotate(90deg); }
 
+    .sub-toggle {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 5px 2px 2px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      user-select: none;
+      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
+      margin-top: 6px;
+    }
+    .sub-toggle:hover { color: var(--vscode-foreground); }
+    .sub-caret {
+      display: inline-block;
+      font-size: 8px;
+      transition: transform 0.1s ease;
+    }
+
     .card-top {
       display: flex;
       align-items: center;
@@ -451,6 +470,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const openSections = { running: true, idle: true, done: false };
     // Preserve per-card expanded state across re-renders.
     const expanded = new Set();
+    // Tracks which parent cards have their subagent list collapsed.
+    const subCollapsed = new Set();
 
     function esc(s) {
       return String(s)
@@ -516,7 +537,20 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         ? '<button class="action-btn danger" data-act="stop" title="Stop agent">\u25a0</button>'
         : '';
       const isOpen = expanded.has(a.sessionId);
-      const subHtml = (a.subagents || []).map(s => renderCard(s, now, indent + 1)).join('');
+      const runningSubs = (a.subagents || []).filter(s => s.state === 'running');
+      const hasSubs = runningSubs.length > 0;
+      const subsCollapsed = subCollapsed.has(a.sessionId);
+      const subToggleHtml = hasSubs
+        ? '<div class="sub-toggle" data-toggle-subs="' + esc(a.sessionId) + '">' +
+            '<span class="sub-caret" style="' + (subsCollapsed ? '' : 'transform:rotate(90deg)') + '">\u25b8</span>' +
+            runningSubs.length + ' subagent' + (runningSubs.length > 1 ? 's' : '') +
+          '</div>'
+        : '';
+      const subListHtml = hasSubs
+        ? '<div class="subagents-list"' + (subsCollapsed ? ' style="display:none"' : '') + '>' +
+            runningSubs.map(s => renderCard(s, now, indent + 1)).join('') +
+          '</div>'
+        : '';
       return '<div class="card' + (isOpen ? ' expanded' : '') + (indent > 0 ? ' subagent-card' : '') + '" data-sid="' + esc(a.sessionId) + '" style="' + (indent > 0 ? 'margin-left:16px;border-left:2px solid var(--vscode-panel-border);' : '') + '">' +
         '<div class="card-top">' +
           '<div class="card-info">' +
@@ -536,7 +570,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           '</div>' +
         '</div>' +
         renderDetails(a, now) +
-        subHtml +
+        subToggleHtml +
+        subListHtml +
       '</div>';
     }
 
@@ -559,6 +594,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const collectIds = a => { live.add(a.sessionId); (a.subagents || []).forEach(collectIds); };
       agents.forEach(collectIds);
       for (const sid of [...expanded]) if (!live.has(sid)) expanded.delete(sid);
+      for (const sid of [...subCollapsed]) if (!live.has(sid)) subCollapsed.delete(sid);
 
       if (agents.length === 0) {
         root.className = 'empty-global';
@@ -588,6 +624,22 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     root.addEventListener('click', (e) => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
+
+      // Sub-toggle: collapse/expand subagent list independently of card details.
+      const subToggle = target.closest('[data-toggle-subs]');
+      if (subToggle) {
+        const sid = subToggle.getAttribute('data-toggle-subs');
+        const card = subToggle.closest('.card[data-sid]');
+        if (!sid || !card) return;
+        if (subCollapsed.has(sid)) subCollapsed.delete(sid);
+        else subCollapsed.add(sid);
+        const caret = subToggle.querySelector('.sub-caret');
+        const list = card.querySelector('.subagents-list');
+        if (list) list.style.display = subCollapsed.has(sid) ? 'none' : '';
+        if (caret) caret.style.transform = subCollapsed.has(sid) ? '' : 'rotate(90deg)';
+        return;
+      }
+
       const btn = target.closest('[data-act]');
       if (btn) {
         const card = btn.closest('[data-sid]');
@@ -597,8 +649,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
       const card = target.closest('.card[data-sid]');
       if (!card) return;
-      // Clicks inside the already-expanded details pane shouldn't collapse it.
-      if (target.closest('.card-details')) return;
+      // Clicks inside the details pane or subagent area shouldn't toggle card expand.
+      if (target.closest('.card-details') || target.closest('.subagents-list')) return;
       const sid = card.getAttribute('data-sid');
       if (!sid) return;
       if (expanded.has(sid)) {
