@@ -3,6 +3,7 @@ import * as fsp from 'fs/promises';
 import { AgentService } from './agentService';
 import { Agent } from './types';
 import { findAgentPids, killAgent } from './processService';
+import { openTranscriptPreview, evict } from './transcriptPanel';
 
 const AUTO_REFRESH_INTERVAL = 5000;
 
@@ -47,7 +48,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   private postAgents(): void {
     if (!this._view) return;
-    const agents = this.agentService.getAgents().map((a) => ({
+    const serialize = (a: Agent): object => ({
       sessionId: a.sessionId,
       projectName: a.projectName,
       cwd: a.cwd,
@@ -55,7 +56,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       activity: a.activity,
       mtimeMs: a.mtimeMs,
       details: a.details,
-    }));
+      parentSessionId: a.parentSessionId,
+      subagents: a.subagents.map(serialize),
+    });
+    const agents = this.agentService.getAgents().map(serialize);
     this._view.webview.postMessage({ command: 'render', agents, now: Date.now() });
   }
 
@@ -66,6 +70,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     if (!agent) return;
 
     switch (command) {
+      case 'previewTranscript':
+        openTranscriptPreview(agent);
+        return;
       case 'viewTranscript':
         await this.viewTranscript(agent);
         return;
@@ -136,6 +143,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     if (answer !== 'Delete') return;
     try {
       await fsp.unlink(agent.transcriptPath);
+      evict(agent.sessionId);
     } catch (err) {
       vscode.window.showErrorMessage(
         `Failed to delete transcript: ${(err as Error).message}`,
@@ -502,12 +510,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       </div>\`;
     }
 
-    function renderCard(a, now) {
+    function renderCard(a, now, indent) {
+      indent = indent || 0;
       const stopBtn = a.state === 'running'
         ? '<button class="action-btn danger" data-act="stop" title="Stop agent">\u25a0</button>'
         : '';
       const isOpen = expanded.has(a.sessionId);
-      return '<div class="card' + (isOpen ? ' expanded' : '') + '" data-sid="' + esc(a.sessionId) + '">' +
+      const subHtml = (a.subagents || []).map(s => renderCard(s, now, indent + 1)).join('');
+      return '<div class="card' + (isOpen ? ' expanded' : '') + (indent > 0 ? ' subagent-card' : '') + '" data-sid="' + esc(a.sessionId) + '" style="' + (indent > 0 ? 'margin-left:16px;border-left:2px solid var(--vscode-panel-border);' : '') + '">' +
         '<div class="card-top">' +
           '<div class="card-info">' +
             '<div class="card-name">' +
@@ -518,13 +528,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
             '<div class="card-meta">' + esc(a.activity) + ' \u00b7 ' + esc(relTime(a.mtimeMs, now)) + '</div>' +
           '</div>' +
           '<div class="card-actions">' +
-            '<button class="action-btn" data-act="viewTranscript" title="View transcript">\u{1f4c4}</button>' +
+            '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">\u{1f4ac}</button>' +
+            '<button class="action-btn" data-act="viewTranscript" title="View raw JSONL">\u{1f4c4}</button>' +
             '<button class="action-btn" data-act="openFolder" title="Open project folder">\u{1f4c1}</button>' +
             stopBtn +
             '<button class="action-btn danger" data-act="delete" title="Delete transcript">\u2715</button>' +
           '</div>' +
         '</div>' +
         renderDetails(a, now) +
+        subHtml +
       '</div>';
     }
 
@@ -552,9 +564,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
       root.className = '';
-      const running = agents.filter(a => a.state === 'running');
-      const idle = agents.filter(a => a.state === 'idle');
-      const done = agents.filter(a => a.state === 'done');
+      const topLevel = agents.filter(a => !a.parentSessionId);
+      const running = topLevel.filter(a => a.state === 'running');
+      const idle    = topLevel.filter(a => a.state === 'idle');
+      const done    = topLevel.filter(a => a.state === 'done');
       root.innerHTML =
         renderSection('running', 'Running', running, now) +
         renderSection('idle', 'Idle', idle, now) +
