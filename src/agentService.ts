@@ -10,7 +10,7 @@ import { buildTree } from './agentTree';
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
 const KEEP_EVENTS = 20;
-const RUNNING_WINDOW_MS = 10 * 1000;
+const RUNNING_WINDOW_MS = 5 * 60 * 1000;
 const DONE_AGE_MS = 24 * 60 * 60 * 1000;
 const DEBOUNCE_MS = 200;
 const STATE_TICK_MS = 5000;
@@ -112,7 +112,8 @@ export class AgentService {
     const now = Date.now();
     let changed = false;
     for (const [id, agent] of this.agents) {
-      const nextState = classifyState(agent.mtimeMs, now, agent.state === 'done');
+      const hasActiveSubagent = agent.subagents.some(s => s.state === 'running');
+      const nextState = classifyState(agent.mtimeMs, now, agent.state === 'done', hasActiveSubagent);
       if (nextState !== agent.state) {
         this.agents.set(id, { ...agent, state: nextState });
         changed = true;
@@ -139,9 +140,25 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[]): Agen
   const terminated = events.some(isTerminator);
   const state = classifyState(mtimeMs, Date.now(), terminated);
   const activity = deriveActivity(events, state);
-  const details = extractDetails(events);
-  return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details, subagents: [] };
+  const { details, agentCallDescs } = extractDetails(events);
+  return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
 }
+
+function assignTaskDescriptions(agents: Map<string, Agent>): void {
+  for (const parent of agents.values()) {
+    if (!parent.subagents.length) continue;
+    const descs = parent.agentCallDescs ?? [];
+    const sorted = [...parent.subagents].sort((a, b) => a.mtimeMs - b.mtimeMs);
+    sorted.forEach((sub, i) => {
+      sub.taskDescription = descs[i]
+        ?? sub.details.latestUserPrompt
+        ?? sub.sessionId.slice(0, 8);
+    });
+  }
+}
+
+/** Exported only for unit testing. */
+export const assignTaskDescriptionsForTesting = assignTaskDescriptions;
 
 function sessionIdFromPath(filePath: string): string {
   return path.basename(filePath, '.jsonl');
@@ -149,18 +166,23 @@ function sessionIdFromPath(filePath: string): string {
 
 function resolveCwd(filePath: string, events: RawEvent[]): string {
   for (const evt of events) {
-    if (typeof evt.cwd === 'string' && evt.cwd.length > 0) return evt.cwd;
+    if (typeof evt.cwd === 'string' && evt.cwd.length > 0) return normalizeCwd(evt.cwd);
   }
   // Fallback: decode dir name. Encoding is lossy (dashes → slashes), so this
   // is a best effort only when events lack a cwd field.
   const dir = path.basename(path.dirname(filePath));
-  return dir.startsWith('-') ? dir.replace(/-/g, '/') : dir;
+  return dir.startsWith('-') ? dir.replace(/-/g, path.sep) : dir;
 }
 
-function classifyState(mtimeMs: number, now: number, terminated: boolean): AgentState {
+function normalizeCwd(p: string): string {
+  // Normalize slashes and lowercase the drive letter so e.g. C:\ and c:/ group together.
+  return path.normalize(p).replace(/^[A-Z]:/, d => d.toLowerCase());
+}
+
+function classifyState(mtimeMs: number, now: number, terminated: boolean, hasActiveSubagent = false): AgentState {
   if (terminated) return 'done';
   const age = now - mtimeMs;
-  if (age < RUNNING_WINDOW_MS) return 'running';
+  if (age < RUNNING_WINDOW_MS || hasActiveSubagent) return 'running';
   if (age > DONE_AGE_MS) return 'done';
   return 'idle';
 }
@@ -208,23 +230,26 @@ function isPartOfType(kind: string): (part: unknown) => boolean {
 
 function labelForToolUse(name: string, input: Record<string, unknown> | undefined): string {
   if (!input) return `Running ${name}`;
-  if (name === 'Bash' && typeof input.command === 'string') {
-    return `Bash: ${truncate(input.command, 40)}`;
-  }
-  if ((name === 'Edit' || name === 'Write') && typeof input.file_path === 'string') {
-    return `${name} ${path.basename(input.file_path)}`;
-  }
-  if (name === 'Read' && typeof input.file_path === 'string') {
-    return `Reading ${path.basename(input.file_path)}`;
-  }
-  if (name === 'Grep' && typeof input.pattern === 'string') {
-    return `Grep: ${truncate(input.pattern, 40)}`;
-  }
-  if (name === 'Glob' && typeof input.pattern === 'string') {
-    return `Glob: ${truncate(input.pattern, 40)}`;
-  }
-  if (name === 'Agent' && typeof input.description === 'string') {
-    return `Subagent: ${truncate(input.description, 40)}`;
+  switch (name) {
+    case 'Bash':
+      if (typeof input.command === 'string') return `Bash: ${truncate(input.command, 40)}`;
+      break;
+    case 'Edit':
+    case 'Write':
+      if (typeof input.file_path === 'string') return `${name} ${path.basename(input.file_path)}`;
+      break;
+    case 'Read':
+      if (typeof input.file_path === 'string') return `Reading ${path.basename(input.file_path)}`;
+      break;
+    case 'Grep':
+      if (typeof input.pattern === 'string') return `Grep: ${truncate(input.pattern, 40)}`;
+      break;
+    case 'Glob':
+      if (typeof input.pattern === 'string') return `Glob: ${truncate(input.pattern, 40)}`;
+      break;
+    case 'Agent':
+      if (typeof input.description === 'string') return `Subagent: ${truncate(input.description, 40)}`;
+      break;
   }
   return `Running ${name}`;
 }
@@ -236,11 +261,12 @@ function truncate(s: string, n: number): string {
 const MAX_TRAIL = 5;
 const MAX_FILES = 5;
 
-function extractDetails(events: RawEvent[]): AgentDetails {
+function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallDescs: string[] } {
   const trail: ToolCallSummary[] = [];
   const files: string[] = [];
   let latestUserPrompt: string | null = null;
   let subagentCount = 0;
+  const agentCallDescs: string[] = [];
 
   for (const evt of events) {
     const type = typeof evt.type === 'string' ? evt.type : '';
@@ -254,7 +280,12 @@ function extractDetails(events: RawEvent[]): AgentDetails {
         trail.push({ summary: labelForToolUse(name, part.input), at: ts });
         const filePath = part.input?.file_path;
         if (typeof filePath === 'string') files.push(filePath);
-        if (name === 'Agent') subagentCount += 1;
+        if (name === 'Agent') {
+          subagentCount += 1;
+          if (typeof part.input?.description === 'string' && part.input.description) {
+            agentCallDescs.push(part.input.description);
+          }
+        }
       }
     }
 
@@ -265,10 +296,13 @@ function extractDetails(events: RawEvent[]): AgentDetails {
   }
 
   return {
-    recentToolCalls: trail.slice(-MAX_TRAIL).reverse(),
-    recentFiles: dedupeLastN(files, MAX_FILES),
-    latestUserPrompt,
-    subagentCount,
+    details: {
+      recentToolCalls: trail.slice(-MAX_TRAIL).reverse(),
+      recentFiles: dedupeLastN(files, MAX_FILES),
+      latestUserPrompt,
+      subagentCount,
+    },
+    agentCallDescs,
   };
 }
 
