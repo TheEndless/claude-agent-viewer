@@ -22,8 +22,10 @@ interface ContentBlock {
 /** Minimal shape of a top-level JSONL event. */
 interface ParsedEvent {
   type?: string;
+  subtype?: string;
   timestamp?: string;
-  message?: { role?: string; content?: unknown };
+  message?: { role?: string; content?: unknown; model?: string };
+  attachment?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -50,14 +52,55 @@ export function parseTranscript(jsonlText: string): Turn[] {
 
   const turns: Turn[] = [];
   let currentAssistant: Turn | null = null;
+  let assistantIndex = 0;
 
   // Maps tool_use id -> { entry, toolName } so tool_result labels can reference
-  // the originating tool name.
+  // the originating tool name and hook summaries can be attached.
   const pendingToolUse = new Map<string, { entry: TurnEntry; toolName: string }>();
 
   for (const event of events) {
     const ts = typeof event.timestamp === 'string' ? event.timestamp : new Date().toISOString();
     const role = event.message?.role;
+
+    // ── Attachment events — hook_success carries actual stdout/stderr ──────────
+    if (event.type === 'attachment') {
+      const att = event.attachment ?? {};
+      if (att.type === 'hook_success' && typeof att.hookEvent === 'string' && att.hookEvent) {
+        const hookEvent = att.hookEvent as string;
+        const command = typeof att.command === 'string' ? att.command : '';
+        const stdout = typeof att.stdout === 'string' ? att.stdout.trim() : '';
+        const stderr = typeof att.stderr === 'string' ? att.stderr.trim() : '';
+        const durationMs = typeof att.durationMs === 'number' ? att.durationMs : 0;
+        const exitCode = typeof att.exitCode === 'number' ? att.exitCode : 0;
+        const prevented = att.preventedContinuation === true;
+        // Cap combined output — some hooks dump megabytes of context which would bloat
+        // every turn's HTML. The full file is always available via "View raw JSONL".
+        const MAX = 8000;
+        const rawOutput = [stdout, stderr].filter(Boolean).join('\n');
+        const output = rawOutput.length > MAX
+          ? rawOutput.slice(0, MAX) + `\n… (${rawOutput.length - MAX} more chars truncated)`
+          : rawOutput;
+        const label = `${hookEvent} Hook · ${hookScriptName(command)}`;
+        const bodyLines = [
+          `**Event:** ${hookEvent}`,
+          command ? `**Command:** \`${command}\`` : '',
+          `**Duration:** ${durationMs}ms · **Exit:** ${exitCode}`,
+          output ? `**Output:**\n\`\`\`\n${output}\n\`\`\`` : '',
+          prevented ? '⚠ **Prevented continuation**' : '',
+        ];
+        const body = bodyLines.filter(Boolean).join('\n');
+        const entry: TurnEntry = { kind: 'system', label, timestamp: ts, body };
+        if (currentAssistant) {
+          currentAssistant.entries.push(entry);
+        } else {
+          turns.push({ role: 'assistant', timestamp: ts, attachments: [], entries: [entry] });
+        }
+      }
+      continue;
+    }
+
+    // ── stop_hook_summary — skip; hook_success attachments carry the output ───
+    if (event.type === 'system' && event.subtype === 'stop_hook_summary') continue;
 
     // ── Session-end events (type: "result" | "summary") ───────────────────────
     if (event.type === 'result' || event.type === 'summary') {
@@ -78,7 +121,9 @@ export function parseTranscript(jsonlText: string): Turn[] {
     // ── Assistant turn ─────────────────────────────────────────────────────────
     if (role === 'assistant') {
       if (currentAssistant) turns.push(currentAssistant);
-      currentAssistant = { role: 'assistant', timestamp: ts, attachments: [], entries: [] };
+      assistantIndex++;
+      const model = typeof event.message?.model === 'string' ? event.message.model : undefined;
+      currentAssistant = { role: 'assistant', timestamp: ts, attachments: [], entries: [], model, index: assistantIndex };
       pendingToolUse.clear();
 
       for (const block of normalizeContent(event.message?.content)) {
@@ -114,14 +159,18 @@ export function parseTranscript(jsonlText: string): Turn[] {
       const allToolResults = blocks.length > 0 && blocks.every(b => b.type === 'tool_result');
 
       if (allToolResults) {
-        // Merge tool results onto the preceding assistant turn - do not create a new turn.
+        // Attach results directly to their matching tool_use entry for grouped rendering.
         for (const block of blocks) {
           const toolUseId = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
           const pending = pendingToolUse.get(toolUseId);
           const label = pending ? `Result · ${pending.toolName}` : 'Result';
           const body = extractResultBody(block);
-          if (currentAssistant) {
-            currentAssistant.entries.push({ kind: 'tool_result', label, timestamp: ts, body });
+          const resultEntry: TurnEntry = { kind: 'tool_result', label, timestamp: ts, body };
+          if (pending) {
+            pending.entry.result = resultEntry;
+          } else if (currentAssistant) {
+            // No matching tool_use (e.g. outside our tail window) — add standalone.
+            currentAssistant.entries.push(resultEntry);
           }
         }
       } else {
@@ -180,8 +229,10 @@ function labelForToolUse(name: string, input: Record<string, unknown>): string {
     case 'Write': return `Write · ${path.basename(String(input.file_path ?? ''))}`;
     case 'Grep':  return `Grep · ${trunc(String(input.pattern ?? ''), 60)}`;
     case 'Glob':  return `Glob · ${trunc(String(input.pattern ?? ''), 60)}`;
-    case 'Agent': return `Subagent · ${trunc(String(input.description ?? ''), 60)}`;
-    default:      return name;
+    case 'Agent':     return `Subagent · ${trunc(String(input.description ?? ''), 60)}`;
+    case 'TodoWrite': return `TodoWrite · ${(input.todos as unknown[] | undefined)?.length ?? 0} items`;
+    case 'TodoRead':  return 'TodoRead';
+    default:          return name;
   }
 }
 
@@ -200,4 +251,10 @@ function extractResultBody(block: ContentBlock): string {
 /** Truncate a string to at most n characters, appending an ellipsis if truncated. */
 function trunc(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '...' : s;
+}
+
+function hookScriptName(command: string): string {
+  // Extract script filename from e.g. python "C:/path/to/script.py"
+  const m = command.match(/[/\\]([^/\\"]+(?:\.py|\.sh|\.js|\.ts)?)"?\s*$/);
+  return m ? m[1] : command.slice(0, 30);
 }

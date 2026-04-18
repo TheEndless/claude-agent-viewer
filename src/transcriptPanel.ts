@@ -1,64 +1,152 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
-import * as path from 'path';
+import * as fsp from 'fs/promises';
 import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
 import { parseTranscript } from './transcriptParser';
 
 const parseCache = new Map<string, { turns: Turn[]; mtimeMs: number }>();
 const openPanels = new Map<string, vscode.WebviewPanel>();
+// Number of turns we have already rendered into each panel's webview.
+// Used to append only newly-added turns on subsequent updates instead of
+// wiping and re-chunking the whole transcript every time a message arrives.
+const renderedCount = new Map<string, number>();
 
 export function openTranscriptPreview(agent: Agent): void {
+  // Force fresh read on explicit user action — bypass any stale cache entry.
+  parseCache.delete(agent.sessionId);
   const existing = openPanels.get(agent.sessionId);
   if (existing) {
-    const cached = parseCache.get(agent.sessionId);
-    if (!cached || cached.mtimeMs !== agent.mtimeMs) {
-      existing.webview.html = buildWebviewHtml(getTurns(agent), agent.projectName);
-    }
+    void sendTurnsUpdate(existing.webview, agent);
     existing.reveal(vscode.ViewColumn.One);
     return;
   }
-  const turns = getTurns(agent);
   const panel = vscode.window.createWebviewPanel(
     'agentTranscript',
-    `💬 ${agent.projectName}`,
+    `💬 ${agent.projectName} · ${agent.sessionId.slice(0, 8)}`,
     vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: true },
   );
   openPanels.set(agent.sessionId, panel);
-  panel.onDidDispose(() => openPanels.delete(agent.sessionId));
-  panel.webview.html = buildWebviewHtml(turns, agent.projectName);
+  panel.onDidDispose(() => {
+    openPanels.delete(agent.sessionId);
+    renderedCount.delete(agent.sessionId);
+  });
+  // Show shell immediately — content loads once webview signals ready.
+  panel.webview.html = buildWebviewHtml(agent.projectName);
+  renderedCount.delete(agent.sessionId);
+  const sub = panel.webview.onDidReceiveMessage((msg) => {
+    if (msg.command !== 'ready') return;
+    sub.dispose();
+    void sendTurnsUpdate(panel.webview, agent);
+  });
+}
+
+export function updateTranscriptPanels(agents: Agent[]): void {
+  for (const agent of agents) {
+    const panel = openPanels.get(agent.sessionId);
+    if (!panel) continue;
+    const cached = parseCache.get(agent.sessionId);
+    if (cached && cached.mtimeMs === agent.mtimeMs) continue;
+    void sendTurnsUpdate(panel.webview, agent);
+  }
+}
+
+async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<void> {
+  const { turns, bytes } = await getTurns(agent);
+  if (turns.length === 0) {
+    webview.postMessage({ command: 'update', html: '<div class="empty-state">No turns found in this transcript.</div>', mode: 'replace' });
+    renderedCount.set(agent.sessionId, 0);
+    return;
+  }
+  const first = turns[0]?.timestamp;
+  const last  = turns[turns.length - 1]?.timestamp;
+  const kb = (bytes / 1024).toFixed(1);
+  const diagHtml = `<div class="diag">${turns.length} turns · ${kb} KB · <span data-iso="${esc(first ?? '')}"></span> → <span data-iso="${esc(last ?? '')}"></span></div>`;
+
+  const prev = renderedCount.get(agent.sessionId) ?? 0;
+  // If turn count went down (file replaced) or we have no prior render, do full replace.
+  const needsFullRender = prev === 0 || turns.length < prev;
+
+  if (needsFullRender) {
+    // Initial or full re-render: replace scroll with diag, then append turns in
+    // size-bounded chunks. Individual tool results / hook outputs can be very large,
+    // so count-based chunks aren't safe — size-based keeps us under postMessage limits.
+    webview.postMessage({ command: 'update', html: diagHtml, mode: 'replace' });
+    flushInChunks(webview, turns, 0);
+  } else if (turns.length > prev) {
+    // Incremental: append only the new turns, update diag in place.
+    flushInChunks(webview, turns, prev);
+    webview.postMessage({ command: 'update', html: diagHtml, mode: 'diag' });
+  } else {
+    // Same count — file mtime changed but no new turns. Just refresh the diag.
+    webview.postMessage({ command: 'update', html: diagHtml, mode: 'diag' });
+  }
+  renderedCount.set(agent.sessionId, turns.length);
+}
+
+const CHUNK_BYTE_LIMIT = 1_000_000; // ~1 MB per postMessage to stay well under IPC limits.
+
+function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: number): void {
+  let buf = '';
+  for (let i = startIdx; i < turns.length; i++) {
+    const rendered = renderTurn(turns[i]);
+    if (buf && buf.length + rendered.length > CHUNK_BYTE_LIMIT) {
+      webview.postMessage({ command: 'update', html: buf, mode: 'append' });
+      buf = '';
+    }
+    buf += rendered + '\n';
+  }
+  if (buf) webview.postMessage({ command: 'update', html: buf, mode: 'append' });
 }
 
 export function evict(sessionId: string): void {
   parseCache.delete(sessionId);
+  renderedCount.delete(sessionId);
   const panel = openPanels.get(sessionId);
   if (panel) { panel.dispose(); openPanels.delete(sessionId); }
 }
 
-function getTurns(agent: Agent): Turn[] {
+async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number }> {
+  // Stat the file directly to get the current mtime, since agent.mtimeMs may be
+  // stale between file writes and chokidar events.
+  let realMtime = agent.mtimeMs;
+  let bytes = 0;
+  try {
+    const stat = await fsp.stat(agent.transcriptPath);
+    realMtime = stat.mtimeMs;
+    bytes = stat.size;
+  } catch { /* fall through; file may have been deleted */ }
   const cached = parseCache.get(agent.sessionId);
-  if (cached && cached.mtimeMs === agent.mtimeMs) return cached.turns;
+  if (cached && cached.mtimeMs === realMtime) return { turns: cached.turns, bytes };
   let text: string;
-  try { text = fs.readFileSync(agent.transcriptPath, 'utf-8'); }
-  catch { return []; }
+  try { text = await fsp.readFile(agent.transcriptPath, 'utf-8'); }
+  catch { return { turns: [], bytes: 0 }; }
   const turns = parseTranscript(text);
-  parseCache.set(agent.sessionId, { turns, mtimeMs: agent.mtimeMs });
-  return turns;
+  parseCache.set(agent.sessionId, { turns, mtimeMs: realMtime });
+  return { turns, bytes: Buffer.byteLength(text, 'utf-8') };
 }
 
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// Accepts pre-escaped HTML — callers must pass esc(text) so surrounding text is safe.
+// Captures are already escaped so we don't double-encode them.
 function inlineMd(s: string): string {
-  const e = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   return s
-    .replace(/`([^`]+)`/g,           (_, c) => `<code>${e(c)}</code>`)
-    .replace(/\*\*([^*]+)\*\*/g,     (_, t) => `<strong>${e(t)}</strong>`)
-    .replace(/__([^_]+)__/g,         (_, t) => `<strong>${e(t)}</strong>`)
-    .replace(/\*([^*\n]+)\*/g,       (_, t) => `<em>${e(t)}</em>`)
-    .replace(/_([^_\n]+)_/g,         (_, t) => `<em>${e(t)}</em>`)
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => `<a href="${e(url)}">${e(text)}</a>`);
+    .replace(/`([^`]+)`/g,               (_, c) => `<code>${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g,         (_, t) => `<strong>${t}</strong>`)
+    .replace(/__([^_]+)__/g,             (_, t) => `<strong>${t}</strong>`)
+    .replace(/\*([^*\n]+)\*/g,           (_, t) => `<em>${t}</em>`)
+    .replace(/_([^_\n]+)_/g,             (_, t) => `<em>${t}</em>`)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => `<a href="${url}">${text}</a>`);
+}
+
+function parseTableRow(line: string): string[] {
+  return line.split('|').slice(1, -1).map(c => c.trim());
+}
+
+function isTableSeparator(cells: string[]): boolean {
+  return cells.length > 0 && cells.every(c => /^:?-{1,}:?\s*$/.test(c));
 }
 
 function mdToHtml(raw: string): string {
@@ -76,22 +164,40 @@ function mdToHtml(raw: string): string {
       continue;
     }
     const hm = line.match(/^(#{1,3})\s+(.+)/);
-    if (hm) { out.push(`<h${hm[1].length}>${inlineMd(hm[2])}</h${hm[1].length}>`); i++; continue; }
+    if (hm) { out.push(`<h${hm[1].length}>${inlineMd(esc(hm[2]))}</h${hm[1].length}>`); i++; continue; }
+    if (/^([-*_] *){3,}$/.test(line.trim()) && line.trim().length > 0) {
+      out.push('<hr>'); i++; continue;
+    }
+    if (line.trimStart().startsWith('|')) {
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].trimStart().startsWith('|')) {
+        rows.push(parseTableRow(lines[i])); i++;
+      }
+      const hasSep = rows.length >= 2 && isTableSeparator(rows[1]);
+      const head = hasSep ? rows[0] : null;
+      const body = hasSep ? rows.slice(2) : rows;
+      let html = '<table>';
+      if (head) html += '<thead><tr>' + head.map(c => `<th>${inlineMd(esc(c))}</th>`).join('') + '</tr></thead>';
+      if (body.length) html += '<tbody>' + body.map(r => '<tr>' + r.map(c => `<td>${inlineMd(esc(c))}</td>`).join('') + '</tr>').join('') + '</tbody>';
+      html += '</table>';
+      out.push(html);
+      continue;
+    }
     if (line.startsWith('> ')) {
       const bq: string[] = [];
       while (i < lines.length && lines[i].startsWith('> ')) { bq.push(lines[i].slice(2)); i++; }
-      out.push(`<blockquote>${inlineMd(bq.join(' '))}</blockquote>`);
+      out.push(`<blockquote>${inlineMd(esc(bq.join(' ')))}</blockquote>`);
       continue;
     }
     if (/^[-*+] /.test(line)) {
       const items: string[] = [];
-      while (i < lines.length && /^[-*+] /.test(lines[i])) { items.push(`<li>${inlineMd(lines[i].slice(2))}</li>`); i++; }
+      while (i < lines.length && /^[-*+] /.test(lines[i])) { items.push(`<li>${inlineMd(esc(lines[i].slice(2)))}</li>`); i++; }
       out.push(`<ul>${items.join('')}</ul>`);
       continue;
     }
     if (/^\d+\. /.test(line)) {
       const items: string[] = [];
-      while (i < lines.length && /^\d+\. /.test(lines[i])) { items.push(`<li>${inlineMd(lines[i].replace(/^\d+\. /, ''))}</li>`); i++; }
+      while (i < lines.length && /^\d+\. /.test(lines[i])) { items.push(`<li>${inlineMd(esc(lines[i].replace(/^\d+\. /, '')))}</li>`); i++; }
       out.push(`<ol>${items.join('')}</ol>`);
       continue;
     }
@@ -106,7 +212,7 @@ function mdToHtml(raw: string): string {
            && !/^\d+\. /.test(lines[i])) {
       para.push(lines[i]); i++;
     }
-    if (para.length) out.push(`<p>${inlineMd(para.join(' '))}</p>`);
+    if (para.length) out.push(`<p>${inlineMd(esc(para.join(' ')))}</p>`);
     else i++;
   }
   return out.join('');
@@ -133,32 +239,69 @@ function renderUserTurn(turn: Turn): string {
 }
 
 function renderAssistantTurn(turn: Turn): string {
-  const entriesHtml = turn.entries.length > 0
-    ? `<div class="entries">${turn.entries.map(renderEntry).join('')}</div>`
+  // System entries (hooks, session-end) appear after the text bubble.
+  const toolEntries = turn.entries.filter(e => e.kind !== 'system');
+  const sysEntries  = turn.entries.filter(e => e.kind === 'system');
+  const toolHtml = toolEntries.length > 0
+    ? `<div class="entries">${toolEntries.map(renderEntry).join('')}</div>`
+    : '';
+  const sysHtml = sysEntries.length > 0
+    ? `<div class="entries">${sysEntries.map(renderEntry).join('')}</div>`
     : '';
   const bubbleHtml = turn.text
     ? `<div class="bubble">${mdToHtml(turn.text)}</div>`
     : '';
-  if (!entriesHtml && !bubbleHtml) return '';
+  if (!toolHtml && !bubbleHtml && !sysHtml) return '';
+  const metaParts: string[] = [];
+  if (turn.index !== undefined) metaParts.push(`#${turn.index}`);
+  if (turn.model) metaParts.push(turn.model.replace(/^claude-/, ''));
+  const metaPrefix = metaParts.length ? `${esc(metaParts.join(' · '))} · ` : '';
   return `<div class="turn assistant">
     <div class="turn-head">
       <div class="avatar agent"><svg><use href="#icon-agent"/></svg></div>
       <span class="turn-label">Agent</span>
-      <span class="turn-ts" data-iso="${esc(turn.timestamp)}"></span>
+      <span class="turn-ts">${metaPrefix}<span data-iso="${esc(turn.timestamp)}"></span></span>
     </div>
     <div class="turn-content"><div class="turn-inner">
-      ${entriesHtml}${bubbleHtml}
+      ${toolHtml}${bubbleHtml}${sysHtml}
     </div></div>
   </div>`;
 }
 
-function renderEntryBody(body: string): { html: string; cls: string } {
+function renderEntryBody(body: string, kind: TurnEntry['kind']): { html: string; cls: string } {
+  if (kind === 'tool_result') {
+    return { html: `<pre><code>${esc(body)}</code></pre>`, cls: 'raw' };
+  }
+  if (kind === 'thinking') {
+    return { html: mdToHtml(body), cls: 'md' };
+  }
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(body);
-    return { html: jsonHlTs(JSON.stringify(parsed, null, 2)), cls: 'json' };
+    parsed = JSON.parse(body);
   } catch {
     return { html: mdToHtml(body), cls: 'md' };
   }
+  if (kind === 'tool_use' && parsed && typeof parsed === 'object' && Array.isArray((parsed as { todos?: unknown }).todos)) {
+    return { html: renderTodoList((parsed as { todos: unknown[] }).todos), cls: 'todos' };
+  }
+  return { html: jsonHlTs(JSON.stringify(parsed, null, 2)), cls: 'json' };
+}
+
+function renderTodoList(todos: unknown[]): string {
+  const items = todos.map(t => {
+    const item = t as { content?: unknown; status?: unknown };
+    let check = '○';
+    let cls = '';
+    if (item.status === 'completed') {
+      check = '✓';
+      cls = ' done';
+    } else if (item.status === 'in_progress') {
+      check = '◐';
+      cls = ' active';
+    }
+    return `<li class="todo-item"><span class="todo-chk">${check}</span><span class="todo-txt${cls}">${esc(String(item.content ?? ''))}</span></li>`;
+  }).join('');
+  return `<ul class="todo-list">${items}</ul>`;
 }
 
 function jsonHlTs(str: string): string {
@@ -170,16 +313,59 @@ function jsonHlTs(str: string): string {
 }
 
 function renderEntry(entry: TurnEntry): string {
+  return renderEntryBubble(entry);
+}
+
+function entryId(entry: TurnEntry): string {
+  return esc(`${entry.timestamp}:${entry.kind}:${entry.label}`);
+}
+
+function renderEntryBubble(entry: TurnEntry): string {
   const kindClass = entry.kind.replace('_', '-');
   const icon = entryIcon(entry.kind);
-  const { html: bodyHtml, cls: bodyCls } = renderEntryBody(entry.body);
-  return `<div class="entry ${kindClass}">
-    <div class="entry-row">
+  const { html: bodyHtml, cls: bodyCls } = renderEntryBody(entry.body, entry.kind);
+  const preview = entry.kind === 'system' ? hookOutputPreview(entry.body) : resultPreview(entry.body);
+  const resultSection = entry.result ? renderResultSection(entry.result) : '';
+  const previewHtml = preview ? `<span class="p-preview">${preview}</span>` : '';
+  return `<div class="entry ${kindClass}" data-eid="${entryId(entry)}">
+    <div class="entry-header">
+      <span class="entry-icon">${icon}</span>
+      <span class="entry-lbl">${esc(entry.label)}</span>
+      ${previewHtml}
+      <span class="p-ts" data-iso="${esc(entry.timestamp)}"></span>
       <span class="entry-caret"><svg><use href="#icon-chevron"/></svg></span>
-      <div class="pill"><span>${icon}</span><span class="p-text">${esc(entry.label)}</span><span class="p-ts" data-iso="${esc(entry.timestamp)}"></span></div>
     </div>
-    <div class="entry-body ${bodyCls}">${bodyHtml}</div>
+    <div class="entry-body ${bodyCls}">${bodyHtml}${resultSection}</div>
   </div>`;
+}
+
+function renderResultSection(result: TurnEntry): string {
+  const { html: bodyHtml, cls: bodyCls } = renderEntryBody(result.body, result.kind);
+  const preview = resultPreview(result.body);
+  return `<div class="result-section">
+    <div class="result-label"><span>↩</span> <span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${preview}</span>` : ''}</div>
+    <div class="result-body ${bodyCls}">${bodyHtml}</div>
+  </div>`;
+}
+
+function resultPreview(body: string): string {
+  // First non-empty line, stripped of markdown/JSON noise.
+  const first = body.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '';
+  const cleaned = first.replace(/^[#>\-*`{[]+\s*/, '').replace(/["`]/g, '').trim();
+  if (!cleaned) return '';
+  return cleaned.length > 80 ? cleaned.slice(0, 79) + '…' : cleaned;
+}
+
+function hookOutputPreview(body: string): string {
+  // Extract text between the **Output:** code fence, fall back to duration line.
+  const m = body.match(/\*\*Output:\*\*\n```\n([\s\S]*?)\n```/);
+  if (m) {
+    const first = m[1].trim().split('\n')[0].trim();
+    return first.length > 72 ? first.slice(0, 71) + '…' : first;
+  }
+  // No output — show duration if present.
+  const d = body.match(/\*\*Duration:\*\*\s*([^\n·]+)/);
+  return d ? d[1].trim() : '';
 }
 
 function entryIcon(kind: TurnEntry['kind']): string {
@@ -212,10 +398,8 @@ function renderAttachment(att: TurnAttachment): string {
   return '';
 }
 
-export function buildWebviewHtml(turns: Turn[], title: string): string {
-  const turnsHtml = turns.length > 0
-    ? turns.map(renderTurn).join('\n')
-    : '<div class="empty-state">No turns found in this transcript.</div>';
+function buildWebviewHtml(title: string): string {
+  const turnsHtml = '<div class="empty-state loading">Loading\u2026</div>';
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -239,9 +423,11 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .scroll::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); }
 
 .empty-state { padding: 32px 14px; color: var(--vscode-descriptionForeground); font-size: 12px; }
+.empty-state.loading { opacity: 0.5; }
+.diag { padding: 6px 14px; font-size: 10px; color: var(--vscode-descriptionForeground); border-bottom: 1px solid var(--vscode-input-border); font-family: "Cascadia Code",Consolas,monospace; opacity: 0.6; }
 
-.turn { padding: 5px 14px; }
-.turn-head { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.turn { padding: 10px 14px; }
+.turn-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .turn.user .turn-head { flex-direction: row-reverse; }
 .avatar { width: 20px; height: 20px; border-radius: 4px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .avatar.user  { background: var(--vscode-chat-requestBackground, #2b3b4e); color: var(--vscode-editor-foreground); border: 1px solid var(--vscode-chat-requestBorder, #3b5070); }
@@ -255,7 +441,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .turn-content { display: flex; }
 .turn.assistant .turn-content { justify-content: flex-start; }
 .turn.user      .turn-content { justify-content: flex-end; }
-.turn-inner { width: 65%; display: flex; flex-direction: column; gap: 4px; }
+.turn-inner { width: 65%; display: flex; flex-direction: column; gap: 8px; }
 
 .bubble { padding: 8px 11px; line-height: 1.65; font-size: 13px; word-break: break-word; }
 .turn.assistant .bubble { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-input-border); border-radius: 10px 10px 10px 2px; }
@@ -273,6 +459,10 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .bubble pre { background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 7px 10px; overflow-x: auto; margin: 0.4em 0; }
 .bubble pre code { background: none; border: none; padding: 0; }
 .bubble blockquote { border-left: 3px solid var(--vscode-input-border); padding-left: 8px; margin: 0.3em 0; opacity: 0.8; }
+.bubble hr { border: none; border-top: 1px solid var(--vscode-input-border); margin: 0.6em 0; }
+.bubble table { border-collapse: collapse; width: 100%; margin: 0.4em 0; font-size: 12px; }
+.bubble th, .bubble td { border: 1px solid var(--vscode-input-border); padding: 4px 8px; text-align: left; }
+.bubble thead th { background: var(--vscode-editorWidget-background); font-weight: 600; }
 
 .bubble-attachments { display: flex; flex-direction: column; gap: 5px; margin-bottom: 7px; }
 .attach-image { position: relative; display: inline-block; max-width: 100%; cursor: zoom-in; }
@@ -282,23 +472,25 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .attach-file .af-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
 .attach-file .af-meta { color: var(--vscode-descriptionForeground); flex-shrink: 0; font-size: 10px; }
 
-.entries { display: flex; flex-direction: column; gap: 2px; }
-.entry { display: flex; flex-direction: column; }
-.entry-row { display: inline-flex; align-items: center; gap: 2px; cursor: pointer; user-select: none; border-radius: 3px; padding: 2px 4px 2px 2px; transition: background 0.1s; max-width: 100%; }
-.entry-row:hover { background: var(--vscode-list-hoverBackground); }
-.entry-caret { width: 16px; height: 16px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: var(--vscode-disabledForeground); transition: transform 0.15s; }
-.entry-caret svg { width: 10px; height: 10px; }
-.entry.open > .entry-row .entry-caret { transform: rotate(90deg); }
-.pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px 2px 5px; border-radius: 3px; font-size: 11px; border: 1px solid transparent; min-width: 0; }
-.pill .p-text { max-width: 280px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pill .p-ts   { font-size: 10px; opacity: 0.45; margin-left: 2px; flex-shrink: 0; }
-.entry.tool-use    .pill { color: var(--vscode-symbolIcon-functionForeground); background: color-mix(in srgb, var(--vscode-symbolIcon-functionForeground) 8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-functionForeground) 25%, transparent); }
-.entry.tool-result .pill { color: var(--vscode-symbolIcon-variableForeground); background: color-mix(in srgb, var(--vscode-symbolIcon-variableForeground) 8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-variableForeground) 25%, transparent); }
-.entry.thinking    .pill { color: var(--vscode-symbolIcon-eventForeground);    background: color-mix(in srgb, var(--vscode-symbolIcon-eventForeground)    8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-eventForeground)    25%, transparent); }
-.entry.system      .pill { color: var(--vscode-symbolIcon-keywordForeground);  background: color-mix(in srgb, var(--vscode-symbolIcon-keywordForeground)  6%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-keywordForeground)  20%, transparent); }
+.entries { display: flex; flex-direction: column; gap: 6px; }
+.entry { border-radius: 8px; border: 1px solid transparent; overflow: hidden; }
+.entry-header { display: flex; align-items: center; gap: 8px; padding: 8px 11px; cursor: pointer; user-select: none; min-width: 0; }
+.entry-header:hover { background: rgba(128,128,128,0.06); }
+.entry-icon { flex-shrink: 0; font-size: 13px; line-height: 1; opacity: 0.85; }
+.entry-lbl { flex-shrink: 0; min-width: 0; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 500; }
+.p-preview { flex: 1; min-width: 0; font-size: 11px; opacity: 0.55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
+.p-ts { flex-shrink: 0; font-size: 10px; opacity: 0.45; }
+.entry-caret { flex-shrink: 0; display: flex; align-items: center; color: currentColor; opacity: 0.5; transition: transform 0.15s; }
+.entry-caret svg { width: 11px; height: 11px; }
+.entry.open > .entry-header .entry-caret { transform: rotate(90deg); }
 
-.entry-body { display: none; margin: 3px 0 4px 18px; padding: 7px 10px; background: var(--vscode-editorWidget-background); border-left: 2px solid var(--vscode-input-border); border-radius: 0 3px 3px 0; font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.5; max-height: 240px; overflow-y: auto; }
-.entry.open .entry-body { display: block; }
+.entry.tool-use    { color: var(--vscode-symbolIcon-functionForeground); background: color-mix(in srgb, var(--vscode-symbolIcon-functionForeground) 8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-functionForeground) 25%, transparent); }
+.entry.tool-result { color: var(--vscode-symbolIcon-variableForeground); background: color-mix(in srgb, var(--vscode-symbolIcon-variableForeground) 8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-variableForeground) 25%, transparent); }
+.entry.thinking    { color: var(--vscode-symbolIcon-eventForeground);    background: color-mix(in srgb, var(--vscode-symbolIcon-eventForeground)    8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-eventForeground)    25%, transparent); }
+.entry.system      { color: var(--vscode-symbolIcon-keywordForeground);  background: color-mix(in srgb, var(--vscode-symbolIcon-keywordForeground)  6%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-keywordForeground)  20%, transparent); }
+
+.entry-body { display: none; padding: 6px 10px 8px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.5; max-height: 240px; overflow-y: auto; }
+.entry.open > .entry-body { display: block; }
 .entry-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; }
 .jk { color: var(--json-key); }
 .js { color: var(--json-str); }
@@ -311,6 +503,26 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry-body.md pre code { background: none; padding: 0; }
 .entry-body.md strong { font-weight: 600; color: var(--vscode-editor-foreground); }
 .entry-body.md ul, .entry-body.md ol { padding-left: 1.2em; margin: 0.2em 0; }
+.entry-body.md hr { border: none; border-top: 1px solid var(--vscode-input-border); margin: 0.4em 0; }
+.entry-body.md table { border-collapse: collapse; width: 100%; margin: 0.3em 0; font-size: 10.5px; }
+.entry-body.md th, .entry-body.md td { border: 1px solid var(--vscode-input-border); padding: 3px 6px; text-align: left; }
+.entry-body.md thead th { background: var(--vscode-editorWidget-background); font-weight: 600; }
+.entry-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
+.entry-body.raw pre { margin: 0; background: none; border: none; padding: 0; }
+.entry-body.raw code { font-family: inherit; background: none; border: none; padding: 0; color: var(--vscode-editor-foreground); }
+.result-section { margin-top: 8px; border-top: 1px solid var(--vscode-input-border); padding-top: 6px; }
+.result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; margin-bottom: 5px; }
+.result-body { font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.5; max-height: 160px; overflow-y: auto; }
+.result-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
+.result-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; }
+.result-body.md p { margin: 0 0 0.3em; }
+.result-body.md p:last-child { margin: 0; }
+.todo-list { list-style: none; padding: 0; margin: 0; }
+.todo-item { display: flex; align-items: baseline; gap: 5px; padding: 1px 0; }
+.todo-chk { flex-shrink: 0; font-size: 10px; color: var(--vscode-disabledForeground); }
+.todo-txt { flex: 1; }
+.todo-txt.done { text-decoration: line-through; opacity: 0.5; }
+.todo-txt.active { color: var(--vscode-focusBorder); }
 
 .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 100; align-items: center; justify-content: center; cursor: zoom-out; }
 .lightbox.open { display: flex; }
@@ -348,34 +560,90 @@ ${turnsHtml}
 </div>
 
 <script>
+  const scroll = document.getElementById('scroll');
+  let userScrolled = false;
+
   function fmtFull(iso) {
     return new Date(iso).toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true });
   }
   function fmtTime(iso) {
     return new Date(iso).toLocaleTimeString(undefined, { hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true });
   }
-  document.querySelectorAll('.turn-ts[data-iso]').forEach(el => el.textContent = fmtFull(el.dataset.iso));
-  document.querySelectorAll('.p-ts[data-iso]').forEach(el => el.textContent = fmtTime(el.dataset.iso));
 
-  document.getElementById('scroll').addEventListener('click', e => {
-    const target = e.target;
-    // Entry expand/collapse
-    const entryRow = target.closest('.entry-row');
-    if (entryRow && !target.closest('.entry-body')) {
-      entryRow.closest('.entry').classList.toggle('open');
+  function stampTimestamps() {
+    document.querySelectorAll('[data-iso]').forEach(el => {
+      const iso = el.dataset.iso;
+      el.textContent = el.classList.contains('p-ts') ? fmtTime(iso) : fmtFull(iso);
+    });
+  }
+
+  // Delegated click handling — attached once, works for any future content.
+  scroll.addEventListener('click', (ev) => {
+    const header = ev.target.closest && ev.target.closest('.entry-header');
+    if (header) {
+      const entry = header.closest('.entry');
+      if (entry) entry.classList.toggle('open');
       return;
     }
-    // Lightbox open
-    const img = target.closest('.attach-image');
+    const img = ev.target.closest && ev.target.closest('.attach-image');
     if (img) {
       document.getElementById('lightbox-img').src = img.querySelector('img').src;
       document.getElementById('lightbox').classList.add('open');
-      return;
     }
   });
+  function attachListeners() { /* no-op: using event delegation now */ }
+
+  function scrollToBottom() {
+    scroll.scrollTop = scroll.scrollHeight;
+  }
+
+  scroll.addEventListener('scroll', () => {
+    const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+    userScrolled = !atBottom;
+  });
+
   document.getElementById('lightbox').addEventListener('click', () => {
     document.getElementById('lightbox').classList.remove('open');
   });
+
+  let openEidsAtReplace = new Set();
+  window.addEventListener('message', e => {
+    if (e.data?.command !== 'update') return;
+    const wasAtBottom = !userScrolled;
+    if (e.data.mode === 'diag') {
+      // Replace just the diagnostic banner, leave content intact.
+      const existing = scroll.querySelector('.diag');
+      if (existing) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = e.data.html;
+        const fresh = tmp.firstElementChild;
+        if (fresh) existing.replaceWith(fresh);
+      }
+      stampTimestamps();
+      return;
+    }
+    if (e.data.mode === 'replace') {
+      openEidsAtReplace = new Set([...scroll.querySelectorAll('.entry.open[data-eid]')].map(el => el.getAttribute('data-eid')));
+      scroll.innerHTML = e.data.html;
+    } else {
+      scroll.insertAdjacentHTML('beforeend', e.data.html);
+    }
+    if (openEidsAtReplace.size > 0) {
+      scroll.querySelectorAll('.entry[data-eid]').forEach(el => {
+        if (openEidsAtReplace.has(el.getAttribute('data-eid'))) el.classList.add('open');
+      });
+    }
+    stampTimestamps();
+    attachListeners();
+    if (wasAtBottom) scrollToBottom();
+  });
+
+  // Initial setup + signal extension we're ready to receive content
+  stampTimestamps();
+  attachListeners();
+  scrollToBottom();
+  const vscode = acquireVsCodeApi();
+  vscode.postMessage({ command: 'ready' });
 </script>
 </body>
 </html>`;

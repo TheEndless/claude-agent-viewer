@@ -97,17 +97,20 @@ describe('parseTranscript', () => {
     expect(JSON.parse(turns[0].entries[0].body)).toEqual({ command: 'ls -la' });
   });
 
-  it('appends tool_result to preceding assistant turn (not a new user turn)', () => {
+  it('pairs tool_result onto its tool_use entry (not a new user turn)', () => {
     const jsonl = [
       line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'Bash', input: { command: 'ls' } }] } }),
       line({ type: 'user', timestamp: TS, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'file.txt\n' }] } }),
     ].join('\n');
     const turns = parseTranscript(jsonl);
     expect(turns).toHaveLength(1);                     // only the assistant turn
-    expect(turns[0].entries).toHaveLength(2);          // tool_use + tool_result
-    expect(turns[0].entries[1].kind).toBe('tool_result');
-    expect(turns[0].entries[1].label).toBe('Result · Bash');
-    expect(turns[0].entries[1].body).toBe('file.txt\n');
+    expect(turns[0].entries).toHaveLength(1);          // tool_use only (result stored on entry.result)
+    const toolEntry = turns[0].entries[0];
+    expect(toolEntry.kind).toBe('tool_use');
+    expect(toolEntry.result).toBeDefined();
+    expect(toolEntry.result!.kind).toBe('tool_result');
+    expect(toolEntry.result!.label).toBe('Result · Bash');
+    expect(toolEntry.result!.body).toBe('file.txt\n');
   });
 
   it('mixed user message with text and tool_result becomes a user turn', () => {
