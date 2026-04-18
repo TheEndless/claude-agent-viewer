@@ -24,6 +24,8 @@ export interface Agent {
   details: AgentDetails;
   parentSessionId?: string;  // set if this agent is a subagent
   subagents: Agent[];        // populated by tree-building pass; always initialized to []
+  taskDescription?: string;  // set during tree-build; shown in sidebar as subagent label
+  agentCallDescs?: string[]; // descriptions from this agent's own Agent tool_use calls; NOT serialized to webview
 }
 
 export interface RawEvent {
@@ -47,11 +49,22 @@ export interface TurnAttachment {
   data?: string;        // base64 for images; raw text for documents
 }
 
+export interface HookInfo {
+  hookType: string;        // e.g. "Stop", "PostToolUse"
+  command: string;
+  durationMs: number;
+  hasOutput: boolean;
+  preventedContinuation: boolean;
+  errors: string[];
+}
+
 export interface TurnEntry {
   kind: 'tool_use' | 'tool_result' | 'thinking' | 'system';
   label: string;        // e.g. "Bash - ls -la", "Result - Bash", "Thinking"
   timestamp: string;    // ISO 8601
   body: string;         // raw content - caller decides JSON vs markdown
+  result?: TurnEntry;   // paired tool_result (tool_use only)
+  hooks?: HookInfo[];   // stop_hook_summary data (tool_use only)
 }
 
 export interface Turn {
@@ -60,4 +73,6 @@ export interface Turn {
   text?: string;        // markdown bubble text
   attachments: TurnAttachment[];
   entries: TurnEntry[]; // tool/thinking/system entries; empty on user turns
+  model?: string;       // from message.model (assistant turns only)
+  index?: number;       // 1-based assistant turn counter
 }
