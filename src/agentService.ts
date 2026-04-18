@@ -11,7 +11,7 @@ const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
 const KEEP_EVENTS = 20;
 const RUNNING_WINDOW_MS = 5 * 60 * 1000;
-const DONE_AGE_MS = 24 * 60 * 60 * 1000;
+const DONE_AGE_MS = 6 * 60 * 60 * 1000;
 const DEBOUNCE_MS = 200;
 const STATE_TICK_MS = 5000;
 
@@ -269,6 +269,9 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
   const trail: ToolCallSummary[] = [];
   const files: string[] = [];
   let latestUserPrompt: string | null = null;
+  let lastPrompt: string | null = null;
+  let customTitle: string | null = null;
+  let aiTitle: string | null = null;
   let subagentCount = 0;
   const agentCallDescs: string[] = [];
 
@@ -297,6 +300,16 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
       const text = extractUserText(content);
       if (text) latestUserPrompt = truncate(text, 200);
     }
+
+    if (type === 'last-prompt' && typeof evt.lastPrompt === 'string' && evt.lastPrompt) {
+      lastPrompt = truncate(evt.lastPrompt as string, 200);
+    }
+    if (type === 'custom-title' && typeof evt.customTitle === 'string' && evt.customTitle) {
+      customTitle = evt.customTitle as string;
+    }
+    if (type === 'ai-title' && typeof evt.aiTitle === 'string' && evt.aiTitle) {
+      aiTitle = evt.aiTitle as string;
+    }
   }
 
   return {
@@ -304,6 +317,9 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
       recentToolCalls: trail.slice(-MAX_TRAIL).reverse(),
       recentFiles: dedupeLastN(files, MAX_FILES),
       latestUserPrompt,
+      lastPrompt,
+      customTitle,
+      aiTitle,
       subagentCount,
     },
     agentCallDescs,

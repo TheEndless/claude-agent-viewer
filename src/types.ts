@@ -9,6 +9,9 @@ export interface AgentDetails {
   recentToolCalls: ToolCallSummary[];
   recentFiles: string[];
   latestUserPrompt: string | null;
+  lastPrompt: string | null;
+  customTitle: string | null;
+  aiTitle: string | null;
   subagentCount: number;
 }
 

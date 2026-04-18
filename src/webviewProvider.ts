@@ -255,7 +255,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .parent-header:hover { background: var(--vscode-list-hoverBackground); }
     .parent-header:hover .count-chip  { display: none; }
     .parent-header:hover .row-time    { display: none; }
-    .parent-header:hover .row-actions { opacity: 1; }
+    .parent-header:hover .row-actions { display: flex; }
 
     .parent-prompt {
       flex: 1;
@@ -322,7 +322,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       height: 22px;
-      padding: 0 8px 0 20px;
+      padding: 0 8px 0 32px;
       gap: 4px;
       cursor: pointer;
       user-select: none;
@@ -330,7 +330,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
     .subagent-row:hover { background: var(--vscode-list-hoverBackground); }
     .subagent-row:hover .row-time    { display: none; }
-    .subagent-row:hover .row-actions { opacity: 1; }
+    .subagent-row:hover .row-actions { display: flex; }
     .subagent-row.done-sub { opacity: 0.6; }
 
     .sub-task {
@@ -344,10 +344,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     .row-actions {
-      display: flex;
+      display: none;
       align-items: center;
       gap: 2px;
-      opacity: 0;
       flex-shrink: 0;
     }
     .action-btn {
@@ -463,7 +462,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const defaultOpen = effState === 'running' && subs.length > 0;
       const open = openSections[key] !== undefined ? openSections[key] : defaultOpen;
 
-      const prompt = parent.details && parent.details.latestUserPrompt;
+      const d = parent.details || {};
+      const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
       const promptHtml = prompt
         ? '<span class="parent-prompt">' + esc(prompt) + '</span>'
         : '<span class="parent-prompt no-prompt">(no prompt yet)</span>';
