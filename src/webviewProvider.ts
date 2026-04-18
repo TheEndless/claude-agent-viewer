@@ -3,7 +3,7 @@ import * as fsp from 'fs/promises';
 import { AgentService } from './agentService';
 import { Agent } from './types';
 import { findAgentPids, killAgent } from './processService';
-import { openTranscriptPreview, evict } from './transcriptPanel';
+import { openTranscriptPreview, evict, updateTranscriptPanels } from './transcriptPanel';
 
 const AUTO_REFRESH_INTERVAL = 5000;
 
@@ -35,7 +35,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       this._subscription?.dispose();
     });
 
-    this._subscription = this.agentService.onDidChange(() => this.postAgents());
+    this._subscription = this.agentService.onDidChange((agents) => {
+      this.postAgents();
+      updateTranscriptPanels(agents);
+    });
 
     webviewView.webview.html = this.getHtml();
     this.postAgents();
@@ -57,6 +60,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       mtimeMs: a.mtimeMs,
       details: a.details,
       parentSessionId: a.parentSessionId,
+      taskDescription: a.taskDescription,
       subagents: a.subagents.map(serialize),
     });
     const agents = this.agentService.getAgents().map(serialize);
@@ -178,7 +182,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       font-size: var(--vscode-font-size);
       color: var(--vscode-foreground);
       background: var(--vscode-sideBar-background);
-      padding: 0 8px 16px;
+      padding: 0 0 16px;
     }
 
     .header {
@@ -219,51 +223,79 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       50% { opacity: 1; }
     }
 
-    details.group {
-      margin-bottom: 8px;
-    }
-    details.group summary {
-      list-style: none;
-      cursor: pointer;
+    .row-header {
       display: flex;
       align-items: center;
-      gap: 6px;
-      padding: 4px 2px;
-      border-radius: 4px;
+      gap: 4px;
+      cursor: pointer;
       user-select: none;
+      border-radius: 2px;
+      overflow: hidden;
     }
-    details.group summary::-webkit-details-marker { display: none; }
-    details.group summary::before {
-      content: '▸';
-      display: inline-block;
-      font-size: 9px;
+    .row-header:hover { background: var(--vscode-list-hoverBackground); }
+
+    .row-caret {
+      flex-shrink: 0;
+      width: 16px;
+      height: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.12s ease;
       color: var(--vscode-icon-foreground);
-      transition: transform 0.1s ease;
-      width: 10px;
+      opacity: 0.6;
     }
-    details.group[open] summary::before {
-      transform: rotate(90deg);
-    }
-    .group-title {
+    .row-group.open > .row-header > .row-caret { transform: rotate(90deg); }
+
+    .row-label {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
       font-size: 11px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.5px;
       color: var(--vscode-sideBarSectionHeader-foreground);
     }
-    .group-count {
+    .row-label.proj {
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--vscode-foreground);
+      direction: rtl;
+      unicode-bidi: plaintext;
+    }
+    .row-label.sub {
+      font-weight: 500;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--vscode-foreground);
+    }
+
+    .row-count {
       font-size: 10px;
       background: var(--vscode-badge-background);
       color: var(--vscode-badge-foreground);
-      padding: 0 6px;
+      padding: 0 5px;
       border-radius: 8px;
-      line-height: 16px;
-      min-width: 18px;
+      line-height: 15px;
+      min-width: 16px;
       text-align: center;
+      flex-shrink: 0;
     }
 
+    .row-body { display: none; }
+    .row-group.open > .row-body { display: block; }
+
+    .top-group > .row-header  { padding: 6px 8px; }
+    .proj-group > .row-header { padding: 3px 8px 3px 16px; }
+    .sub-group  > .row-header { padding: 3px 8px 3px 24px; }
+    .sub-group  > .row-body > .card { margin: 2px 8px 2px 32px; }
+
     .empty {
-      padding: 8px 18px;
+      padding: 4px 14px;
       color: var(--vscode-disabledForeground);
       font-size: 11px;
     }
@@ -271,9 +303,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .card {
       background: var(--vscode-editor-background);
       border: 1px solid var(--vscode-widget-border, transparent);
-      border-radius: 6px;
-      padding: 8px 10px;
-      margin: 4px 0;
+      border-radius: 4px;
+      padding: 5px 8px;
+      margin: 2px 0;
       cursor: pointer;
     }
     .card:hover {
@@ -379,19 +411,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       font-size: 8px;
       transition: transform 0.1s ease;
     }
-    .sub-group-label {
-      font-size: 10px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
-      color: var(--vscode-foreground);
-      padding: 6px 2px 2px;
-      margin-top: 4px;
-      opacity: 0.55;
-      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.15));
-    }
-
-    .card-top {
+.card-top {
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -478,8 +498,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
 
-    // Preserve <details> open state across re-renders.
-    const openSections = { running: true, idle: true, done: false };
+    // Preserve <details> open state across re-renders, keyed by project name.
+    const openSections = {};
     // Preserve per-card expanded state across re-renders.
     const expanded = new Set();
     // Tracks which parent cards have their subagent list expanded (collapsed by default).
@@ -550,36 +570,30 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         : '';
       const isOpen = expanded.has(a.sessionId);
       const subs = a.subagents || [];
-      const hasSubs = subs.length > 0;
-      const subsExpanded = subExpanded.has(a.sessionId);
       const activeSubs = subs.filter(s => s.state === 'running');
       const inactiveSubs = subs.filter(s => s.state !== 'running');
-      const subToggleHtml = hasSubs
-        ? '<div class="sub-toggle" data-toggle-subs="' + esc(a.sessionId) + '">' +
-            '<span class="sub-caret" style="' + (subsExpanded ? 'transform:rotate(90deg)' : '') + '">\u25b8</span>' +
-            subs.length + ' subagent' + (subs.length > 1 ? 's' : '') +
-          '</div>'
-        : '';
-      const activeHtml = activeSubs.length === 0 ? '' :
-        '<div class="sub-group-label">Active</div>' +
-        activeSubs.map(s => renderCard(s, now, indent + 1)).join('');
-      const inactiveHtml = inactiveSubs.length === 0 ? '' :
-        '<div class="sub-group-label">Inactive</div>' +
-        inactiveSubs.map(s => renderCard(s, now, indent + 1)).join('');
-      const subListHtml = hasSubs
-        ? '<div class="subagents-list"' + (subsExpanded ? '' : ' style="display:none"') + '>' +
-            activeHtml + inactiveHtml +
-          '</div>'
-        : '';
+      function subSection(key, label, list) {
+        if (list.length === 0) return '';
+        const open = subExpanded.has(key);
+        return '<div class="sub-toggle" data-toggle-subs="' + esc(key) + '">' +
+            '<span class="sub-caret" style="' + (open ? 'transform:rotate(90deg)' : '') + '">\u25b8</span>' +
+            list.length + ' ' + label + (list.length > 1 ? 's' : '') +
+          '</div>' +
+          '<div class="subagents-list"' + (open ? '' : ' style="display:none"') + '>' +
+            list.map(s => renderCard(s, now, indent + 1)).join('') +
+          '</div>';
+      }
+      const subHtml = subSection(a.sessionId + ':active', 'active subagent', activeSubs) +
+                      subSection(a.sessionId + ':inactive', 'inactive subagent', inactiveSubs);
       return '<div class="card' + (isOpen ? ' expanded' : '') + (indent > 0 ? ' subagent-card' : '') + '" data-sid="' + esc(a.sessionId) + '" style="' + (indent > 0 ? 'margin-left:16px;border-left:2px solid var(--vscode-panel-border);' : '') + '">' +
         '<div class="card-top">' +
           '<div class="card-info">' +
             '<div class="card-name">' +
               '<span class="status-dot ' + esc(a.state) + '"></span>' +
-              esc(a.projectName) +
+              esc(a.activity) +
               '<span class="chev">\u25b8</span>' +
             '</div>' +
-            '<div class="card-meta">' + esc(a.activity) + ' \u00b7 ' + esc(relTime(a.mtimeMs, now)) + '</div>' +
+            '<div class="card-meta">' + esc(relTime(a.mtimeMs, now)) + '</div>' +
           '</div>' +
           '<div class="card-actions">' +
             '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">\u{1f4ac}</button>' +
@@ -590,22 +604,72 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           '</div>' +
         '</div>' +
         renderDetails(a, now) +
-        subToggleHtml +
-        subListHtml +
+        subHtml +
       '</div>';
     }
 
-    function renderSection(state, title, list, now) {
-      const open = openSections[state];
-      const body = list.length === 0
-        ? '<div class="empty">No ' + title.toLowerCase() + ' agents</div>'
-        : list.map(a => renderCard(a, now)).join('');
-      return '<details class="group" data-state="' + state + '"' + (open ? ' open' : '') + '>' +
-        '<summary>' +
-          '<span class="group-title">' + title + '</span>' +
-          '<span class="group-count">' + list.length + '</span>' +
-        '</summary>' + body +
-      '</details>';
+    const CARET = '<span class="row-caret"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
+
+    function renderSubGroup(label, stateKey, agents, now, cwd) {
+      if (agents.length === 0) return '';
+      const key = 'sub:' + stateKey + ':' + cwd;
+      const open = openSections[key] !== undefined ? openSections[key] : (stateKey === 'active');
+      const dotCls = stateKey === 'active' ? 'running' : stateKey === 'idle' ? 'idle' : 'done';
+      const cards = agents.sort((a, b) => b.mtimeMs - a.mtimeMs).map(a => renderCard(a, now, 0)).join('');
+      return '<div class="row-group sub-group' + (open ? ' open' : '') + '" data-key="' + esc(key) + '">' +
+        '<div class="row-header">' +
+          CARET +
+          '<span class="status-dot ' + dotCls + '"></span>' +
+          '<span class="row-label sub">' + label + '</span>' +
+          '<span class="row-count">' + agents.length + '</span>' +
+        '</div>' +
+        '<div class="row-body">' + cards + '</div>' +
+      '</div>';
+    }
+
+    function renderProjectSection(cwd, agents, now) {
+      const key = 'proj:' + cwd;
+      const open = openSections[key] !== undefined ? openSections[key] : false;
+      const topState = agents.some(a => a.state === 'running') ? 'running'
+                     : agents.some(a => a.state === 'idle') ? 'idle' : 'done';
+      const active = agents.filter(a => a.state === 'running');
+      const idle   = agents.filter(a => a.state === 'idle');
+      const done   = agents.filter(a => a.state === 'done');
+      return '<div class="row-group proj-group' + (open ? ' open' : '') + '" data-key="' + esc(key) + '">' +
+        '<div class="row-header">' +
+          CARET +
+          '<span class="status-dot ' + topState + '"></span>' +
+          '<span class="row-label proj">' + esc(cwd) + '</span>' +
+          '<span class="row-count">' + agents.length + '</span>' +
+        '</div>' +
+        '<div class="row-body">' +
+          renderSubGroup('Active', 'active', active, now, cwd) +
+          renderSubGroup('Idle', 'idle', idle, now, cwd) +
+          renderSubGroup('Done', 'done', done, now, cwd) +
+        '</div>' +
+      '</div>';
+    }
+
+    function renderTopSection(label, stateKey, projects, now) {
+      if (projects.length === 0) return '';
+      const key = 'top:' + stateKey;
+      const open = openSections[key] !== undefined ? openSections[key] : (stateKey === 'active');
+      const sorted = [...projects].sort((a, b) =>
+        Math.max(...b[1].map(x => x.mtimeMs)) - Math.max(...a[1].map(x => x.mtimeMs))
+      );
+      const dotCls = stateKey === 'active' ? 'running' : stateKey === 'idle' ? 'idle' : 'done';
+      const total = projects.reduce((s, [, a]) => s + a.length, 0);
+      return '<div class="row-group top-group' + (open ? ' open' : '') + '" data-key="' + esc(key) + '">' +
+        '<div class="row-header">' +
+          CARET +
+          '<span class="status-dot ' + dotCls + '"></span>' +
+          '<span class="row-label">' + label + '</span>' +
+          '<span class="row-count">' + total + '</span>' +
+        '</div>' +
+        '<div class="row-body">' +
+          sorted.map(([cwd, proj]) => renderProjectSection(cwd, proj, now)).join('') +
+        '</div>' +
+      '</div>';
     }
 
     function render(agents, now, ready) {
@@ -614,7 +678,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const collectIds = a => { live.add(a.sessionId); (a.subagents || []).forEach(collectIds); };
       agents.forEach(collectIds);
       for (const sid of [...expanded]) if (!live.has(sid)) expanded.delete(sid);
-      for (const sid of [...subExpanded]) if (!live.has(sid)) subExpanded.delete(sid);
+      for (const key of [...subExpanded]) if (!live.has(key.split(':')[0])) subExpanded.delete(key);
 
       if (agents.length === 0) {
         root.className = 'empty-global';
@@ -625,40 +689,54 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
       root.className = '';
       const topLevel = agents.filter(a => !a.parentSessionId);
-      const running = topLevel.filter(a => a.state === 'running');
-      const idle    = topLevel.filter(a => a.state === 'idle');
-      const done    = topLevel.filter(a => a.state === 'done');
-      root.innerHTML =
-        renderSection('running', 'Running', running, now) +
-        renderSection('idle', 'Idle', idle, now) +
-        renderSection('done', 'Done', done, now);
-    }
 
-    // Track <details> open state so polling re-renders don't collapse the user's view.
-    root.addEventListener('toggle', (e) => {
-      const el = e.target;
-      if (el instanceof HTMLDetailsElement && el.classList.contains('group')) {
-        const state = el.dataset.state;
-        if (state) openSections[state] = el.open;
+      const projectMap = new Map();
+      topLevel.forEach(a => {
+        if (!projectMap.has(a.cwd)) projectMap.set(a.cwd, []);
+        projectMap.get(a.cwd).push(a);
+      });
+
+      const activeProjects = [], idleProjects = [], doneProjects = [];
+      for (const entry of projectMap) {
+        if (entry[1].some(a => a.state === 'running')) activeProjects.push(entry);
+        else if (entry[1].some(a => a.state === 'idle')) idleProjects.push(entry);
+        else doneProjects.push(entry);
       }
-    }, true);
+
+      root.innerHTML =
+        renderTopSection('Active', 'active', activeProjects, now) +
+        renderTopSection('Idle', 'idle', idleProjects, now) +
+        renderTopSection('Done', 'done', doneProjects, now);
+    }
 
     root.addEventListener('click', (e) => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
 
-      // Sub-toggle: collapse/expand subagent list independently of card details.
+      // Row-group toggle (custom collapsibles).
+      const rowHeader = target.closest('.row-header');
+      if (rowHeader && !target.closest('[data-act]') && !target.closest('[data-toggle-subs]')) {
+        const group = rowHeader.closest('.row-group');
+        if (group) {
+          const key = group.dataset.key;
+          const isOpen = group.classList.toggle('open');
+          if (key) openSections[key] = isOpen;
+          return;
+        }
+      }
+
+      // Sub-toggle: each toggle is immediately followed by its own subagents-list.
       const subToggle = target.closest('[data-toggle-subs]');
       if (subToggle) {
-        const sid = subToggle.getAttribute('data-toggle-subs');
-        const card = subToggle.closest('.card[data-sid]');
-        if (!sid || !card) return;
-        if (subExpanded.has(sid)) subExpanded.delete(sid);
-        else subExpanded.add(sid);
+        const key = subToggle.getAttribute('data-toggle-subs');
+        if (!key) return;
+        if (subExpanded.has(key)) subExpanded.delete(key);
+        else subExpanded.add(key);
+        const open = subExpanded.has(key);
         const caret = subToggle.querySelector('.sub-caret');
-        const list = card.querySelector('.subagents-list');
-        if (list) list.style.display = subExpanded.has(sid) ? '' : 'none';
-        if (caret) caret.style.transform = subExpanded.has(sid) ? 'rotate(90deg)' : '';
+        const list = subToggle.nextElementSibling;
+        if (list && list.classList.contains('subagents-list')) list.style.display = open ? '' : 'none';
+        if (caret) caret.style.transform = open ? 'rotate(90deg)' : '';
         return;
       }
 
