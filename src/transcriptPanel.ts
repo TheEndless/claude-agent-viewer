@@ -50,13 +50,75 @@ function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+function inlineMd(s: string): string {
+  const e = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return s
+    .replace(/`([^`]+)`/g,           (_, c) => `<code>${e(c)}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g,     (_, t) => `<strong>${e(t)}</strong>`)
+    .replace(/__([^_]+)__/g,         (_, t) => `<strong>${e(t)}</strong>`)
+    .replace(/\*([^*\n]+)\*/g,       (_, t) => `<em>${e(t)}</em>`)
+    .replace(/_([^_\n]+)_/g,         (_, t) => `<em>${e(t)}</em>`)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => `<a href="${e(url)}">${e(text)}</a>`);
+}
+
+function mdToHtml(raw: string): string {
+  const lines = raw.split('\n');
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.startsWith('```')) {
+      const code: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith('```')) { code.push(lines[i]); i++; }
+      i++;
+      out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
+      continue;
+    }
+    const hm = line.match(/^(#{1,3})\s+(.+)/);
+    if (hm) { out.push(`<h${hm[1].length}>${inlineMd(hm[2])}</h${hm[1].length}>`); i++; continue; }
+    if (line.startsWith('> ')) {
+      const bq: string[] = [];
+      while (i < lines.length && lines[i].startsWith('> ')) { bq.push(lines[i].slice(2)); i++; }
+      out.push(`<blockquote>${inlineMd(bq.join(' '))}</blockquote>`);
+      continue;
+    }
+    if (/^[-*+] /.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^[-*+] /.test(lines[i])) { items.push(`<li>${inlineMd(lines[i].slice(2))}</li>`); i++; }
+      out.push(`<ul>${items.join('')}</ul>`);
+      continue;
+    }
+    if (/^\d+\. /.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\d+\. /.test(lines[i])) { items.push(`<li>${inlineMd(lines[i].replace(/^\d+\. /, ''))}</li>`); i++; }
+      out.push(`<ol>${items.join('')}</ol>`);
+      continue;
+    }
+    if (line.trim() === '') { i++; continue; }
+    const para: string[] = [];
+    while (i < lines.length
+           && lines[i].trim() !== ''
+           && !lines[i].startsWith('```')
+           && !/^#{1,3} /.test(lines[i])
+           && !lines[i].startsWith('> ')
+           && !/^[-*+] /.test(lines[i])
+           && !/^\d+\. /.test(lines[i])) {
+      para.push(lines[i]); i++;
+    }
+    if (para.length) out.push(`<p>${inlineMd(para.join(' '))}</p>`);
+    else i++;
+  }
+  return out.join('');
+}
+
 function renderTurn(turn: Turn): string {
   return turn.role === 'user' ? renderUserTurn(turn) : renderAssistantTurn(turn);
 }
 
 function renderUserTurn(turn: Turn): string {
   const attachHtml = turn.attachments.map(renderAttachment).join('');
-  const textHtml = turn.text ? `<div data-md>${esc(turn.text)}</div>` : '';
+  const textHtml = turn.text ? `<div class="bubble-text">${mdToHtml(turn.text)}</div>` : '';
   const bubbleInner = (attachHtml ? `<div class="bubble-attachments">${attachHtml}</div>` : '') + textHtml;
   return `<div class="turn user">
     <div class="turn-head">
@@ -75,7 +137,7 @@ function renderAssistantTurn(turn: Turn): string {
     ? `<div class="entries">${turn.entries.map(renderEntry).join('')}</div>`
     : '';
   const bubbleHtml = turn.text
-    ? `<div class="bubble" data-md>${esc(turn.text)}</div>`
+    ? `<div class="bubble">${mdToHtml(turn.text)}</div>`
     : '';
   if (!entriesHtml && !bubbleHtml) return '';
   return `<div class="turn assistant">
@@ -90,15 +152,33 @@ function renderAssistantTurn(turn: Turn): string {
   </div>`;
 }
 
+function renderEntryBody(body: string): { html: string; cls: string } {
+  try {
+    const parsed = JSON.parse(body);
+    return { html: jsonHlTs(JSON.stringify(parsed, null, 2)), cls: 'json' };
+  } catch {
+    return { html: mdToHtml(body), cls: 'md' };
+  }
+}
+
+function jsonHlTs(str: string): string {
+  return esc(str)
+    .replace(/(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)\s*:/g, '<span class="jk">$1</span>:')
+    .replace(/:\s*(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)/g, ': <span class="js">$1</span>')
+    .replace(/:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)/g, ': <span class="jn">$1</span>')
+    .replace(/:\s*(true|false|null)/g, ': <span class="jb">$1</span>');
+}
+
 function renderEntry(entry: TurnEntry): string {
   const kindClass = entry.kind.replace('_', '-');
   const icon = entryIcon(entry.kind);
+  const { html: bodyHtml, cls: bodyCls } = renderEntryBody(entry.body);
   return `<div class="entry ${kindClass}">
     <div class="entry-row">
       <span class="entry-caret"><svg><use href="#icon-chevron"/></svg></span>
       <div class="pill"><span>${icon}</span><span class="p-text">${esc(entry.label)}</span><span class="p-ts" data-iso="${esc(entry.timestamp)}"></span></div>
     </div>
-    <div class="entry-body">${esc(entry.body)}</div>
+    <div class="entry-body ${bodyCls}">${bodyHtml}</div>
   </div>`;
 }
 
@@ -268,96 +348,6 @@ ${turnsHtml}
 </div>
 
 <script>
-  function renderMd(raw) {
-    const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    const lines = raw.split('\n');
-    const result = [];
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i];
-      if (line.startsWith('\`\`\`')) {
-        const code = [];
-        i++;
-        while (i < lines.length && !lines[i].startsWith('\`\`\`')) { code.push(lines[i]); i++; }
-        i++;
-        result.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>');
-        continue;
-      }
-      const hm = line.match(/^(#{1,3})\s+(.+)/);
-      if (hm) { result.push('<h' + hm[1].length + '>' + inlineMd(hm[2]) + '</h' + hm[1].length + '>'); i++; continue; }
-      if (line.startsWith('> ')) {
-        const bq = [];
-        while (i < lines.length && lines[i].startsWith('> ')) { bq.push(lines[i].slice(2)); i++; }
-        result.push('<blockquote>' + inlineMd(bq.join(' ')) + '</blockquote>');
-        continue;
-      }
-      if (/^[-*+]\s/.test(line)) {
-        const items = [];
-        while (i < lines.length && /^[-*+]\s/.test(lines[i])) { items.push('<li>' + inlineMd(lines[i].replace(/^[-*+]\s/,'')) + '</li>'); i++; }
-        result.push('<ul>' + items.join('') + '</ul>');
-        continue;
-      }
-      if (/^\d+\.\s/.test(line)) {
-        const items = [];
-        while (i < lines.length && /^\d+\.\s/.test(lines[i])) { items.push('<li>' + inlineMd(lines[i].replace(/^\d+\.\s/,'')) + '</li>'); i++; }
-        result.push('<ol>' + items.join('') + '</ol>');
-        continue;
-      }
-      if (line.trim() === '') { i++; continue; }
-      const para = [];
-      while (i < lines.length
-             && lines[i].trim() !== ''
-             && !lines[i].startsWith('\`\`\`')
-             && !/^#{1,3}\s/.test(lines[i])
-             && !lines[i].startsWith('> ')
-             && !/^[-*+]\s/.test(lines[i])
-             && !/^\d+\.\s/.test(lines[i])) {
-        para.push(lines[i]); i++;
-      }
-      if (para.length) result.push('<p>' + inlineMd(para.join(' ')) + '</p>');
-      else i++;
-    }
-    return result.join('');
-  }
-
-  function inlineMd(s) {
-    const esc = t => t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-    return s
-      .replace(/\`([^\`]+)\`/g, (_, c) => '<code>' + esc(c) + '</code>')
-      .replace(/\*\*([^*]+)\*\*/g, (_, t) => '<strong>' + esc(t) + '</strong>')
-      .replace(/__([^_]+)__/g, (_, t) => '<strong>' + esc(t) + '</strong>')
-      .replace(/\*([^*]+)\*/g, (_, t) => '<em>' + esc(t) + '</em>')
-      .replace(/_([^_]+)_/g, (_, t) => '<em>' + esc(t) + '</em>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => '<a href="' + esc(url) + '">' + esc(text) + '</a>');
-  }
-
-  function jsonHL(str) {
-    return str
-      .replace(/("(?:\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*")\s*:/g, '<span class="jk">$1</span>:')
-      .replace(/:\s*("(?:\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*")/g, ': <span class="js">$1</span>')
-      .replace(/:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)/g, ': <span class="jn">$1</span>')
-      .replace(/:\s*(true|false|null)/g, ': <span class="jb">$1</span>');
-  }
-
-  document.querySelectorAll('.entry-body').forEach(el => {
-    const raw = el.textContent.trim();
-    try {
-      const parsed = JSON.parse(raw);
-      el.innerHTML = jsonHL(JSON.stringify(parsed, null, 2));
-      el.classList.add('json');
-    } catch {
-      el.innerHTML = renderMd(raw);
-      el.classList.add('md');
-    }
-  });
-
-  document.querySelectorAll('.bubble[data-md]').forEach(el => {
-    el.innerHTML = renderMd(el.textContent.trim());
-  });
-  document.querySelectorAll('.bubble [data-md]').forEach(el => {
-    el.innerHTML = renderMd(el.textContent.trim());
-  });
-
   function fmtFull(iso) {
     return new Date(iso).toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true });
   }
