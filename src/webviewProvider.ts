@@ -216,8 +216,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       user-select: none;
     }
     .card-top:hover { background: rgba(128,128,128,0.05); }
-    .card-top:hover .card-time    { display: none; }
-    .card-top:hover .card-actions { display: flex; }
+    .card-top:hover .card-slot .card-time    { display: none; }
+    .card-top:hover .card-slot .card-actions { display: flex; }
 
     .card-name {
       flex: 1;
@@ -230,17 +230,23 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
     .card-name.no-prompt { color: var(--vscode-disabledForeground); }
 
+    .card-slot {
+      width: 72px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+    }
+
     .card-time {
       font-size: 10px;
       color: var(--vscode-disabledForeground);
-      flex-shrink: 0;
     }
 
     .card-actions {
       display: none;
       align-items: center;
       gap: 2px;
-      flex-shrink: 0;
     }
 
     .card-path {
@@ -291,8 +297,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       border-top: 1px solid color-mix(in srgb, var(--vscode-widget-border, var(--vscode-input-border)) 50%, transparent);
     }
     .sub-row:hover { background: var(--vscode-list-hoverBackground); }
-    .sub-row:hover .sub-time    { display: none; }
-    .sub-row:hover .sub-actions { display: flex; }
+    .sub-row:hover .card-slot .sub-time    { display: none; }
+    .sub-row:hover .card-slot .sub-actions { display: flex; }
     .sub-row.done-sub { opacity: 0.6; }
 
     .sub-name {
@@ -307,13 +313,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .sub-time {
       font-size: 10px;
       color: var(--vscode-disabledForeground);
-      flex-shrink: 0;
     }
     .sub-actions {
       display: none;
       align-items: center;
       gap: 2px;
-      flex-shrink: 0;
     }
 
     .action-btn {
@@ -405,12 +409,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return '<div class="sub-row' + doneCls + '" data-sid="' + esc(sub.sessionId) + '">' +
         '<span class="status-dot ' + esc(sub.state) + '"></span>' +
         '<span class="sub-name">' + esc(task) + '</span>' +
-        '<span class="sub-time">' + relTimeShort(sub.mtimeMs, now) + '</span>' +
-        '<div class="sub-actions">' +
-          '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
-          '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
-          stopBtn +
-          '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
+        '<div class="card-slot">' +
+          '<span class="sub-time">' + relTimeShort(sub.mtimeMs, now) + '</span>' +
+          '<div class="sub-actions">' +
+            '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+            '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
+            stopBtn +
+            '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
+          '</div>' +
         '</div>' +
       '</div>';
     }
@@ -446,12 +452,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         '<div class="card-top">' +
           '<span class="status-dot ' + esc(effState) + '"></span>' +
           '<span class="card-name' + nameCls + '">' + esc(prompt || '(no prompt yet)') + '</span>' +
-          '<span class="card-time">' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
-          '<div class="card-actions">' +
-            '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
-            '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
-            stopBtn +
-            '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
+          '<div class="card-slot">' +
+            '<span class="card-time">' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
+            '<div class="card-actions">' +
+              '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+              '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
+              stopBtn +
+              '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
+            '</div>' +
           '</div>' +
         '</div>' +
         '<div class="card-path"><span class="proj-path">\u200E' + esc(parent.cwd) + '</span></div>' +
