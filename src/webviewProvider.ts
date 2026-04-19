@@ -217,7 +217,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
     .card-top:hover { background: rgba(128,128,128,0.05); }
     .card-top:hover .card-time    { display: none; }
-    .card-top:hover .card-actions { opacity: 1; }
+    .card-top:hover .card-actions { display: flex; }
 
     .card-name {
       flex: 1;
@@ -237,10 +237,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     .card-actions {
-      display: flex;
+      display: none;
       align-items: center;
       gap: 2px;
-      opacity: 0;
       flex-shrink: 0;
     }
 
@@ -293,7 +292,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
     .sub-row:hover { background: var(--vscode-list-hoverBackground); }
     .sub-row:hover .sub-time    { display: none; }
-    .sub-row:hover .sub-actions { opacity: 1; }
+    .sub-row:hover .sub-actions { display: flex; }
     .sub-row.done-sub { opacity: 0.6; }
 
     .sub-name {
@@ -311,10 +310,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       flex-shrink: 0;
     }
     .sub-actions {
-      display: flex;
+      display: none;
       align-items: center;
       gap: 2px;
-      opacity: 0;
       flex-shrink: 0;
     }
 
@@ -478,11 +476,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function render(agents, now, ready) {
+      if (!ready) {
+        root.className = 'empty-global';
+        root.innerHTML = 'Scanning\u2026';
+        return;
+      }
       if (!agents || agents.length === 0) {
         root.className = 'empty-global';
-        root.innerHTML = ready
-          ? 'No agents yet \u2014 run <code>claude</code> in any project'
-          : 'Scanning\u2026';
+        root.innerHTML = 'No agents yet \u2014 run <code>claude</code> in any project';
         return;
       }
       root.className = '';
