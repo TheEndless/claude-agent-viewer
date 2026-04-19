@@ -264,8 +264,8 @@ function resolveCwd(filePath: string, events: RawEvent[]): string {
 }
 
 function normalizeCwd(p: string): string {
-  // Normalize slashes and lowercase the drive letter so e.g. C:\ and c:/ group together.
-  return path.normalize(p).replace(/^[A-Z]:/, d => d.toLowerCase());
+  // Normalize slashes; uppercase drive letter for consistent Windows display (e.g. c:\ -> C:\).
+  return path.normalize(p).replace(/^[a-z]:/, d => d.toUpperCase());
 }
 
 function classifyState(mtimeMs: number, now: number, terminated: boolean, hasActiveSubagent = false): AgentState {
