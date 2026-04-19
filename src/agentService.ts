@@ -68,6 +68,9 @@ export class AgentService {
   private async refreshFile(filePath: string): Promise<void> {
     try {
       const stat = await fsp.stat(filePath);
+      // During initial scan, skip files older than 6 hours — they're archived sessions
+      // that slow startup without adding value to the primary view.
+      if (!this._ready && (Date.now() - stat.mtimeMs) > DONE_AGE_MS) return;
       const sessionId = sessionIdFromPath(filePath);
       // One-time full-file scan for title events. Subsequent updates use the cached
       // values (titles don't change). Without this, ai-title/custom-title events

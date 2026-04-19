@@ -198,115 +198,105 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .status-dot.idle    { background: #d29922; }
     .status-dot.done    { background: #6e7681; }
 
-    .row-caret {
-      flex-shrink: 0;
-      width: 16px;
-      height: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: transform 0.12s ease;
-      color: var(--vscode-icon-foreground);
-      opacity: 0.6;
+    .card {
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-widget-border, var(--vscode-input-border));
+      border-radius: 5px;
+      margin: 3px 8px;
+      overflow: hidden;
     }
-    .parent-row.open > .parent-header > .row-caret,
-    .archive-section.open > .archive-row > .row-caret { transform: rotate(90deg); }
+    .card:hover { border-color: color-mix(in srgb, var(--vscode-focusBorder) 60%, transparent); }
 
-    .parent-header {
+    .card-top {
       display: flex;
       align-items: center;
-      height: 22px;
-      padding: 0 8px;
-      gap: 4px;
+      gap: 5px;
+      padding: 7px 8px 4px;
       cursor: pointer;
       user-select: none;
-      border-radius: 2px;
     }
-    .parent-header:hover { background: var(--vscode-list-hoverBackground); }
-    .parent-header:hover .count-chip  { display: none; }
-    .parent-header:hover .row-time    { display: none; }
-    .parent-header:hover .row-actions { display: flex; }
+    .card-top:hover { background: rgba(128,128,128,0.05); }
+    .card-top:hover .card-time    { display: none; }
+    .card-top:hover .card-actions { opacity: 1; }
 
-    .parent-prompt {
+    .card-name {
       flex: 1;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
       min-width: 0;
       font-size: 13px;
-      font-weight: 400;
       color: var(--vscode-foreground);
     }
-    .parent-prompt.no-prompt { color: var(--vscode-disabledForeground); }
+    .card-name.no-prompt { color: var(--vscode-disabledForeground); }
 
-    .count-chip {
-      font-size: 10px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      padding: 0 5px;
-      border-radius: 8px;
-      line-height: 15px;
-      min-width: 16px;
-      text-align: center;
-      flex-shrink: 0;
-    }
-
-    .row-time {
+    .card-time {
       font-size: 10px;
       color: var(--vscode-disabledForeground);
       flex-shrink: 0;
     }
 
-    .parent-body { display: none; }
-    .parent-row.open > .parent-body { display: block; }
-
-    .parent-secondary {
+    .card-actions {
       display: flex;
       align-items: center;
-      height: 18px;
-      padding: 0 8px 0 39px;
+      gap: 2px;
+      opacity: 0;
+      flex-shrink: 0;
+    }
+
+    .card-path {
+      padding: 0 8px 6px 20px;
       font-size: 10px;
       color: var(--vscode-descriptionForeground);
       overflow: hidden;
-      white-space: nowrap;
     }
-    .parent-secondary .proj-path {
-      flex: 1;
-      min-width: 0;
+    .proj-path {
+      display: block;
       overflow: hidden;
       white-space: nowrap;
       text-overflow: ellipsis;
       direction: rtl;
       text-align: left;
     }
-    /* LRM character inside the span forces LTR rendering of the path while the
-       container's RTL direction pushes overflow (and the ellipsis) to the start. */
-    .parent-secondary .sep {
-      flex-shrink: 0;
-      padding: 0 4px;
-      color: var(--vscode-disabledForeground);
-    }
-    .parent-secondary .p-mtime {
-      flex-shrink: 0;
-      color: var(--vscode-disabledForeground);
-    }
 
-    .subagent-row {
+    .sub-toggle {
       display: flex;
       align-items: center;
-      height: 22px;
-      padding: 0 8px 0 39px;
-      gap: 4px;
+      gap: 5px;
+      padding: 4px 8px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
       cursor: pointer;
       user-select: none;
-      border-radius: 2px;
+      border-top: 1px solid var(--vscode-widget-border, var(--vscode-input-border));
     }
-    .subagent-row:hover { background: var(--vscode-list-hoverBackground); }
-    .subagent-row:hover .row-time    { display: none; }
-    .subagent-row:hover .row-actions { display: flex; }
-    .subagent-row.done-sub { opacity: 0.6; }
+    .sub-toggle:hover { color: var(--vscode-foreground); background: rgba(128,128,128,0.04); }
+    .sub-caret {
+      display: inline-block;
+      font-size: 9px;
+      transition: transform 0.1s;
+      opacity: 0.5;
+    }
+    .card.subs-open .sub-caret { transform: rotate(90deg); }
+    .sub-list { display: none; }
+    .card.subs-open .sub-list { display: block; }
 
-    .sub-task {
+    .sub-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      height: 22px;
+      padding: 0 8px 0 20px;
+      cursor: pointer;
+      user-select: none;
+      border-top: 1px solid color-mix(in srgb, var(--vscode-widget-border, var(--vscode-input-border)) 50%, transparent);
+    }
+    .sub-row:hover { background: var(--vscode-list-hoverBackground); }
+    .sub-row:hover .sub-time    { display: none; }
+    .sub-row:hover .sub-actions { opacity: 1; }
+    .sub-row.done-sub { opacity: 0.6; }
+
+    .sub-name {
       flex: 1;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -315,13 +305,19 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       font-size: 12px;
       color: var(--vscode-foreground);
     }
-
-    .row-actions {
-      display: none;
-      align-items: center;
-      gap: 2px;
+    .sub-time {
+      font-size: 10px;
+      color: var(--vscode-disabledForeground);
       flex-shrink: 0;
     }
+    .sub-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      opacity: 0;
+      flex-shrink: 0;
+    }
+
     .action-btn {
       background: none;
       border: none;
@@ -333,10 +329,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
     }
-    .action-btn:hover {
-      background: var(--vscode-toolbar-hoverBackground);
-      color: var(--vscode-foreground);
-    }
+    .action-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
     .action-btn.danger:hover { color: #f85149; }
 
     .archive-divider {
@@ -357,10 +350,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-descriptionForeground);
     }
     .archive-row:hover { background: var(--vscode-list-hoverBackground); }
+    .archive-section.open > .archive-row > .arch-caret { transform: rotate(90deg); }
+    .arch-caret { display: inline-block; font-size: 9px; transition: transform 0.1s; opacity: 0.5; }
     .archive-label { flex: 1; }
     .archive-count { color: var(--vscode-disabledForeground); flex-shrink: 0; }
 
-    .archive-body { display: none; opacity: 0.6; }
+    .archive-body { display: none; opacity: 0.65; }
     .archive-section.open > .archive-body { display: block; }
   </style>
 </head>
@@ -403,19 +398,17 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return subs.reduce((m, s) => Math.max(m, s.mtimeMs), p.mtimeMs);
     }
 
-    const CARET = '<span class="row-caret"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
-
-    function renderSubagentRow(sub, now) {
+    function renderSubRow(sub, now) {
       const task = sub.taskDescription || (sub.details && sub.details.latestUserPrompt) || sub.sessionId.slice(0, 8);
       const doneCls = sub.state === 'done' ? ' done-sub' : '';
       const stopBtn = sub.state === 'running'
         ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
         : '';
-      return '<div class="subagent-row' + doneCls + '" data-sid="' + esc(sub.sessionId) + '">' +
+      return '<div class="sub-row' + doneCls + '" data-sid="' + esc(sub.sessionId) + '">' +
         '<span class="status-dot ' + esc(sub.state) + '"></span>' +
-        '<span class="sub-task">' + esc(task) + '</span>' +
-        '<span class="row-time">\u00b7 ' + relTimeShort(sub.mtimeMs, now) + '</span>' +
-        '<div class="row-actions">' +
+        '<span class="sub-name">' + esc(task) + '</span>' +
+        '<span class="sub-time">' + relTimeShort(sub.mtimeMs, now) + '</span>' +
+        '<div class="sub-actions">' +
           '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
           '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
           stopBtn +
@@ -424,53 +417,47 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       '</div>';
     }
 
-    function renderParent(parent, now) {
+    function renderCard(parent, now) {
       const key = 'parent:' + parent.sessionId;
       const allSubs = parent.subagents || [];
-      const subs = allSubs.filter(s => s.state !== 'done');
+      const activeSubs = allSubs.filter(s => s.state !== 'done');
       const effState = parentEffectiveState(parent);
-      const defaultOpen = effState === 'running' && subs.length > 0;
-      const open = openSections[key] !== undefined ? openSections[key] : defaultOpen;
+      const subsOpen = openSections[key + ':subs'] !== undefined
+        ? openSections[key + ':subs']
+        : effState === 'running' && activeSubs.length > 0;
 
       const d = parent.details || {};
       const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
-      const promptHtml = prompt
-        ? '<span class="parent-prompt">' + esc(prompt) + '</span>'
-        : '<span class="parent-prompt no-prompt">(no prompt yet)</span>';
-
-      const countHtml = subs.length > 0
-        ? '<span class="count-chip">' + subs.length + '</span>'
-        : '';
+      const nameCls = prompt ? '' : ' no-prompt';
 
       const stopBtn = effState === 'running'
         ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
         : '';
 
-      const subRows = subs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs)
-        .map(s => renderSubagentRow(s, now)).join('');
+      const subSection = activeSubs.length > 0
+        ? '<div class="sub-toggle" data-sub-key="' + esc(key) + '">' +
+            '<span class="sub-caret">\u25b6</span>' +
+            '<span>' + activeSubs.length + ' subagent' + (activeSubs.length !== 1 ? 's' : '') + '</span>' +
+          '</div>' +
+          '<div class="sub-list">' +
+            activeSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
+          '</div>'
+        : '';
 
-      return '<div class="parent-row' + (open ? ' open' : '') + '" data-key="' + esc(key) + '" data-sid="' + esc(parent.sessionId) + '">' +
-        '<div class="parent-header">' +
-          CARET +
+      return '<div class="card' + (subsOpen ? ' subs-open' : '') + '" data-key="' + esc(key) + '" data-sid="' + esc(parent.sessionId) + '">' +
+        '<div class="card-top">' +
           '<span class="status-dot ' + esc(effState) + '"></span>' +
-          promptHtml +
-          countHtml +
-          '<span class="row-time">\u00b7 ' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
-          '<div class="row-actions">' +
+          '<span class="card-name' + nameCls + '">' + esc(prompt || '(no prompt yet)') + '</span>' +
+          '<span class="card-time">' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
+          '<div class="card-actions">' +
             '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
             '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
             stopBtn +
             '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
           '</div>' +
         '</div>' +
-        '<div class="parent-body">' +
-          '<div class="parent-secondary">' +
-            '<span class="proj-path">\u200E' + esc(parent.cwd) + '</span>' +
-            '<span class="sep">\u00b7</span>' +
-            '<span class="p-mtime">' + relTimeShort(parent.mtimeMs, now) + '</span>' +
-          '</div>' +
-          subRows +
-        '</div>' +
+        '<div class="card-path"><span class="proj-path">\u200E' + esc(parent.cwd) + '</span></div>' +
+        subSection +
       '</div>';
     }
 
@@ -480,12 +467,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return '<hr class="archive-divider">' +
         '<div class="archive-section' + (open ? ' open' : '') + '" data-key="archive">' +
           '<div class="archive-row">' +
-            CARET +
+            '<span class="arch-caret">\u25b6</span>' +
             '<span class="archive-label">' + (open ? 'Hide archive' : 'Show archive') + '</span>' +
             '<span class="archive-count">' + count + ' session' + (count !== 1 ? 's' : '') + '</span>' +
           '</div>' +
           '<div class="archive-body">' +
-            doneParents.map(p => renderParent(p, now)).join('') +
+            doneParents.map(p => renderCard(p, now)).join('') +
           '</div>' +
         '</div>';
     }
@@ -512,14 +499,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       primary.sort((a, b) => parentMaxMtime(b) - parentMaxMtime(a));
       archive.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-      root.innerHTML = primary.map(p => renderParent(p, now)).join('') + renderArchive(archive, now);
+      root.innerHTML = primary.map(p => renderCard(p, now)).join('') + renderArchive(archive, now);
     }
 
     root.addEventListener('click', (e) => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
 
-      // Action buttons — handled first so they don't fall through to row clicks.
+      // Action buttons — handled first so they don't fall through.
       const btn = target.closest('[data-act]');
       if (btn) {
         const sidEl = btn.closest('[data-sid]');
@@ -540,26 +527,30 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Parent header: caret toggles expand; everything else opens preview.
-      const parentHeader = target.closest('.parent-header');
-      if (parentHeader) {
-        const parentRow = parentHeader.closest('.parent-row');
-        if (!parentRow) return;
-        if (target.closest('.row-caret')) {
-          const key = parentRow.dataset.key;
-          const isOpen = parentRow.classList.toggle('open');
-          if (key) openSections[key] = isOpen;
-          return;
-        }
-        const sid = parentRow.getAttribute('data-sid');
+      // Sub-toggle: collapse/expand subagent list within a card.
+      const subToggle = target.closest('.sub-toggle');
+      if (subToggle) {
+        const card = subToggle.closest('.card');
+        if (!card) return;
+        const isOpen = card.classList.toggle('subs-open');
+        const key = card.dataset.key;
+        if (key) openSections[key + ':subs'] = isOpen;
+        return;
+      }
+
+      // Sub-row click opens preview.
+      const subRow = target.closest('.sub-row');
+      if (subRow) {
+        const sid = subRow.getAttribute('data-sid');
         if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
         return;
       }
 
-      // Subagent row click opens preview.
-      const subRow = target.closest('.subagent-row');
-      if (subRow) {
-        const sid = subRow.getAttribute('data-sid');
+      // Card-top click opens preview.
+      const cardTop = target.closest('.card-top');
+      if (cardTop) {
+        const card = cardTop.closest('.card');
+        const sid = card ? card.getAttribute('data-sid') : null;
         if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
         return;
       }
