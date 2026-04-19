@@ -211,7 +211,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       gap: 5px;
-      padding: 7px 8px 4px;
+      height: 30px;
+      padding: 0 8px;
       cursor: pointer;
       user-select: none;
     }
@@ -325,7 +326,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       border: none;
       color: var(--vscode-descriptionForeground);
       cursor: pointer;
-      padding: 2px 3px;
+      padding: 0 3px;
+      height: 20px;
       border-radius: 4px;
       font-size: 12px;
       display: flex;
