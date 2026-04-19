@@ -242,7 +242,8 @@ function renderEntryBubble(entry: TurnEntry): string {
   const preview = entry.kind === 'system' ? hookOutputPreview(entry.body) : resultPreview(entry.body);
   const resultSection = entry.result ? renderResultSection(entry.result) : '';
   const previewHtml = preview ? `<span class="p-preview">${preview}</span>` : '';
-  return `<div class="entry ${kindClass}" data-eid="${entryId(entry)}">
+  const autoOpen = bodyCls === 'todos' ? ' open' : '';
+  return `<div class="entry ${kindClass}${autoOpen}" data-eid="${entryId(entry)}">
     <div class="entry-header">
       <span class="entry-icon">${icon}</span>
       <span class="entry-lbl">${esc(entry.label)}</span>
@@ -361,25 +362,26 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .turn.assistant .bubble { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-input-border); border-radius: 10px 10px 10px 2px; }
 .turn.user      .bubble { background: var(--vscode-chat-requestBackground, #2b3b4e); border: 1px solid var(--vscode-chat-requestBorder, #3b5070); border-radius: 10px 10px 2px 10px; }
 
-.bubble p { margin: 0 0 0.45em; }
+.bubble p { margin: 0 0 0.8em; }
 .bubble p:last-child { margin-bottom: 0; }
-.bubble ul, .bubble ol { padding-left: 1.4em; margin: 0.2em 0; }
-.bubble li { margin: 0.1em 0; }
+.bubble ul, .bubble ol { padding-left: 1.5em; margin: 0.3em 0 0.7em; }
+.bubble li { margin: 0.2em 0; }
+.bubble li > p { margin-bottom: 0.3em; }
 .bubble strong { font-weight: 600; }
 .bubble em { font-style: italic; opacity: 0.85; }
-.bubble h1 { font-weight: 700; font-size: 1.5em; margin: 0.5em 0 0.25em; }
-.bubble h2 { font-weight: 600; font-size: 1.25em; margin: 0.45em 0 0.2em; }
-.bubble h3 { font-weight: 600; font-size: 1.05em; margin: 0.4em 0 0.2em; }
+.bubble h1 { font-weight: 700; font-size: 1.5em; margin: 0.7em 0 0.35em; padding-bottom: 0.15em; border-bottom: 1px solid var(--vscode-panel-border); }
+.bubble h2 { font-weight: 600; font-size: 1.25em; margin: 0.6em 0 0.3em; padding-bottom: 0.12em; border-bottom: 1px solid var(--vscode-panel-border); }
+.bubble h3 { font-weight: 600; font-size: 1.05em; margin: 0.5em 0 0.25em; }
 .bubble h4, .bubble h5, .bubble h6 { font-weight: 600; font-size: 1em; margin: 0.4em 0 0.2em; }
 .bubble a { color: var(--vscode-focusBorder); }
-.bubble code { font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 11.5px; background: var(--vscode-textCodeBlock-background); color: var(--vscode-textPreformat-foreground); padding: 1px 5px; border-radius: 3px; border: 1px solid var(--vscode-panel-border); }
-.bubble pre { background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 7px 10px; overflow-x: auto; margin: 0.4em 0; }
-.bubble pre code { background: none; border: none; padding: 0; }
-.bubble blockquote { border-left: 3px solid var(--vscode-input-border); padding-left: 8px; margin: 0.3em 0; opacity: 0.8; }
-.bubble hr { border: none; border-top: 1px solid var(--vscode-input-border); margin: 0.6em 0; }
-.bubble table { border-collapse: collapse; width: 100%; margin: 0.4em 0; font-size: 12px; }
-.bubble th, .bubble td { border: 1px solid var(--vscode-input-border); padding: 4px 8px; text-align: left; }
-.bubble thead th { background: var(--vscode-editorWidget-background); font-weight: 600; }
+.bubble code { font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 11.5px; background: var(--vscode-textCodeBlock-background); color: var(--vscode-textPreformat-foreground); padding: 1px 5px; border-radius: 3px; border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent); }
+.bubble pre { background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 10px 14px; overflow-x: auto; margin: 0.6em 0; }
+.bubble pre code { background: none; border: none; padding: 0; font-size: 12px; }
+.bubble blockquote { border-left: 3px solid color-mix(in srgb, var(--vscode-focusBorder) 50%, transparent); padding: 2px 10px; margin: 0.5em 0; opacity: 0.85; background: color-mix(in srgb, var(--vscode-focusBorder) 5%, transparent); border-radius: 0 4px 4px 0; }
+.bubble hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 0.8em 0; }
+.bubble table { border-collapse: collapse; width: 100%; margin: 0.6em 0; font-size: 12px; }
+.bubble th, .bubble td { border: 1px solid var(--vscode-panel-border); padding: 5px 10px; text-align: left; }
+.bubble thead th { background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent); font-weight: 600; }
 
 .bubble-attachments { display: flex; flex-direction: column; gap: 5px; margin-bottom: 7px; }
 .attach-image { position: relative; display: inline-block; max-width: 100%; cursor: zoom-in; }
@@ -478,6 +480,7 @@ ${turnsHtml}
 <script>
   const scroll = document.getElementById('scroll');
   let userScrolled = false;
+  let _progScrolls = 0;
 
   function fmtFull(iso) {
     return new Date(iso).toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'numeric', minute:'2-digit', second:'2-digit', hour12:true });
@@ -510,10 +513,15 @@ ${turnsHtml}
   function attachListeners() { /* no-op: using event delegation now */ }
 
   function scrollToBottom() {
-    scroll.scrollTop = scroll.scrollHeight;
+    _progScrolls++;
+    requestAnimationFrame(() => {
+      scroll.scrollTop = scroll.scrollHeight;
+      requestAnimationFrame(() => { _progScrolls = Math.max(0, _progScrolls - 1); });
+    });
   }
 
   scroll.addEventListener('scroll', () => {
+    if (_progScrolls > 0) return;
     const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
     userScrolled = !atBottom;
   });

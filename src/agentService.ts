@@ -9,8 +9,8 @@ import { buildTree } from './agentTree';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
-const HEAD_BYTES = 2 * 1024;
-const TITLE_EVENT_TYPES = new Set(['ai-title', 'custom-title']);
+const HEAD_BYTES = 8 * 1024;
+const TITLE_EVENT_TYPES = new Set(['ai-title', 'custom-title', 'last-prompt']);
 const KEEP_EVENTS = 20;
 const RUNNING_WINDOW_MS = 5 * 60 * 1000;
 const DONE_AGE_MS = 6 * 60 * 60 * 1000;
