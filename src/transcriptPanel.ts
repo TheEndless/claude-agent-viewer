@@ -153,16 +153,15 @@ function renderUserTurn(turn: Turn): string {
   </div>`;
 }
 
+function renderEntriesGroup(entries: TurnEntry[]): string {
+  if (entries.length === 0) return '';
+  return `<div class="entries">${entries.map(renderEntry).join('')}</div>`;
+}
+
 function renderAssistantTurn(turn: Turn): string {
   // System entries (hooks, session-end) appear after the text bubble.
-  const toolEntries = turn.entries.filter(e => e.kind !== 'system');
-  const sysEntries  = turn.entries.filter(e => e.kind === 'system');
-  const toolHtml = toolEntries.length > 0
-    ? `<div class="entries">${toolEntries.map(renderEntry).join('')}</div>`
-    : '';
-  const sysHtml = sysEntries.length > 0
-    ? `<div class="entries">${sysEntries.map(renderEntry).join('')}</div>`
-    : '';
+  const toolHtml = renderEntriesGroup(turn.entries.filter(e => e.kind !== 'system'));
+  const sysHtml  = renderEntriesGroup(turn.entries.filter(e => e.kind === 'system'));
   const bubbleHtml = turn.text
     ? `<div class="bubble">${md.render(turn.text)}</div>`
     : '';
@@ -196,24 +195,27 @@ function renderEntryBody(body: string, kind: TurnEntry['kind']): { html: string;
   } catch {
     return { html: md.render(body), cls: 'md' };
   }
-  if (kind === 'tool_use' && parsed && typeof parsed === 'object' && Array.isArray((parsed as { todos?: unknown }).todos)) {
-    return { html: renderTodoList((parsed as { todos: unknown[] }).todos), cls: 'todos' };
+  if (kind === 'tool_use' && parsed && typeof parsed === 'object') {
+    const todos = (parsed as { todos?: unknown }).todos;
+    if (Array.isArray(todos)) {
+      return { html: renderTodoList(todos), cls: 'todos' };
+    }
   }
   return { html: jsonHlTs(JSON.stringify(parsed, null, 2)), cls: 'json' };
+}
+
+function todoMarker(status: unknown): { check: string; cls: string } {
+  switch (status) {
+    case 'completed':   return { check: '✓', cls: ' done' };
+    case 'in_progress': return { check: '◐', cls: ' active' };
+    default:            return { check: '○', cls: '' };
+  }
 }
 
 function renderTodoList(todos: unknown[]): string {
   const items = todos.map(t => {
     const item = t as { content?: unknown; status?: unknown };
-    let check = '○';
-    let cls = '';
-    if (item.status === 'completed') {
-      check = '✓';
-      cls = ' done';
-    } else if (item.status === 'in_progress') {
-      check = '◐';
-      cls = ' active';
-    }
+    const { check, cls } = todoMarker(item.status);
     return `<li class="todo-item"><span class="todo-chk">${check}</span><span class="todo-txt${cls}">${esc(String(item.content ?? ''))}</span></li>`;
   }).join('');
   return `<ul class="todo-list">${items}</ul>`;
@@ -227,17 +229,13 @@ function jsonHlTs(str: string): string {
     .replace(/:\s*(true|false|null)/g, ': <span class="jb">$1</span>');
 }
 
-function renderEntry(entry: TurnEntry): string {
-  return renderEntryBubble(entry);
-}
-
 function entryId(entry: TurnEntry): string {
   return esc(`${entry.timestamp}:${entry.kind}:${entry.label}`);
 }
 
-function renderEntryBubble(entry: TurnEntry): string {
+function renderEntry(entry: TurnEntry): string {
   const kindClass = entry.kind.replace('_', '-');
-  const icon = entry.isError ? '⚠' : entryIcon(entry.kind);
+  const icon = entry.isError ? '<svg><use href="#icon-warning"/></svg>' : entryIcon(entry.kind);
   const { html: bodyHtml, cls: bodyCls } = renderEntryBody(entry.body, entry.kind);
   const preview = entry.kind === 'system' ? hookOutputPreview(entry.body) : resultPreview(entry.body);
   const resultSection = entry.result ? renderResultSection(entry.result) : '';
@@ -249,9 +247,11 @@ function renderEntryBubble(entry: TurnEntry): string {
       <span class="entry-icon">${icon}</span>
       <span class="entry-lbl">${esc(entry.label)}</span>
       ${previewHtml}
+      <button class="raw-btn" title="View raw"><svg><use href="#icon-code"/></svg></button>
       <span class="entry-caret"><svg><use href="#icon-chevron"/></svg></span>
     </div>
-    <div class="entry-body ${bodyCls}">${bodyHtml}${resultSection}</div>
+    <div class="entry-body rendered-view ${bodyCls}">${bodyHtml}${resultSection}</div>
+    <div class="entry-body raw-view raw"><pre><code>${esc(entry.body)}</code></pre></div>
   </div>`;
 }
 
@@ -259,9 +259,11 @@ function renderResultSection(result: TurnEntry): string {
   const { html: bodyHtml, cls: bodyCls } = renderEntryBody(result.body, result.kind);
   const preview = resultPreview(result.body);
   const errorCls = result.isError ? ' is-error' : '';
-  const marker = result.isError ? '⚠' : '↩';
+  const markerIcon = result.isError
+    ? '<svg class="result-marker-icon"><use href="#icon-warning"/></svg>'
+    : '<svg class="result-marker-icon"><use href="#icon-return"/></svg>';
   return `<div class="result-section${errorCls}">
-    <div class="result-label"><span>${marker}</span> <span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${preview}</span>` : ''}</div>
+    <div class="result-label">${markerIcon}<span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${preview}</span>` : ''}</div>
     <div class="result-body ${bodyCls}">${bodyHtml}</div>
   </div>`;
 }
@@ -287,12 +289,14 @@ function hookOutputPreview(body: string): string {
 }
 
 function entryIcon(kind: TurnEntry['kind']): string {
+  let id: string;
   switch (kind) {
-    case 'tool_use':    return '⚙';
-    case 'tool_result': return '↩';
-    case 'thinking':    return '💭';
-    case 'system':      return '◾';
+    case 'tool_use':    id = 'icon-terminal'; break;
+    case 'tool_result': id = 'icon-return';   break;
+    case 'thinking':    id = 'icon-thinking'; break;
+    default:            id = 'icon-info';     break;
   }
+  return `<svg><use href="#${id}"/></svg>`;
 }
 
 function renderAttachment(att: TurnAttachment): string {
@@ -445,7 +449,8 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry { border-radius: 8px; border: 1px solid transparent; overflow: hidden; }
 .entry-header { display: flex; align-items: center; gap: 8px; padding: 8px 11px; cursor: pointer; user-select: none; min-width: 0; }
 .entry-header:hover { background: rgba(128,128,128,0.06); }
-.entry-icon { flex-shrink: 0; font-size: 13px; line-height: 1; opacity: 0.85; }
+.entry-icon { flex-shrink: 0; display: flex; align-items: center; opacity: 0.85; }
+.entry-icon svg { width: 13px; height: 13px; }
 .entry-lbl { flex-shrink: 0; min-width: 0; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 500; }
 .p-preview { flex: 1; min-width: 0; font-size: 11px; opacity: 0.55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
 .entry-caret { flex-shrink: 0; display: flex; align-items: center; color: currentColor; opacity: 0.5; transition: transform 0.15s; }
@@ -461,7 +466,15 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .result-section.is-error { border-top-color: color-mix(in srgb, #f85149 40%, transparent); }
 
 .entry-body { display: none; padding: 6px 10px 8px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.5; max-height: 240px; overflow-y: auto; }
-.entry.open > .entry-body { display: block; }
+.entry.open > .entry-body.rendered-view { display: block; }
+.entry.open.show-raw > .entry-body.rendered-view { display: none; }
+.entry.open.show-raw > .entry-body.raw-view { display: block; }
+
+.raw-btn { display: none; flex-shrink: 0; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; background: none; border: none; cursor: pointer; border-radius: 3px; color: currentColor; opacity: 0.5; }
+.raw-btn svg { width: 11px; height: 11px; }
+.raw-btn:hover { background: rgba(128,128,128,0.12); opacity: 1; }
+.entry-header:hover .raw-btn { display: flex; }
+.entry.show-raw .raw-btn { display: flex; opacity: 1; }
 .entry-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; }
 .jk { color: var(--json-key); }
 .js { color: var(--json-str); }
@@ -483,6 +496,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry-body.raw code { font-family: inherit; background: none; border: none; padding: 0; color: var(--vscode-editor-foreground); }
 .result-section { margin-top: 8px; border-top: 1px solid var(--vscode-input-border); padding-top: 6px; }
 .result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; margin-bottom: 5px; }
+.result-marker-icon { width: 11px; height: 11px; flex-shrink: 0; }
 .result-body { font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.5; max-height: 160px; overflow-y: auto; }
 .result-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
 .result-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; }
@@ -520,6 +534,33 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
   <symbol id="icon-file" viewBox="0 0 16 16" fill="currentColor">
     <path fill-rule="evenodd" d="M4 2h5.5L13 5.5V14H4V2zm1 1v10h7V6.5H9V3H5zm5 .7L11.3 5.5H10V3.7z"/>
   </symbol>
+  <symbol id="icon-terminal" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="2,5.5 6.5,8 2,10.5" stroke-width="1.7"/>
+    <line x1="8.5" y1="11" x2="14" y2="11" stroke-width="1.7"/>
+  </symbol>
+  <symbol id="icon-thinking" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round">
+    <path d="M8 2C5.24 2 3 4.24 3 7s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5z" stroke-width="1.4"/>
+    <circle cx="5.5" cy="13.5" r="1" fill="currentColor" stroke="none"/>
+    <circle cx="3.5" cy="12" r="0.7" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="icon-info" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round">
+    <circle cx="8" cy="8" r="6.5" stroke-width="1.4"/>
+    <line x1="8" y1="7.5" x2="8" y2="11.5" stroke-width="1.8"/>
+    <circle cx="8" cy="5.5" r="0.9" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="icon-return" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="11,3.5 11,10 3,10" stroke-width="1.7"/>
+    <polyline points="6,7 3,10 6,13" stroke-width="1.7"/>
+  </symbol>
+  <symbol id="icon-warning" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M8 2L14 13.5H2L8 2Z" stroke-width="1.5"/>
+    <line x1="8" y1="7" x2="8" y2="10" stroke-width="1.8"/>
+    <circle cx="8" cy="12" r="0.9" fill="currentColor" stroke="none"/>
+  </symbol>
+  <symbol id="icon-code" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="5,4 1,8 5,12" stroke-width="1.7"/>
+    <polyline points="11,4 15,8 11,12" stroke-width="1.7"/>
+  </symbol>
 </svg>
 
 <div class="lightbox" id="lightbox">
@@ -551,6 +592,15 @@ ${turnsHtml}
 
   // Delegated click handling — attached once, works for any future content.
   scroll.addEventListener('click', (ev) => {
+    const rawBtn = ev.target.closest && ev.target.closest('.raw-btn');
+    if (rawBtn) {
+      const entry = rawBtn.closest('.entry');
+      if (entry) {
+        entry.classList.toggle('show-raw');
+        if (!entry.classList.contains('open')) entry.classList.add('open');
+      }
+      return;
+    }
     const header = ev.target.closest && ev.target.closest('.entry-header');
     if (header) {
       const entry = header.closest('.entry');
