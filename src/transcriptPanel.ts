@@ -392,34 +392,38 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .bubble h5 { font-size: 0.9em; }
 .bubble h6 { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
 
-.bubble a { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); text-decoration: none; }
-.bubble a:hover { text-decoration: underline; }
+.bubble a { color: var(--vscode-textLink-foreground); text-decoration: none; }
+.bubble a:hover { color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground)); text-decoration: underline; }
 
-.bubble code {
-  font-family: "Cascadia Code","Fira Code",Consolas,"Courier New",monospace;
-  font-size: 0.92em; line-height: 1.35em;
-  background: var(--vscode-textCodeBlock-background);
+/* Inline code — VSCode uses textPreformat-*, not textCodeBlock-*. */
+.bubble :not(pre) > code {
+  font-family: var(--vscode-editor-font-family, "Cascadia Code","Fira Code",Consolas,"Courier New",monospace);
+  font-size: 1em; line-height: 1.357em;
   color: var(--vscode-textPreformat-foreground);
-  padding: 0.15em 0.4em; border-radius: 3px;
+  background-color: var(--vscode-textPreformat-background);
+  padding: 1px 4px; border-radius: 4px;
 }
 .bubble pre {
   background: var(--vscode-textCodeBlock-background);
-  padding: 14px; border-radius: 3px; overflow: auto;
-  white-space: pre; tab-size: 4;
+  padding: 16px; border-radius: 3px; overflow: auto;
+  white-space: pre;
 }
 .bubble pre code {
-  background: none; padding: 0; border-radius: 0;
-  color: var(--vscode-editor-foreground); font-size: 0.92em;
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-editor-font-family, "Cascadia Code","Fira Code",Consolas,"Courier New",monospace);
+  font-size: 1em; line-height: 1.357em;
+  tab-size: 4; background: none; padding: 0; border-radius: 0;
 }
 
 .bubble blockquote {
+  margin: 0 0 14px 0;
   padding: 0 16px 0 10px;
-  border-left: 5px solid var(--vscode-textBlockQuote-border, var(--vscode-input-border));
-  background: var(--vscode-textBlockQuote-background, transparent);
-  color: var(--vscode-textBlockQuote-foreground, inherit);
+  border-left: 5px solid var(--vscode-textBlockQuote-border);
+  background: var(--vscode-textBlockQuote-background);
+  color: var(--vscode-foreground);
 }
 
-.bubble hr { border: 0; height: 2px; border-bottom: 2px solid var(--vscode-panel-border); margin: 14px 0; }
+.bubble hr { border: 0; height: 1px; border-bottom: 1px solid var(--vscode-textSeparator-foreground, var(--vscode-panel-border)); margin: 14px 0; }
 
 .bubble table { border-collapse: collapse; }
 .bubble th, .bubble td { padding: 5px 10px; }
