@@ -1,7 +1,10 @@
 import * as vscode from 'vscode';
 import * as fsp from 'fs/promises';
+import MarkdownIt from 'markdown-it';
 import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
 import { parseTranscript } from './transcriptParser';
+
+const md = new MarkdownIt({ html: false, linkify: true, typographer: true });
 
 const parseCache = new Map<string, { turns: Turn[]; mtimeMs: number }>();
 const openPanels = new Map<string, vscode.WebviewPanel>();
@@ -129,94 +132,6 @@ function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// Accepts pre-escaped HTML — callers must pass esc(text) so surrounding text is safe.
-// Captures are already escaped so we don't double-encode them.
-function inlineMd(s: string): string {
-  return s
-    .replace(/`([^`]+)`/g,               (_, c) => `<code>${c}</code>`)
-    .replace(/\*\*([^*]+)\*\*/g,         (_, t) => `<strong>${t}</strong>`)
-    .replace(/__([^_]+)__/g,             (_, t) => `<strong>${t}</strong>`)
-    .replace(/\*([^*\n]+)\*/g,           (_, t) => `<em>${t}</em>`)
-    .replace(/_([^_\n]+)_/g,             (_, t) => `<em>${t}</em>`)
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => `<a href="${url}">${text}</a>`);
-}
-
-function parseTableRow(line: string): string[] {
-  return line.split('|').slice(1, -1).map(c => c.trim());
-}
-
-function isTableSeparator(cells: string[]): boolean {
-  return cells.length > 0 && cells.every(c => /^:?-{1,}:?\s*$/.test(c));
-}
-
-function mdToHtml(raw: string): string {
-  const lines = raw.split('\n');
-  const out: string[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line.startsWith('```')) {
-      const code: string[] = [];
-      i++;
-      while (i < lines.length && !lines[i].startsWith('```')) { code.push(lines[i]); i++; }
-      i++;
-      out.push(`<pre><code>${esc(code.join('\n'))}</code></pre>`);
-      continue;
-    }
-    const hm = line.match(/^(#{1,3})\s+(.+)/);
-    if (hm) { out.push(`<h${hm[1].length}>${inlineMd(esc(hm[2]))}</h${hm[1].length}>`); i++; continue; }
-    if (/^([-*_] *){3,}$/.test(line.trim()) && line.trim().length > 0) {
-      out.push('<hr>'); i++; continue;
-    }
-    if (line.trimStart().startsWith('|')) {
-      const rows: string[][] = [];
-      while (i < lines.length && lines[i].trimStart().startsWith('|')) {
-        rows.push(parseTableRow(lines[i])); i++;
-      }
-      const hasSep = rows.length >= 2 && isTableSeparator(rows[1]);
-      const head = hasSep ? rows[0] : null;
-      const body = hasSep ? rows.slice(2) : rows;
-      let html = '<table>';
-      if (head) html += '<thead><tr>' + head.map(c => `<th>${inlineMd(esc(c))}</th>`).join('') + '</tr></thead>';
-      if (body.length) html += '<tbody>' + body.map(r => '<tr>' + r.map(c => `<td>${inlineMd(esc(c))}</td>`).join('') + '</tr>').join('') + '</tbody>';
-      html += '</table>';
-      out.push(html);
-      continue;
-    }
-    if (line.startsWith('> ')) {
-      const bq: string[] = [];
-      while (i < lines.length && lines[i].startsWith('> ')) { bq.push(lines[i].slice(2)); i++; }
-      out.push(`<blockquote>${inlineMd(esc(bq.join(' ')))}</blockquote>`);
-      continue;
-    }
-    if (/^[-*+] /.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^[-*+] /.test(lines[i])) { items.push(`<li>${inlineMd(esc(lines[i].slice(2)))}</li>`); i++; }
-      out.push(`<ul>${items.join('')}</ul>`);
-      continue;
-    }
-    if (/^\d+\. /.test(line)) {
-      const items: string[] = [];
-      while (i < lines.length && /^\d+\. /.test(lines[i])) { items.push(`<li>${inlineMd(esc(lines[i].replace(/^\d+\. /, '')))}</li>`); i++; }
-      out.push(`<ol>${items.join('')}</ol>`);
-      continue;
-    }
-    if (line.trim() === '') { i++; continue; }
-    const para: string[] = [];
-    while (i < lines.length
-           && lines[i].trim() !== ''
-           && !lines[i].startsWith('```')
-           && !/^#{1,3} /.test(lines[i])
-           && !lines[i].startsWith('> ')
-           && !/^[-*+] /.test(lines[i])
-           && !/^\d+\. /.test(lines[i])) {
-      para.push(lines[i]); i++;
-    }
-    if (para.length) out.push(`<p>${inlineMd(esc(para.join(' ')))}</p>`);
-    else i++;
-  }
-  return out.join('');
-}
 
 function renderTurn(turn: Turn): string {
   return turn.role === 'user' ? renderUserTurn(turn) : renderAssistantTurn(turn);
@@ -224,7 +139,7 @@ function renderTurn(turn: Turn): string {
 
 function renderUserTurn(turn: Turn): string {
   const attachHtml = turn.attachments.map(renderAttachment).join('');
-  const textHtml = turn.text ? `<div class="bubble-text">${mdToHtml(turn.text)}</div>` : '';
+  const textHtml = turn.text ? `<div class="bubble-text">${md.render(turn.text)}</div>` : '';
   const bubbleInner = (attachHtml ? `<div class="bubble-attachments">${attachHtml}</div>` : '') + textHtml;
   return `<div class="turn user">
     <div class="turn-head">
@@ -249,7 +164,7 @@ function renderAssistantTurn(turn: Turn): string {
     ? `<div class="entries">${sysEntries.map(renderEntry).join('')}</div>`
     : '';
   const bubbleHtml = turn.text
-    ? `<div class="bubble">${mdToHtml(turn.text)}</div>`
+    ? `<div class="bubble">${md.render(turn.text)}</div>`
     : '';
   if (!toolHtml && !bubbleHtml && !sysHtml) return '';
   const metaParts: string[] = [];
@@ -273,13 +188,13 @@ function renderEntryBody(body: string, kind: TurnEntry['kind']): { html: string;
     return { html: `<pre><code>${esc(body)}</code></pre>`, cls: 'raw' };
   }
   if (kind === 'thinking') {
-    return { html: mdToHtml(body), cls: 'md' };
+    return { html: md.render(body), cls: 'md' };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
-    return { html: mdToHtml(body), cls: 'md' };
+    return { html: md.render(body), cls: 'md' };
   }
   if (kind === 'tool_use' && parsed && typeof parsed === 'object' && Array.isArray((parsed as { todos?: unknown }).todos)) {
     return { html: renderTodoList((parsed as { todos: unknown[] }).todos), cls: 'todos' };

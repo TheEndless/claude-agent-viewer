@@ -68,6 +68,8 @@
     "vitest": "^4.1.4"
   },
   "dependencies": {
-    "chokidar": "^3.6.0"
+    "@types/markdown-it": "^14.1.2",
+    "chokidar": "^3.6.0",
+    "markdown-it": "^14.1.1"
   }
 }
