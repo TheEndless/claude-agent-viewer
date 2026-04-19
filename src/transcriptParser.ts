@@ -58,63 +58,115 @@ export function parseTranscript(jsonlText: string): Turn[] {
   // the originating tool name and hook summaries can be attached.
   const pendingToolUse = new Map<string, { entry: TurnEntry; toolName: string }>();
 
+  const attachSystemEntry = (entry: TurnEntry): void => {
+    if (currentAssistant) {
+      currentAssistant.entries.push(entry);
+    } else {
+      turns.push({ role: 'assistant', timestamp: entry.timestamp, attachments: [], entries: [entry] });
+    }
+  };
+
   for (const event of events) {
     const ts = typeof event.timestamp === 'string' ? event.timestamp : new Date().toISOString();
     const role = event.message?.role;
 
-    // ── Attachment events — hook_success carries actual stdout/stderr ──────────
+    // ── Attachment events ──────────────────────────────────────────────────────
     if (event.type === 'attachment') {
       const att = event.attachment ?? {};
-      if (att.type === 'hook_success' && typeof att.hookEvent === 'string' && att.hookEvent) {
-        const hookEvent = att.hookEvent as string;
+      const attType = typeof att.type === 'string' ? att.type : '';
+      const hookEvent = typeof att.hookEvent === 'string' ? att.hookEvent : '';
+
+      if (attType === 'hook_success' && hookEvent) {
         const command = typeof att.command === 'string' ? att.command : '';
         const stdout = typeof att.stdout === 'string' ? att.stdout.trim() : '';
         const stderr = typeof att.stderr === 'string' ? att.stderr.trim() : '';
         const durationMs = typeof att.durationMs === 'number' ? att.durationMs : 0;
         const exitCode = typeof att.exitCode === 'number' ? att.exitCode : 0;
         const prevented = att.preventedContinuation === true;
-        // Cap combined output — some hooks dump megabytes of context which would bloat
-        // every turn's HTML. The full file is always available via "View raw JSONL".
         const MAX = 8000;
         const rawOutput = [stdout, stderr].filter(Boolean).join('\n');
         const output = rawOutput.length > MAX
           ? rawOutput.slice(0, MAX) + `\n… (${rawOutput.length - MAX} more chars truncated)`
           : rawOutput;
-        const label = `${hookEvent} Hook · ${hookScriptName(command)}`;
-        const bodyLines = [
+        const body = [
           `**Event:** ${hookEvent}`,
           command ? `**Command:** \`${command}\`` : '',
           `**Duration:** ${durationMs}ms · **Exit:** ${exitCode}`,
           output ? `**Output:**\n\`\`\`\n${output}\n\`\`\`` : '',
           prevented ? '⚠ **Prevented continuation**' : '',
-        ];
-        const body = bodyLines.filter(Boolean).join('\n');
-        const entry: TurnEntry = { kind: 'system', label, timestamp: ts, body };
-        if (currentAssistant) {
-          currentAssistant.entries.push(entry);
-        } else {
-          turns.push({ role: 'assistant', timestamp: ts, attachments: [], entries: [entry] });
-        }
+        ].filter(Boolean).join('\n');
+        attachSystemEntry({ kind: 'system', label: `${hookEvent} Hook · ${hookScriptName(command)}`, timestamp: ts, body });
+      } else if (attType === 'hook_non_blocking_error') {
+        const msg = String(att.error ?? att.message ?? att.stderr ?? JSON.stringify(att));
+        attachSystemEntry({
+          kind: 'system',
+          label: `Hook error · ${hookEvent || 'unknown'}`,
+          timestamp: ts,
+          body: msg,
+          isError: true,
+        });
+      } else if (attType === 'hook_system_message') {
+        const msg = String(att.message ?? att.content ?? JSON.stringify(att));
+        attachSystemEntry({
+          kind: 'system',
+          label: `Hook · ${hookEvent || 'system message'}`,
+          timestamp: ts,
+          body: msg,
+        });
       }
+      // Other attachment types (todo_reminder, auto_mode, file-history, etc.) are internal metadata — skip.
       continue;
     }
 
-    // ── stop_hook_summary — skip; hook_success attachments carry the output ───
-    if (event.type === 'system' && event.subtype === 'stop_hook_summary') continue;
+    // ── System events with subtypes ────────────────────────────────────────────
+    if (event.type === 'system') {
+      const subtype = typeof event.subtype === 'string' ? event.subtype : '';
+      if (subtype === 'stop_hook_summary') continue;  // hook_success attachment carries the data
+      if (subtype === 'compact_boundary') {
+        const meta = (event as { compactMetadata?: unknown }).compactMetadata;
+        attachSystemEntry({
+          kind: 'system',
+          label: 'Context compacted',
+          timestamp: ts,
+          body: typeof meta === 'object' && meta !== null ? JSON.stringify(meta, null, 2) : '',
+        });
+        continue;
+      }
+      if (subtype === 'api_error') {
+        const err = (event as { error?: unknown }).error;
+        const content = (event as { content?: unknown }).content;
+        const body = typeof err === 'string' ? err
+          : typeof content === 'string' ? content
+          : JSON.stringify(err ?? content ?? event);
+        attachSystemEntry({
+          kind: 'system',
+          label: 'API error',
+          timestamp: ts,
+          body,
+          isError: true,
+        });
+        continue;
+      }
+      if (subtype === 'informational' || subtype === 'local_command') {
+        attachSystemEntry({
+          kind: 'system',
+          label: subtype === 'informational' ? 'Info' : 'Local command',
+          timestamp: ts,
+          body: JSON.stringify(event),
+        });
+        continue;
+      }
+      continue;  // unknown subtypes ignored
+    }
 
     // ── Session-end events (type: "result" | "summary") ───────────────────────
     if (event.type === 'result' || event.type === 'summary') {
-      const entry: TurnEntry = {
+      attachSystemEntry({
         kind: 'system',
         label: 'Session ended',
         timestamp: ts,
         body: JSON.stringify(event),
-      };
-      if (currentAssistant) {
-        currentAssistant.entries.push(entry);
-      } else {
-        turns.push({ role: 'assistant', timestamp: ts, attachments: [], entries: [entry] });
-      }
+      });
       continue;
     }
 
@@ -157,6 +209,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
     if (role === 'user') {
       const blocks = normalizeContent(event.message?.content);
       const allToolResults = blocks.length > 0 && blocks.every(b => b.type === 'tool_result');
+      const isCompactSummary = (event as { isCompactSummary?: boolean }).isCompactSummary === true;
 
       if (allToolResults) {
         // Attach results directly to their matching tool_use entry for grouped rendering.
@@ -165,7 +218,8 @@ export function parseTranscript(jsonlText: string): Turn[] {
           const pending = pendingToolUse.get(toolUseId);
           const label = pending ? `Result · ${pending.toolName}` : 'Result';
           const body = extractResultBody(block);
-          const resultEntry: TurnEntry = { kind: 'tool_result', label, timestamp: ts, body };
+          const isError = block.is_error === true;
+          const resultEntry: TurnEntry = { kind: 'tool_result', label, timestamp: ts, body, isError };
           if (pending) {
             pending.entry.result = resultEntry;
           } else if (currentAssistant) {
@@ -182,6 +236,15 @@ export function parseTranscript(jsonlText: string): Turn[] {
         pendingToolUse.clear();
 
         const turn: Turn = { role: 'user', timestamp: ts, attachments: [], entries: [] };
+        if (isCompactSummary) {
+          // Mark as a compaction placeholder; visible in UI as "(compacted summary)".
+          turn.entries.push({
+            kind: 'system',
+            label: 'Compacted summary',
+            timestamp: ts,
+            body: 'Preceding conversation was auto-compacted; this turn is the summary placeholder.',
+          });
+        }
         for (const block of blocks) {
           if (block.type === 'text') {
             turn.text = ((turn.text ?? '') + (block.text as string)).trim();
@@ -222,17 +285,37 @@ function normalizeContent(content: unknown): ContentBlock[] {
  * For well-known tools, includes the most relevant input field as a suffix.
  */
 function labelForToolUse(name: string, input: Record<string, unknown>): string {
+  // MCP tools: mcp__<server>__<tool> — strip the prefix for display.
+  if (name.startsWith('mcp__')) {
+    const parts = name.split('__');
+    const server = parts[1] ?? '';
+    const tool = parts.slice(2).join('.') || '';
+    return tool ? `MCP · ${server} · ${tool}` : `MCP · ${server}`;
+  }
   switch (name) {
-    case 'Bash':  return `Bash · ${trunc(String(input.command ?? ''), 60)}`;
-    case 'Read':  return `Read · ${path.basename(String(input.file_path ?? ''))}`;
-    case 'Edit':  return `Edit · ${path.basename(String(input.file_path ?? ''))}`;
-    case 'Write': return `Write · ${path.basename(String(input.file_path ?? ''))}`;
-    case 'Grep':  return `Grep · ${trunc(String(input.pattern ?? ''), 60)}`;
-    case 'Glob':  return `Glob · ${trunc(String(input.pattern ?? ''), 60)}`;
-    case 'Agent':     return `Subagent · ${trunc(String(input.description ?? ''), 60)}`;
-    case 'TodoWrite': return `TodoWrite · ${(input.todos as unknown[] | undefined)?.length ?? 0} items`;
-    case 'TodoRead':  return 'TodoRead';
-    default:          return name;
+    case 'Bash':          return `Bash · ${trunc(String(input.command ?? ''), 60)}`;
+    case 'Read':          return `Read · ${path.basename(String(input.file_path ?? ''))}`;
+    case 'Edit':          return `Edit · ${path.basename(String(input.file_path ?? ''))}`;
+    case 'MultiEdit':     return `MultiEdit · ${path.basename(String(input.file_path ?? ''))}`;
+    case 'Write':         return `Write · ${path.basename(String(input.file_path ?? ''))}`;
+    case 'NotebookEdit':  return `NotebookEdit · ${path.basename(String(input.notebook_path ?? ''))}`;
+    case 'Grep':          return `Grep · ${trunc(String(input.pattern ?? ''), 60)}`;
+    case 'Glob':          return `Glob · ${trunc(String(input.pattern ?? ''), 60)}`;
+    case 'Agent':
+    case 'Task':          return `Subagent · ${trunc(String(input.description ?? ''), 60)}`;
+    case 'TodoWrite':     return `TodoWrite · ${(input.todos as unknown[] | undefined)?.length ?? 0} items`;
+    case 'TodoRead':      return 'TodoRead';
+    case 'Skill':         return `Skill · ${trunc(String(input.skill ?? input.name ?? ''), 60)}`;
+    case 'ToolSearch':    return `ToolSearch · ${trunc(String(input.query ?? ''), 60)}`;
+    case 'WebFetch':      return `WebFetch · ${trunc(String(input.url ?? ''), 60)}`;
+    case 'WebSearch':     return `WebSearch · ${trunc(String(input.query ?? ''), 60)}`;
+    case 'AskUserQuestion': return `AskUserQuestion · ${trunc(String(input.question ?? ''), 60)}`;
+    case 'ExitPlanMode':  return 'ExitPlanMode';
+    case 'EnterPlanMode': return 'EnterPlanMode';
+    case 'Monitor':       return `Monitor · pid ${input.pid ?? '?'}`;
+    case 'TaskOutput':    return `TaskOutput · ${String(input.task_id ?? input.taskId ?? '').slice(0, 12)}`;
+    case 'TaskStop':      return `TaskStop · ${String(input.task_id ?? input.taskId ?? '').slice(0, 12)}`;
+    default:              return name;
   }
 }
 
@@ -242,7 +325,14 @@ function extractResultBody(block: ContentBlock): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
     return (content as ContentBlock[])
-      .map(b => (b.type === 'text' ? String(b.text ?? '') : JSON.stringify(b)))
+      .map(b => {
+        if (b.type === 'text') return String(b.text ?? '');
+        if (b.type === 'image') {
+          const src = b.source as { media_type?: string } | undefined;
+          return `[image${src?.media_type ? ` · ${src.media_type}` : ''}]`;
+        }
+        return JSON.stringify(b);
+      })
       .join('\n');
   }
   return JSON.stringify(block);

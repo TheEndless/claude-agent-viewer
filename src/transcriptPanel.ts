@@ -237,13 +237,14 @@ function entryId(entry: TurnEntry): string {
 
 function renderEntryBubble(entry: TurnEntry): string {
   const kindClass = entry.kind.replace('_', '-');
-  const icon = entryIcon(entry.kind);
+  const icon = entry.isError ? '⚠' : entryIcon(entry.kind);
   const { html: bodyHtml, cls: bodyCls } = renderEntryBody(entry.body, entry.kind);
   const preview = entry.kind === 'system' ? hookOutputPreview(entry.body) : resultPreview(entry.body);
   const resultSection = entry.result ? renderResultSection(entry.result) : '';
   const previewHtml = preview ? `<span class="p-preview">${preview}</span>` : '';
   const autoOpen = bodyCls === 'todos' ? ' open' : '';
-  return `<div class="entry ${kindClass}${autoOpen}" data-eid="${entryId(entry)}">
+  const errorCls = entry.isError ? ' is-error' : '';
+  return `<div class="entry ${kindClass}${autoOpen}${errorCls}" data-eid="${entryId(entry)}">
     <div class="entry-header">
       <span class="entry-icon">${icon}</span>
       <span class="entry-lbl">${esc(entry.label)}</span>
@@ -257,8 +258,10 @@ function renderEntryBubble(entry: TurnEntry): string {
 function renderResultSection(result: TurnEntry): string {
   const { html: bodyHtml, cls: bodyCls } = renderEntryBody(result.body, result.kind);
   const preview = resultPreview(result.body);
-  return `<div class="result-section">
-    <div class="result-label"><span>↩</span> <span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${preview}</span>` : ''}</div>
+  const errorCls = result.isError ? ' is-error' : '';
+  const marker = result.isError ? '⚠' : '↩';
+  return `<div class="result-section${errorCls}">
+    <div class="result-label"><span>${marker}</span> <span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${preview}</span>` : ''}</div>
     <div class="result-body ${bodyCls}">${bodyHtml}</div>
   </div>`;
 }
@@ -453,6 +456,9 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry.tool-result { color: var(--vscode-symbolIcon-variableForeground); background: color-mix(in srgb, var(--vscode-symbolIcon-variableForeground) 8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-variableForeground) 25%, transparent); }
 .entry.thinking    { color: var(--vscode-symbolIcon-eventForeground);    background: color-mix(in srgb, var(--vscode-symbolIcon-eventForeground)    8%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-eventForeground)    25%, transparent); }
 .entry.system      { color: var(--vscode-symbolIcon-keywordForeground);  background: color-mix(in srgb, var(--vscode-symbolIcon-keywordForeground)  6%, transparent); border-color: color-mix(in srgb, var(--vscode-symbolIcon-keywordForeground)  20%, transparent); }
+.entry.is-error    { color: #f85149; background: color-mix(in srgb, #f85149 10%, transparent); border-color: color-mix(in srgb, #f85149 40%, transparent); }
+.result-section.is-error .result-label { color: #f85149; }
+.result-section.is-error { border-top-color: color-mix(in srgb, #f85149 40%, transparent); }
 
 .entry-body { display: none; padding: 6px 10px 8px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.5; max-height: 240px; overflow-y: auto; }
 .entry.open > .entry-body { display: block; }

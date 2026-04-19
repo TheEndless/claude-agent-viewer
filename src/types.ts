@@ -68,6 +68,7 @@ export interface TurnEntry {
   body: string;         // raw content - caller decides JSON vs markdown
   result?: TurnEntry;   // paired tool_result (tool_use only)
   hooks?: HookInfo[];   // stop_hook_summary data (tool_use only)
+  isError?: boolean;    // tool_result is_error=true OR api_error/hook error system entries
 }
 
 export interface Turn {

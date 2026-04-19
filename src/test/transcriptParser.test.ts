@@ -152,19 +152,94 @@ describe('parseTranscript', () => {
 
   it('labels tool_use entries for common tools', () => {
     const cases: Array<[string, object, string]> = [
-      ['Bash',   { command: 'npm test' },           'Bash · npm test'],
-      ['Read',   { file_path: '/src/foo.ts' },       'Read · foo.ts'],
-      ['Edit',   { file_path: '/src/bar.ts' },       'Edit · bar.ts'],
-      ['Write',  { file_path: '/src/baz.ts' },       'Write · baz.ts'],
-      ['Grep',   { pattern: 'TODO' },                'Grep · TODO'],
-      ['Glob',   { pattern: '**/*.ts' },             'Glob · **/*.ts'],
-      ['Agent',  { description: 'explore codebase' },'Subagent · explore codebase'],
-      ['Unknown',{},                                  'Unknown'],
+      ['Bash',           { command: 'npm test' },                          'Bash · npm test'],
+      ['Read',           { file_path: '/src/foo.ts' },                     'Read · foo.ts'],
+      ['Edit',           { file_path: '/src/bar.ts' },                     'Edit · bar.ts'],
+      ['MultiEdit',      { file_path: '/src/multi.ts' },                   'MultiEdit · multi.ts'],
+      ['Write',          { file_path: '/src/baz.ts' },                     'Write · baz.ts'],
+      ['NotebookEdit',   { notebook_path: '/nb/run.ipynb' },               'NotebookEdit · run.ipynb'],
+      ['Grep',           { pattern: 'TODO' },                              'Grep · TODO'],
+      ['Glob',           { pattern: '**/*.ts' },                           'Glob · **/*.ts'],
+      ['Agent',          { description: 'explore codebase' },              'Subagent · explore codebase'],
+      ['Task',           { description: 'do the thing' },                  'Subagent · do the thing'],
+      ['Skill',          { skill: 'writing-plans' },                       'Skill · writing-plans'],
+      ['ToolSearch',     { query: 'select:Read' },                         'ToolSearch · select:Read'],
+      ['WebFetch',       { url: 'https://example.com' },                   'WebFetch · https://example.com'],
+      ['WebSearch',      { query: 'rust traits' },                         'WebSearch · rust traits'],
+      ['AskUserQuestion',{ question: 'Which base branch?' },               'AskUserQuestion · Which base branch?'],
+      ['ExitPlanMode',   {},                                               'ExitPlanMode'],
+      ['mcp__slack__send_message',    { channel: 'x' },                    'MCP · slack · send_message'],
+      ['mcp__github',                 {},                                  'MCP · github'],
+      ['Unknown',        {},                                               'Unknown'],
     ];
     for (const [name, input, expectedLabel] of cases) {
       const jsonl = line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'x', name, input }] } });
       const turns = parseTranscript(jsonl);
       expect(turns[0].entries[0].label).toBe(expectedLabel);
     }
+  });
+
+  it('flags is_error on tool_result', () => {
+    const jsonl = [
+      line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_e', name: 'Bash', input: { command: 'false' } }] } }),
+      line({ type: 'user', timestamp: TS, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_e', content: 'boom', is_error: true }] } }),
+    ].join('\n');
+    const turns = parseTranscript(jsonl);
+    expect(turns[0].entries[0].result?.isError).toBe(true);
+  });
+
+  it('parses compact_boundary system event as "Context compacted"', () => {
+    const jsonl = [
+      line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'text', text: 'hi' }] } }),
+      line({ type: 'system', subtype: 'compact_boundary', timestamp: TS, compactMetadata: { trigger: 'auto' } }),
+    ].join('\n');
+    const turns = parseTranscript(jsonl);
+    expect(turns[0].entries[0].kind).toBe('system');
+    expect(turns[0].entries[0].label).toBe('Context compacted');
+  });
+
+  it('parses api_error system event with isError=true', () => {
+    const jsonl = [
+      line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'text', text: 'before' }] } }),
+      line({ type: 'system', subtype: 'api_error', timestamp: TS, error: 'overloaded' }),
+    ].join('\n');
+    const turns = parseTranscript(jsonl);
+    expect(turns[0].entries[0]).toMatchObject({ kind: 'system', label: 'API error', isError: true });
+    expect(turns[0].entries[0].body).toBe('overloaded');
+  });
+
+  it('parses hook_non_blocking_error attachment as error entry', () => {
+    const jsonl = [
+      line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } }),
+      line({ type: 'attachment', timestamp: TS, attachment: { type: 'hook_non_blocking_error', hookEvent: 'PostToolUse', error: 'hook crashed' } }),
+    ].join('\n');
+    const turns = parseTranscript(jsonl);
+    expect(turns[0].entries[0]).toMatchObject({ kind: 'system', label: 'Hook error · PostToolUse', isError: true });
+    expect(turns[0].entries[0].body).toBe('hook crashed');
+  });
+
+  it('marks isCompactSummary user turn with system entry', () => {
+    const jsonl = line({
+      type: 'user', timestamp: TS, isCompactSummary: true,
+      message: { role: 'user', content: 'Summary text here' }
+    });
+    const turns = parseTranscript(jsonl);
+    expect(turns[0].role).toBe('user');
+    expect(turns[0].entries[0]).toMatchObject({ kind: 'system', label: 'Compacted summary' });
+    expect(turns[0].text).toBe('Summary text here');
+  });
+
+  it('extracts text from array tool_result content with image blocks', () => {
+    const jsonl = [
+      line({ type: 'assistant', timestamp: TS, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_m', name: 'Bash', input: { command: 'x' } }] } }),
+      line({ type: 'user', timestamp: TS, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_m', content: [
+        { type: 'text', text: 'screenshot:' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: '...' } },
+      ] }] } }),
+    ].join('\n');
+    const turns = parseTranscript(jsonl);
+    const body = turns[0].entries[0].result!.body;
+    expect(body).toContain('screenshot:');
+    expect(body).toContain('[image · image/png]');
   });
 });
