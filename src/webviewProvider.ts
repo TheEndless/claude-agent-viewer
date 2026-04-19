@@ -274,6 +274,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       flex: 1;
       min-width: 0;
       overflow: hidden;
+      white-space: nowrap;
       text-overflow: ellipsis;
       direction: rtl;
       unicode-bidi: plaintext;
