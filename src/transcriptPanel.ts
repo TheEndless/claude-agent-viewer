@@ -247,7 +247,6 @@ function renderEntryBubble(entry: TurnEntry): string {
       <span class="entry-icon">${icon}</span>
       <span class="entry-lbl">${esc(entry.label)}</span>
       ${previewHtml}
-      <span class="p-ts" data-iso="${esc(entry.timestamp)}"></span>
       <span class="entry-caret"><svg><use href="#icon-chevron"/></svg></span>
     </div>
     <div class="entry-body ${bodyCls}">${bodyHtml}${resultSection}</div>
@@ -268,7 +267,7 @@ function resultPreview(body: string): string {
   const first = body.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? '';
   const cleaned = first.replace(/^[#>\-*`{[]+\s*/, '').replace(/["`]/g, '').trim();
   if (!cleaned) return '';
-  return cleaned.length > 80 ? cleaned.slice(0, 79) + '…' : cleaned;
+  return cleaned.length > 160 ? cleaned.slice(0, 159) + '…' : cleaned;
 }
 
 function hookOutputPreview(body: string): string {
@@ -276,7 +275,7 @@ function hookOutputPreview(body: string): string {
   const m = body.match(/\*\*Output:\*\*\n```\n([\s\S]*?)\n```/);
   if (m) {
     const first = m[1].trim().split('\n')[0].trim();
-    return first.length > 72 ? first.slice(0, 71) + '…' : first;
+    return first.length > 150 ? first.slice(0, 149) + '…' : first;
   }
   // No output — show duration if present.
   const d = body.match(/\*\*Duration:\*\*\s*([^\n·]+)/);
@@ -368,7 +367,10 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .bubble li { margin: 0.1em 0; }
 .bubble strong { font-weight: 600; }
 .bubble em { font-style: italic; opacity: 0.85; }
-.bubble h1, .bubble h2, .bubble h3 { font-weight: 600; font-size: 1em; margin: 0.4em 0 0.2em; }
+.bubble h1 { font-weight: 700; font-size: 1.5em; margin: 0.5em 0 0.25em; }
+.bubble h2 { font-weight: 600; font-size: 1.25em; margin: 0.45em 0 0.2em; }
+.bubble h3 { font-weight: 600; font-size: 1.05em; margin: 0.4em 0 0.2em; }
+.bubble h4, .bubble h5, .bubble h6 { font-weight: 600; font-size: 1em; margin: 0.4em 0 0.2em; }
 .bubble a { color: var(--vscode-focusBorder); }
 .bubble code { font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 11.5px; background: var(--vscode-textCodeBlock-background); color: var(--vscode-textPreformat-foreground); padding: 1px 5px; border-radius: 3px; border: 1px solid var(--vscode-panel-border); }
 .bubble pre { background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); border-radius: 4px; padding: 7px 10px; overflow-x: auto; margin: 0.4em 0; }
@@ -392,9 +394,8 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry-header { display: flex; align-items: center; gap: 8px; padding: 8px 11px; cursor: pointer; user-select: none; min-width: 0; }
 .entry-header:hover { background: rgba(128,128,128,0.06); }
 .entry-icon { flex-shrink: 0; font-size: 13px; line-height: 1; opacity: 0.85; }
-.entry-lbl { flex-shrink: 0; min-width: 0; max-width: 45%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 500; }
+.entry-lbl { flex-shrink: 0; min-width: 0; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 500; }
 .p-preview { flex: 1; min-width: 0; font-size: 11px; opacity: 0.55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 400; }
-.p-ts { flex-shrink: 0; font-size: 10px; opacity: 0.45; }
 .entry-caret { flex-shrink: 0; display: flex; align-items: center; color: currentColor; opacity: 0.5; transition: transform 0.15s; }
 .entry-caret svg { width: 11px; height: 11px; }
 .entry.open > .entry-header .entry-caret { transform: rotate(90deg); }
