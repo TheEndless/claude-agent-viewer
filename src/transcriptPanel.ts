@@ -358,30 +358,73 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .turn.user      .turn-content { justify-content: flex-end; }
 .turn-inner { width: 65%; display: flex; flex-direction: column; gap: 8px; }
 
-.bubble { padding: 8px 11px; line-height: 1.65; font-size: 13px; word-break: break-word; }
+.bubble { padding: 8px 11px; line-height: 1.57; font-size: 13px; word-wrap: break-word; }
 .turn.assistant .bubble { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-input-border); border-radius: 10px 10px 10px 2px; }
 .turn.user      .bubble { background: var(--vscode-chat-requestBackground, #2b3b4e); border: 1px solid var(--vscode-chat-requestBorder, #3b5070); border-radius: 10px 10px 2px 10px; }
 
-.bubble p { margin: 0 0 0.8em; }
-.bubble p:last-child { margin-bottom: 0; }
-.bubble ul, .bubble ol { padding-left: 1.5em; margin: 0.3em 0 0.7em; }
-.bubble li { margin: 0.2em 0; }
-.bubble li > p { margin-bottom: 0.3em; }
+/* Match VSCode's markdown preview CSS (markdown-language-features/media/markdown.css),
+   scaled slightly for 13px bubble context. */
+.bubble > *:first-child { margin-top: 0; }
+.bubble > *:last-child  { margin-bottom: 0; }
+.bubble p,
+.bubble blockquote,
+.bubble ul,
+.bubble ol,
+.bubble dl,
+.bubble table,
+.bubble pre { margin-top: 0; margin-bottom: 14px; }
+
+.bubble ul, .bubble ol { padding-left: 2em; }
+.bubble ul ul, .bubble ul ol, .bubble ol ol, .bubble ol ul { margin-top: 0; margin-bottom: 0; }
+.bubble li + li { margin-top: 0.25em; }
+.bubble li > p { margin-top: 14px; }
+
 .bubble strong { font-weight: 600; }
-.bubble em { font-style: italic; opacity: 0.85; }
-.bubble h1 { font-weight: 700; font-size: 1.5em; margin: 0.7em 0 0.35em; padding-bottom: 0.15em; border-bottom: 1px solid var(--vscode-panel-border); }
-.bubble h2 { font-weight: 600; font-size: 1.25em; margin: 0.6em 0 0.3em; padding-bottom: 0.12em; border-bottom: 1px solid var(--vscode-panel-border); }
-.bubble h3 { font-weight: 600; font-size: 1.05em; margin: 0.5em 0 0.25em; }
-.bubble h4, .bubble h5, .bubble h6 { font-weight: 600; font-size: 1em; margin: 0.4em 0 0.2em; }
-.bubble a { color: var(--vscode-focusBorder); }
-.bubble code { font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 11.5px; background: var(--vscode-textCodeBlock-background); color: var(--vscode-textPreformat-foreground); padding: 1px 5px; border-radius: 3px; border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 60%, transparent); }
-.bubble pre { background: var(--vscode-textCodeBlock-background); border: 1px solid var(--vscode-panel-border); border-radius: 6px; padding: 10px 14px; overflow-x: auto; margin: 0.6em 0; }
-.bubble pre code { background: none; border: none; padding: 0; font-size: 12px; }
-.bubble blockquote { border-left: 3px solid color-mix(in srgb, var(--vscode-focusBorder) 50%, transparent); padding: 2px 10px; margin: 0.5em 0; opacity: 0.85; background: color-mix(in srgb, var(--vscode-focusBorder) 5%, transparent); border-radius: 0 4px 4px 0; }
-.bubble hr { border: none; border-top: 1px solid var(--vscode-panel-border); margin: 0.8em 0; }
-.bubble table { border-collapse: collapse; width: 100%; margin: 0.6em 0; font-size: 12px; }
-.bubble th, .bubble td { border: 1px solid var(--vscode-panel-border); padding: 5px 10px; text-align: left; }
-.bubble thead th { background: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent); font-weight: 600; }
+.bubble em { font-style: italic; }
+
+.bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
+  font-weight: 600; margin-top: 20px; margin-bottom: 14px; line-height: 1.25;
+}
+.bubble h1 { font-size: 1.7em; padding-bottom: 0.3em; border-bottom: 1px solid var(--vscode-panel-border); }
+.bubble h2 { font-size: 1.35em; padding-bottom: 0.3em; border-bottom: 1px solid var(--vscode-panel-border); }
+.bubble h3 { font-size: 1.15em; }
+.bubble h4 { font-size: 1em; }
+.bubble h5 { font-size: 0.9em; }
+.bubble h6 { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+
+.bubble a { color: var(--vscode-textLink-foreground, var(--vscode-focusBorder)); text-decoration: none; }
+.bubble a:hover { text-decoration: underline; }
+
+.bubble code {
+  font-family: "Cascadia Code","Fira Code",Consolas,"Courier New",monospace;
+  font-size: 0.92em; line-height: 1.35em;
+  background: var(--vscode-textCodeBlock-background);
+  color: var(--vscode-textPreformat-foreground);
+  padding: 0.15em 0.4em; border-radius: 3px;
+}
+.bubble pre {
+  background: var(--vscode-textCodeBlock-background);
+  padding: 14px; border-radius: 3px; overflow: auto;
+  white-space: pre; tab-size: 4;
+}
+.bubble pre code {
+  background: none; padding: 0; border-radius: 0;
+  color: var(--vscode-editor-foreground); font-size: 0.92em;
+}
+
+.bubble blockquote {
+  padding: 0 16px 0 10px;
+  border-left: 5px solid var(--vscode-textBlockQuote-border, var(--vscode-input-border));
+  background: var(--vscode-textBlockQuote-background, transparent);
+  color: var(--vscode-textBlockQuote-foreground, inherit);
+}
+
+.bubble hr { border: 0; height: 2px; border-bottom: 2px solid var(--vscode-panel-border); margin: 14px 0; }
+
+.bubble table { border-collapse: collapse; }
+.bubble th, .bubble td { padding: 5px 10px; }
+.bubble thead th { text-align: left; border-bottom: 1px solid var(--vscode-panel-border); font-weight: 600; }
+.bubble tbody tr + tr td { border-top: 1px solid var(--vscode-panel-border); }
 
 .bubble-attachments { display: flex; flex-direction: column; gap: 5px; margin-bottom: 7px; }
 .attach-image { position: relative; display: inline-block; max-width: 100%; cursor: zoom-in; }

@@ -275,7 +275,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       min-width: 0;
       overflow: hidden;
       white-space: nowrap;
+      text-overflow: ellipsis;
+      direction: rtl;
+      text-align: left;
     }
+    /* LRM character inside the span forces LTR rendering of the path while the
+       container's RTL direction pushes overflow (and the ellipsis) to the start. */
     .parent-secondary .sep {
       flex-shrink: 0;
       padding: 0 4px;
@@ -398,10 +403,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return subs.reduce((m, s) => Math.max(m, s.mtimeMs), p.mtimeMs);
     }
 
-    function leftTrunc(str, n) {
-      return str.length > n ? '\u2026' + str.slice(str.length - n) : str;
-    }
-
     const CARET = '<span class="row-caret"><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></span>';
 
     function renderSubagentRow(sub, now) {
@@ -464,7 +465,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         '</div>' +
         '<div class="parent-body">' +
           '<div class="parent-secondary">' +
-            '<span class="proj-path">' + esc(leftTrunc(parent.cwd, 45)) + '</span>' +
+            '<span class="proj-path">\u200E' + esc(parent.cwd) + '</span>' +
             '<span class="sep">\u00b7</span>' +
             '<span class="p-mtime">' + relTimeShort(parent.mtimeMs, now) + '</span>' +
           '</div>' +

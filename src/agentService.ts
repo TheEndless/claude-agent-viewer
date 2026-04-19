@@ -17,8 +17,16 @@ const DONE_AGE_MS = 6 * 60 * 60 * 1000;
 const DEBOUNCE_MS = 200;
 const STATE_TICK_MS = 5000;
 
+interface TitleCache {
+  customTitle: string | null;
+  aiTitle: string | null;
+  lastPrompt: string | null;
+  firstUserPrompt: string | null;
+}
+
 export class AgentService {
   private agents = new Map<string, Agent>();
+  private titleCache = new Map<string, TitleCache>();
   private watcher?: chokidar.FSWatcher;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
@@ -60,8 +68,16 @@ export class AgentService {
   private async refreshFile(filePath: string): Promise<void> {
     try {
       const stat = await fsp.stat(filePath);
+      const sessionId = sessionIdFromPath(filePath);
+      // One-time full-file scan for title events. Subsequent updates use the cached
+      // values (titles don't change). Without this, ai-title/custom-title events
+      // written mid-file are missed by head+tail reads on large transcripts.
+      if (!this.titleCache.has(sessionId)) {
+        this.titleCache.set(sessionId, await scanFullFileForTitles(filePath));
+      }
       const events = await this.tailEvents(filePath, stat.size);
-      const agent = buildAgent(filePath, stat.mtimeMs, events);
+      const cached = this.titleCache.get(sessionId)!;
+      const agent = buildAgent(filePath, stat.mtimeMs, events, cached);
       this.agents.set(agent.sessionId, agent);
       this.scheduleEmit();
     } catch {
@@ -71,6 +87,7 @@ export class AgentService {
 
   private dropFile(filePath: string): void {
     const sessionId = sessionIdFromPath(filePath);
+    this.titleCache.delete(sessionId);
     if (this.agents.delete(sessionId)) {
       this.scheduleEmit();
     }
@@ -153,7 +170,7 @@ export class AgentService {
   }
 }
 
-function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[]): Agent {
+function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], titles: TitleCache): Agent {
   const sessionId = sessionIdFromPath(filePath);
   const cwd = resolveCwd(filePath, events);
   const projectName = path.basename(cwd);
@@ -161,7 +178,41 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[]): Agen
   const state = classifyState(mtimeMs, Date.now(), terminated);
   const activity = deriveActivity(events, state);
   const { details, agentCallDescs } = extractDetails(events);
+  // Merge cached title/prompt values (scanned once from whole file) with tail-derived details.
+  // Cached values win for titles since they were collected from the complete file.
+  details.customTitle = titles.customTitle ?? details.customTitle;
+  details.aiTitle = titles.aiTitle ?? details.aiTitle;
+  details.lastPrompt = titles.lastPrompt ?? details.lastPrompt;
+  details.latestUserPrompt = details.latestUserPrompt ?? titles.firstUserPrompt;
   return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
+}
+
+async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
+  const out: TitleCache = { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null };
+  try {
+    const content = await fsp.readFile(filePath, 'utf8');
+    const lines = content.split('\n');
+    for (const line of lines) {
+      if (!line) continue;
+      // Cheap check before JSON.parse — skip lines that don't contain any title/prompt key.
+      if (!/"(custom-title|ai-title|last-prompt|user)"/.test(line)) continue;
+      try {
+        const evt = JSON.parse(line) as RawEvent;
+        const t = typeof evt.type === 'string' ? evt.type : '';
+        if (t === 'custom-title' && typeof evt.customTitle === 'string' && evt.customTitle) {
+          out.customTitle = evt.customTitle;
+        } else if (t === 'ai-title' && typeof evt.aiTitle === 'string' && evt.aiTitle) {
+          out.aiTitle = evt.aiTitle;
+        } else if (t === 'last-prompt' && typeof evt.lastPrompt === 'string' && evt.lastPrompt) {
+          out.lastPrompt = truncate(evt.lastPrompt as string, 200);
+        } else if (t === 'user' && out.firstUserPrompt == null) {
+          const text = extractUserText(evt.message?.content);
+          if (text) out.firstUserPrompt = truncate(text, 200);
+        }
+      } catch { /* skip malformed line */ }
+    }
+  } catch { /* file vanished */ }
+  return out;
 }
 
 function assignTaskDescriptions(agents: Map<string, Agent>): void {
