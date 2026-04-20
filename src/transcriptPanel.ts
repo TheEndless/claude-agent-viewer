@@ -1,10 +1,35 @@
+/**
+ * transcriptPanel.ts
+ *
+ * Manages VS Code webview panels that render Claude Code JSONL transcripts as
+ * a chat-style conversation view. Each open panel corresponds to one agent
+ * session. Panels stream content in tail-first chunks so long sessions feel
+ * responsive, and update incrementally as the underlying transcript file grows.
+ */
+
 import * as vscode from 'vscode';
 import * as fsp from 'fs/promises';
 import MarkdownIt from 'markdown-it';
 import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
 import { parseTranscript } from './transcriptParser';
+import { logError } from './logger';
 
 const md = new MarkdownIt({ html: false, linkify: true, typographer: true });
+
+/** Derives the webview panel tab title from the session's best available name. */
+function transcriptTabTitle(agent: Agent): string {
+  const d = agent.details;
+  const name = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || agent.sessionId.slice(0, 8);
+  return name.length > 40 ? name.slice(0, 39) + '…' : name;
+}
+
+/** Valid modes for webview update messages. */
+type IpcMode = 'replace' | 'append' | 'prepend' | 'diag';
+
+/** Posts an update message to the webview with a compile-time-checked mode. */
+function postUpdate(webview: vscode.Webview, html: string, mode: IpcMode): void {
+  webview.postMessage({ command: 'update', html, mode });
+}
 
 const parseCache = new Map<string, { turns: Turn[]; mtimeMs: number }>();
 const openPanels = new Map<string, vscode.WebviewPanel>();
@@ -13,6 +38,11 @@ const openPanels = new Map<string, vscode.WebviewPanel>();
 // wiping and re-chunking the whole transcript every time a message arrives.
 const renderedCount = new Map<string, number>();
 
+/**
+ * Opens (or reveals) the transcript preview panel for the given agent.
+ * Forces a fresh parse of the transcript file on each explicit open to avoid
+ * serving stale cached turns after the file has been replaced.
+ */
 export function openTranscriptPreview(agent: Agent): void {
   // Force fresh read on explicit user action — bypass any stale cache entry.
   parseCache.delete(agent.sessionId);
@@ -24,7 +54,7 @@ export function openTranscriptPreview(agent: Agent): void {
   }
   const panel = vscode.window.createWebviewPanel(
     'agentTranscript',
-    `💬 ${agent.projectName} · ${agent.sessionId.slice(0, 8)}`,
+    transcriptTabTitle(agent),
     vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: true },
   );
@@ -32,17 +62,31 @@ export function openTranscriptPreview(agent: Agent): void {
   panel.onDidDispose(() => {
     openPanels.delete(agent.sessionId);
     renderedCount.delete(agent.sessionId);
+    parseCache.delete(agent.sessionId);
   });
   // Show shell immediately — content loads once webview signals ready.
   panel.webview.html = buildWebviewHtml(agent.projectName);
   renderedCount.delete(agent.sessionId);
-  const sub = panel.webview.onDidReceiveMessage((msg) => {
+  // Declare sub as let so the fallbackTimer closure can reference it after assignment.
+  // If the webview crashes or never fires 'ready', send turns anyway after 10s
+  // so the subscription doesn't leak and the panel doesn't stay blank forever.
+  let sub: vscode.Disposable;
+  const fallbackTimer = setTimeout(() => {
+    sub.dispose();
+    void sendTurnsUpdate(panel.webview, agent);
+  }, 10_000);
+  sub = panel.webview.onDidReceiveMessage((msg) => {
     if (msg.command !== 'ready') return;
+    clearTimeout(fallbackTimer);
     sub.dispose();
     void sendTurnsUpdate(panel.webview, agent);
   });
 }
 
+/**
+ * Called by the sidebar provider whenever the agent list changes.
+ * Refreshes any open transcript panels whose underlying file has a new mtime.
+ */
 export function updateTranscriptPanels(agents: Agent[]): void {
   for (const agent of agents) {
     const panel = openPanels.get(agent.sessionId);
@@ -53,10 +97,15 @@ export function updateTranscriptPanels(agents: Agent[]): void {
   }
 }
 
+/**
+ * Reads and parses the agent's transcript, then sends the rendered HTML to the
+ * webview. On the first render (or when the file is replaced) it does a full
+ * tail-first flush; on subsequent updates it appends only the new turns.
+ */
 async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<void> {
   const { turns, bytes } = await getTurns(agent);
   if (turns.length === 0) {
-    webview.postMessage({ command: 'update', html: '<div class="empty-state">No turns found in this transcript.</div>', mode: 'replace' });
+    postUpdate(webview, '<div class="empty-state">No turns found in this transcript.</div>', 'replace');
     renderedCount.set(agent.sessionId, 0);
     return;
   }
@@ -70,37 +119,83 @@ async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<v
   const needsFullRender = prev === 0 || turns.length < prev;
 
   if (needsFullRender) {
-    // Initial or full re-render: replace scroll with diag, then append turns in
-    // size-bounded chunks. Individual tool results / hook outputs can be very large,
-    // so count-based chunks aren't safe — size-based keeps us under postMessage limits.
-    webview.postMessage({ command: 'update', html: diagHtml, mode: 'replace' });
-    flushInChunks(webview, turns, 0);
+    // Initial or full re-render: pass diagHtml into flushInChunks so it can be
+    // combined with the first chunk — keeps "Loading…" visible until real content arrives.
+    await flushInChunks(webview, turns, 0, diagHtml);
   } else if (turns.length > prev) {
     // Incremental: append only the new turns, update diag in place.
-    flushInChunks(webview, turns, prev);
-    webview.postMessage({ command: 'update', html: diagHtml, mode: 'diag' });
+    await flushInChunks(webview, turns, prev);
+    postUpdate(webview, diagHtml, 'diag');
   } else {
     // Same count — file mtime changed but no new turns. Just refresh the diag.
-    webview.postMessage({ command: 'update', html: diagHtml, mode: 'diag' });
+    postUpdate(webview, diagHtml, 'diag');
   }
   renderedCount.set(agent.sessionId, turns.length);
 }
 
-const CHUNK_BYTE_LIMIT = 1_000_000; // ~1 MB per postMessage to stay well under IPC limits.
+const CHUNK_BYTE_LIMIT = 4_000_000; // 4 MB per chunk — fewer IPC round-trips.
+const INITIAL_TAIL = 30;            // render last N turns first for fast initial display.
 
-function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: number): void {
-  let buf = '';
-  for (let i = startIdx; i < turns.length; i++) {
-    const rendered = renderTurn(turns[i]);
-    if (buf && buf.length + rendered.length > CHUNK_BYTE_LIMIT) {
-      webview.postMessage({ command: 'update', html: buf, mode: 'append' });
-      buf = '';
+/**
+ * Streams rendered turn HTML to the webview in byte-limited chunks, yielding
+ * between each chunk to keep the extension host responsive. For large initial
+ * renders, the most recent INITIAL_TAIL turns are sent first as a single atomic
+ * replace so the user sees real content immediately; older history is then
+ * prepended in reverse-order chunks while the viewport stays stable.
+ */
+async function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: number, replaceDiag = ''): Promise<void> {
+  const yld = () => new Promise<void>(resolve => setImmediate(resolve));
+  const total = turns.length;
+
+  if (startIdx > 0 || total <= INITIAL_TAIL) {
+    // Incremental append or small session: simple forward pass.
+    if (replaceDiag) postUpdate(webview, replaceDiag, 'replace');
+    let buf = '';
+    for (let i = startIdx; i < total; i++) {
+      buf += renderTurn(turns[i]) + '\n';
+      if (buf.length >= CHUNK_BYTE_LIMIT) {
+        postUpdate(webview, buf, 'append');
+        buf = '';
+        await yld();
+      }
     }
-    buf += rendered + '\n';
+    if (buf) postUpdate(webview, buf, 'append');
+    return;
   }
-  if (buf) webview.postMessage({ command: 'update', html: buf, mode: 'append' });
+
+  // Full render of a large session.
+  // Phase 1: render the last INITIAL_TAIL turns as one batch and replace Loading…
+  // atomically — user sees the most recent content in a single paint, no mid-load flicker.
+  const tailStart = total - INITIAL_TAIL;
+  let tailBuf = replaceDiag || '';
+  for (let i = tailStart; i < total; i++) {
+    tailBuf += renderTurn(turns[i]) + '\n';
+  }
+  postUpdate(webview, tailBuf, replaceDiag ? 'replace' : 'append');
+  await yld();
+
+  // Phase 2: render earlier turns in forward-order chunks, then prepend them in
+  // reverse order so the oldest chunk ends up at the top. Yield between chunks
+  // to keep the extension host event loop responsive while history loads.
+  const chunks: string[] = [];
+  let buf = '';
+  for (let i = 0; i < tailStart; i++) {
+    buf += renderTurn(turns[i]) + '\n';
+    if (buf.length >= CHUNK_BYTE_LIMIT) {
+      chunks.push(buf);
+      buf = '';
+      await yld();
+    }
+  }
+  if (buf) chunks.push(buf);
+
+  for (let i = chunks.length - 1; i >= 0; i--) {
+    postUpdate(webview, chunks[i], 'prepend');
+    await yld();
+  }
 }
 
+/** Disposes the open panel and clears all cached state for the given session. */
 export function evict(sessionId: string): void {
   parseCache.delete(sessionId);
   renderedCount.delete(sessionId);
@@ -108,6 +203,11 @@ export function evict(sessionId: string): void {
   if (panel) { panel.dispose(); openPanels.delete(sessionId); }
 }
 
+/**
+ * Returns parsed turns for the agent, using a mtime-keyed cache to avoid
+ * re-parsing unchanged files. Stats the file directly to get the current mtime
+ * since agent.mtimeMs may lag slightly behind chokidar events.
+ */
 async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number }> {
   // Stat the file directly to get the current mtime, since agent.mtimeMs may be
   // stale between file writes and chokidar events.
@@ -117,29 +217,47 @@ async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number }>
     const stat = await fsp.stat(agent.transcriptPath);
     realMtime = stat.mtimeMs;
     bytes = stat.size;
-  } catch { /* fall through; file may have been deleted */ }
+  } catch (err) { logError(`getTurns stat(${agent.transcriptPath})`, err); }
   const cached = parseCache.get(agent.sessionId);
   if (cached && cached.mtimeMs === realMtime) return { turns: cached.turns, bytes };
   let text: string;
   try { text = await fsp.readFile(agent.transcriptPath, 'utf-8'); }
-  catch { return { turns: [], bytes: 0 }; }
+  catch (err) { logError(`getTurns readFile(${agent.transcriptPath})`, err); return { turns: [], bytes: 0 }; }
   const turns = parseTranscript(text);
   parseCache.set(agent.sessionId, { turns, mtimeMs: realMtime });
-  return { turns, bytes: Buffer.byteLength(text, 'utf-8') };
+  return { turns, bytes };
 }
 
+/** Escapes a string for safe embedding in HTML attribute values and text content. */
 function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-
 
 function renderTurn(turn: Turn): string {
   return turn.role === 'user' ? renderUserTurn(turn) : renderAssistantTurn(turn);
 }
 
+/**
+ * Renders a collapsible "Raw JSON" `<details>` element. The body is intentionally
+ * left empty — the webview syntax-highlights and pretty-prints lazily on first open
+ * using the `data-raw` attribute, avoiding expensive work for collapsed entries.
+ */
+function rawJsonDetails(source: string | undefined, extraClass = ''): string {
+  if (!source) return '';
+  const cls = extraClass ? ` ${extraClass}` : '';
+  // Body is empty — the webview renders and syntax-highlights lazily on first open.
+  return `<details class="bubble-raw${cls}" data-raw="${esc(source)}"><summary>Raw JSON</summary><div class="bubble-raw-body json"></div></details>`;
+}
+
+/** Renders the Raw JSON details element for a turn's source JSONL line. */
+function renderRawDetails(turn: Turn): string {
+  return rawJsonDetails(turn.rawJson);
+}
+
+/** Renders a user turn as a right-aligned chat bubble with optional attachments. */
 function renderUserTurn(turn: Turn): string {
   const attachHtml = turn.attachments.map(renderAttachment).join('');
-  const textHtml = turn.text ? `<div class="bubble-text">${md.render(turn.text)}</div>` : '';
+  const textHtml = turn.text ? md.render(turn.text) : '';
   const bubbleInner = (attachHtml ? `<div class="bubble-attachments">${attachHtml}</div>` : '') + textHtml;
   return `<div class="turn user">
     <div class="turn-head">
@@ -148,11 +266,12 @@ function renderUserTurn(turn: Turn): string {
       <span class="turn-ts" data-iso="${esc(turn.timestamp)}"></span>
     </div>
     <div class="turn-content"><div class="turn-inner">
-      <div class="bubble">${bubbleInner}</div>
+      <div class="bubble"><div class="bubble-content">${bubbleInner}</div>${renderRawDetails(turn)}</div>
     </div></div>
   </div>`;
 }
 
+/** Wraps a set of turn entries in a `.entries` container, or returns empty string if none. */
 function renderEntriesGroup(entries: TurnEntry[]): string {
   if (entries.length === 0) return '';
   return `<div class="entries">${entries.map(renderEntry).join('')}</div>`;
@@ -163,7 +282,7 @@ function renderAssistantTurn(turn: Turn): string {
   const toolHtml = renderEntriesGroup(turn.entries.filter(e => e.kind !== 'system'));
   const sysHtml  = renderEntriesGroup(turn.entries.filter(e => e.kind === 'system'));
   const bubbleHtml = turn.text
-    ? `<div class="bubble">${md.render(turn.text)}</div>`
+    ? `<div class="bubble"><div class="bubble-content">${md.render(turn.text)}</div>${renderRawDetails(turn)}</div>`
     : '';
   if (!toolHtml && !bubbleHtml && !sysHtml) return '';
   const metaParts: string[] = [];
@@ -182,12 +301,18 @@ function renderAssistantTurn(turn: Turn): string {
   </div>`;
 }
 
+/**
+ * Renders the body content of a turn entry, returning the HTML string and a CSS
+ * class name that controls layout (json, md, raw, plain, todos). Thinking entries
+ * return an empty body — content is stored in `data-lazy-body` and assigned via
+ * `textContent` in the webview on first open to avoid md.render overhead.
+ */
 function renderEntryBody(body: string, kind: TurnEntry['kind']): { html: string; cls: string } {
   if (kind === 'tool_result') {
     return { html: `<pre><code>${esc(body)}</code></pre>`, cls: 'raw' };
   }
   if (kind === 'thinking') {
-    return { html: md.render(body), cls: 'md' };
+    return { html: '', cls: 'plain' }; // body stored in data-lazy-body, rendered on open
   }
   let parsed: unknown;
   try {
@@ -221,8 +346,13 @@ function renderTodoList(todos: unknown[]): string {
   return `<ul class="todo-list">${items}</ul>`;
 }
 
+/**
+ * Applies basic JSON syntax highlighting via regex, returning an HTML string.
+ * Identical logic runs in the webview for lazy Raw JSON rendering — keep both in sync.
+ */
 function jsonHlTs(str: string): string {
-  return esc(str)
+  return str
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
     .replace(/(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)\s*:/g, '<span class="jk">$1</span>:')
     .replace(/:\s*(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)/g, ': <span class="js">$1</span>')
     .replace(/:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)/g, ': <span class="jn">$1</span>')
@@ -233,28 +363,30 @@ function entryId(entry: TurnEntry): string {
   return esc(`${entry.timestamp}:${entry.kind}:${entry.label}`);
 }
 
+/** Renders a collapsible entry row (tool call, tool result, thinking, or system event). */
 function renderEntry(entry: TurnEntry): string {
   const kindClass = entry.kind.replace('_', '-');
   const icon = entry.isError ? '<svg><use href="#icon-warning"/></svg>' : entryIcon(entry.kind);
   const { html: bodyHtml, cls: bodyCls } = renderEntryBody(entry.body, entry.kind);
   const preview = entry.kind === 'system' ? hookOutputPreview(entry.body) : resultPreview(entry.body);
   const resultSection = entry.result ? renderResultSection(entry.result) : '';
-  const previewHtml = preview ? `<span class="p-preview">${preview}</span>` : '';
+  const previewHtml = preview ? `<span class="p-preview">${esc(preview)}</span>` : '';
   const autoOpen = bodyCls === 'todos' ? ' open' : '';
   const errorCls = entry.isError ? ' is-error' : '';
+  const rawDetails = rawJsonDetails(entry.rawJson ?? entry.body, 'entry-raw');
+  const lazyAttr = entry.kind === 'thinking' ? ` data-lazy-body="${esc(entry.body)}"` : '';
   return `<div class="entry ${kindClass}${autoOpen}${errorCls}" data-eid="${entryId(entry)}">
     <div class="entry-header">
       <span class="entry-icon">${icon}</span>
       <span class="entry-lbl">${esc(entry.label)}</span>
       ${previewHtml}
-      <button class="raw-btn" title="View raw"><svg><use href="#icon-code"/></svg></button>
       <span class="entry-caret"><svg><use href="#icon-chevron"/></svg></span>
     </div>
-    <div class="entry-body rendered-view ${bodyCls}">${bodyHtml}${resultSection}</div>
-    <div class="entry-body raw-view raw"><pre><code>${esc(entry.body)}</code></pre></div>
+    <div class="entry-body"${lazyAttr}><div class="entry-body-content ${bodyCls}">${bodyHtml}${resultSection}</div>${rawDetails}</div>
   </div>`;
 }
 
+/** Renders the paired tool_result section that appears inside a tool_use entry. */
 function renderResultSection(result: TurnEntry): string {
   const { html: bodyHtml, cls: bodyCls } = renderEntryBody(result.body, result.kind);
   const preview = resultPreview(result.body);
@@ -263,7 +395,7 @@ function renderResultSection(result: TurnEntry): string {
     ? '<svg class="result-marker-icon"><use href="#icon-warning"/></svg>'
     : '<svg class="result-marker-icon"><use href="#icon-return"/></svg>';
   return `<div class="result-section${errorCls}">
-    <div class="result-label">${markerIcon}<span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${preview}</span>` : ''}</div>
+    <div class="result-label">${markerIcon}<span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${esc(preview)}</span>` : ''}</div>
     <div class="result-body ${bodyCls}">${bodyHtml}</div>
   </div>`;
 }
@@ -299,6 +431,7 @@ function entryIcon(kind: TurnEntry['kind']): string {
   return `<svg><use href="#${id}"/></svg>`;
 }
 
+/** Renders an image or document attachment for display within a user turn bubble. */
 function renderAttachment(att: TurnAttachment): string {
   if (att.type === 'image' && att.data && att.mediaType) {
     const src = `data:${esc(att.mediaType)};base64,${att.data}`;
@@ -320,6 +453,7 @@ function renderAttachment(att: TurnAttachment): string {
   return '';
 }
 
+/** Returns the full HTML shell for the transcript webview panel, including all CSS and JS. */
 function buildWebviewHtml(title: string): string {
   const turnsHtml = '<div class="empty-state loading">Loading\u2026</div>';
 
@@ -365,14 +499,15 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .turn.user      .turn-content { justify-content: flex-end; }
 .turn-inner { width: 65%; display: flex; flex-direction: column; gap: 8px; }
 
-.bubble { padding: 8px 11px; line-height: 1.57; font-size: 13px; word-wrap: break-word; }
+.bubble { line-height: 1.57; font-size: 13px; word-wrap: break-word; }
 .turn.assistant .bubble { background: var(--vscode-editorWidget-background); border: 1px solid var(--vscode-input-border); border-radius: 10px 10px 10px 2px; }
 .turn.user      .bubble { background: var(--vscode-chat-requestBackground, #2b3b4e); border: 1px solid var(--vscode-chat-requestBorder, #3b5070); border-radius: 10px 10px 2px 10px; }
+.bubble-content { padding: 8px 11px; }
 
 /* Match VSCode's markdown preview CSS (markdown-language-features/media/markdown.css),
    scaled slightly for 13px bubble context. */
-.bubble > *:first-child { margin-top: 0; }
-.bubble > *:last-child  { margin-bottom: 0; }
+.bubble-content > *:first-child { margin-top: 0; }
+.bubble-content > *:last-child  { margin-bottom: 0; }
 .bubble p,
 .bubble blockquote,
 .bubble ul,
@@ -465,35 +600,31 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .result-section.is-error .result-label { color: #f85149; }
 .result-section.is-error { border-top-color: color-mix(in srgb, #f85149 40%, transparent); }
 
-.entry-body { display: none; padding: 6px 10px 8px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.5; max-height: 240px; overflow-y: auto; }
-.entry.open > .entry-body.rendered-view { display: block; }
-.entry.open.show-raw > .entry-body.rendered-view { display: none; }
-.entry.open.show-raw > .entry-body.raw-view { display: block; }
+.entry-body { display: none; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+.entry.open > .entry-body { display: block; }
+.entry-body-content { max-height: 200px; overflow-y: auto; padding: 6px 10px 8px; font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.5; }
+.entry-raw { border-radius: 0 0 7px 7px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
 
-.raw-btn { display: none; flex-shrink: 0; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; background: none; border: none; cursor: pointer; border-radius: 3px; color: currentColor; opacity: 0.5; }
-.raw-btn svg { width: 11px; height: 11px; }
-.raw-btn:hover { background: rgba(128,128,128,0.12); opacity: 1; }
-.entry-header:hover .raw-btn { display: flex; }
-.entry.show-raw .raw-btn { display: flex; opacity: 1; }
-.entry-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; }
+.entry-body-content.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; }
 .jk { color: var(--json-key); }
 .js { color: var(--json-str); }
 .jn { color: var(--json-num); }
 .jb { color: var(--json-bool); }
-.entry-body.md p { margin: 0 0 0.35em; }
-.entry-body.md p:last-child { margin: 0; }
-.entry-body.md code { font-family: "Cascadia Code",Consolas,monospace; font-size: 10.5px; background: var(--vscode-textCodeBlock-background); color: var(--vscode-textPreformat-foreground); padding: 1px 4px; border-radius: 2px; }
-.entry-body.md pre { background: var(--vscode-textCodeBlock-background); padding: 5px 8px; border-radius: 3px; overflow-x: auto; margin: 0.3em 0; }
-.entry-body.md pre code { background: none; padding: 0; }
-.entry-body.md strong { font-weight: 600; color: var(--vscode-editor-foreground); }
-.entry-body.md ul, .entry-body.md ol { padding-left: 1.2em; margin: 0.2em 0; }
-.entry-body.md hr { border: none; border-top: 1px solid var(--vscode-input-border); margin: 0.4em 0; }
-.entry-body.md table { border-collapse: collapse; width: 100%; margin: 0.3em 0; font-size: 10.5px; }
-.entry-body.md th, .entry-body.md td { border: 1px solid var(--vscode-input-border); padding: 3px 6px; text-align: left; }
-.entry-body.md thead th { background: var(--vscode-editorWidget-background); font-weight: 600; }
-.entry-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
-.entry-body.raw pre { margin: 0; background: none; border: none; padding: 0; }
-.entry-body.raw code { font-family: inherit; background: none; border: none; padding: 0; color: var(--vscode-editor-foreground); }
+.entry-body-content.md p { margin: 0 0 0.35em; }
+.entry-body-content.md p:last-child { margin: 0; }
+.entry-body-content.md code { font-family: "Cascadia Code",Consolas,monospace; font-size: 10.5px; background: var(--vscode-textCodeBlock-background); color: var(--vscode-textPreformat-foreground); padding: 1px 4px; border-radius: 2px; }
+.entry-body-content.md pre { background: var(--vscode-textCodeBlock-background); padding: 5px 8px; border-radius: 3px; overflow-x: auto; margin: 0.3em 0; }
+.entry-body-content.md pre code { background: none; padding: 0; }
+.entry-body-content.md strong { font-weight: 600; color: var(--vscode-editor-foreground); }
+.entry-body-content.md ul, .entry-body-content.md ol { padding-left: 1.2em; margin: 0.2em 0; }
+.entry-body-content.md hr { border: none; border-top: 1px solid var(--vscode-input-border); margin: 0.4em 0; }
+.entry-body-content.md table { border-collapse: collapse; width: 100%; margin: 0.3em 0; font-size: 10.5px; }
+.entry-body-content.md th, .entry-body-content.md td { border: 1px solid var(--vscode-input-border); padding: 3px 6px; text-align: left; }
+.entry-body-content.md thead th { background: var(--vscode-editorWidget-background); font-weight: 600; }
+.entry-body-content.plain { white-space: pre-wrap; word-wrap: break-word; line-height: 1.6; }
+.entry-body-content.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
+.entry-body-content.raw pre { margin: 0; background: none; border: none; padding: 0; }
+.entry-body-content.raw code { font-family: inherit; background: none; border: none; padding: 0; color: var(--vscode-editor-foreground); }
 .result-section { margin-top: 8px; border-top: 1px solid var(--vscode-input-border); padding-top: 6px; }
 .result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; margin-bottom: 5px; }
 .result-marker-icon { width: 11px; height: 11px; flex-shrink: 0; }
@@ -512,6 +643,15 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 100; align-items: center; justify-content: center; cursor: zoom-out; }
 .lightbox.open { display: flex; }
 .lightbox img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: 6px; }
+
+.bubble-raw { border-top: 1px solid color-mix(in srgb, var(--vscode-input-border) 60%, transparent); overflow: hidden; }
+.entry-raw.bubble-raw { border-top-color: color-mix(in srgb, currentColor 20%, transparent); }
+.bubble-raw summary { padding: 5px 10px; font-size: 10px; font-weight: 500; color: var(--vscode-descriptionForeground); cursor: pointer; display: flex; align-items: center; gap: 5px; list-style: none; }
+.bubble-raw summary::-webkit-details-marker { display: none; }
+.bubble-raw summary::before { content: '▶'; font-size: 8px; transition: transform 0.15s; display: inline-block; opacity: 0.6; }
+.bubble-raw[open] summary::before { transform: rotate(90deg); }
+.bubble-raw summary:hover { background: rgba(128,128,128,0.06); }
+.bubble-raw-body { padding: 6px 10px 8px; font-size: 11px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; overflow-x: auto; }
 </style>
 </head>
 <body>
@@ -590,21 +730,45 @@ ${turnsHtml}
     });
   }
 
+  function jsonHlTs(str) {
+    return str
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+      .replace(/(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)\s*:/g,'<span class="jk">$1</span>:')
+      .replace(/:\s*(&quot;(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\&])*&quot;)/g,': <span class="js">$1</span>')
+      .replace(/:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)/g,': <span class="jn">$1</span>')
+      .replace(/:\s*(true|false|null)/g,': <span class="jb">$1</span>');
+  }
+
+  function renderRawBody(details) {
+    const body = details.querySelector('.bubble-raw-body');
+    if (!body || body.dataset.rendered) return;
+    body.dataset.rendered = '1';
+    let pretty;
+    try { pretty = JSON.stringify(JSON.parse(details.dataset.raw || ''), null, 2); }
+    catch { pretty = details.dataset.raw || ''; }
+    body.innerHTML = jsonHlTs(pretty);
+  }
+
   // Delegated click handling — attached once, works for any future content.
   scroll.addEventListener('click', (ev) => {
-    const rawBtn = ev.target.closest && ev.target.closest('.raw-btn');
-    if (rawBtn) {
-      const entry = rawBtn.closest('.entry');
-      if (entry) {
-        entry.classList.toggle('show-raw');
-        if (!entry.classList.contains('open')) entry.classList.add('open');
-      }
-      return;
+    const summary = ev.target.closest && ev.target.closest('summary');
+    if (summary) {
+      const details = summary.closest('details.bubble-raw');
+      if (details && !details.open) renderRawBody(details); // open is old state at click time
     }
     const header = ev.target.closest && ev.target.closest('.entry-header');
     if (header) {
       const entry = header.closest('.entry');
-      if (entry) entry.classList.toggle('open');
+      if (entry) {
+        // Lazy-render thinking body on first open.
+        const entryBody = entry.querySelector('.entry-body');
+        if (entryBody && entryBody.dataset.lazyBody !== undefined && !entryBody.dataset.rendered) {
+          entryBody.dataset.rendered = '1';
+          const content = entryBody.querySelector('.entry-body-content');
+          if (content) content.textContent = entryBody.dataset.lazyBody;
+        }
+        entry.classList.toggle('open');
+      }
       return;
     }
     const img = ev.target.closest && ev.target.closest('.attach-image');
@@ -613,8 +777,6 @@ ${turnsHtml}
       document.getElementById('lightbox').classList.add('open');
     }
   });
-  function attachListeners() { /* no-op: using event delegation now */ }
-
   function scrollToBottom() {
     _progScrolls++;
     requestAnimationFrame(() => {
@@ -636,6 +798,7 @@ ${turnsHtml}
   let openEidsAtReplace = new Set();
   window.addEventListener('message', e => {
     if (e.data?.command !== 'update') return;
+    if (!['replace', 'append', 'prepend', 'diag'].includes(e.data.mode)) return;
     const wasAtBottom = !userScrolled;
     if (e.data.mode === 'diag') {
       // Replace just the diagnostic banner, leave content intact.
@@ -652,8 +815,29 @@ ${turnsHtml}
     if (e.data.mode === 'replace') {
       openEidsAtReplace = new Set([...scroll.querySelectorAll('.entry.open[data-eid]')].map(el => el.getAttribute('data-eid')));
       scroll.innerHTML = e.data.html;
+    } else if (e.data.mode === 'prepend') {
+      // Insert older content above existing turns. Chromium's native scroll anchoring
+      // (overflow-anchor: auto, the default) keeps the viewport stable automatically —
+      // no manual scrollTop compensation needed (it would double-adjust and cause dancing).
+      const tmp = document.createElement('div');
+      tmp.innerHTML = e.data.html;
+      const diag = scroll.querySelector('.diag');
+      const ref = diag ? diag.nextSibling : scroll.firstChild;
+      while (tmp.firstChild) scroll.insertBefore(tmp.firstChild, ref);
+      if (openEidsAtReplace.size > 0) {
+        scroll.querySelectorAll('.entry[data-eid]').forEach(el => {
+          if (openEidsAtReplace.has(el.getAttribute('data-eid'))) el.classList.add('open');
+        });
+      }
+      stampTimestamps();
+      return;
     } else {
-      scroll.insertAdjacentHTML('beforeend', e.data.html);
+      // Parse in a detached element so parser state from prior chunks can't leak
+      // into the main document context (e.g. unclosed SVG leaving Chromium in
+      // "foreign content" mode for subsequent insertAdjacentHTML calls).
+      const tmp = document.createElement('div');
+      tmp.innerHTML = e.data.html;
+      while (tmp.firstChild) scroll.appendChild(tmp.firstChild);
     }
     if (openEidsAtReplace.size > 0) {
       scroll.querySelectorAll('.entry[data-eid]').forEach(el => {
@@ -661,13 +845,10 @@ ${turnsHtml}
       });
     }
     stampTimestamps();
-    attachListeners();
     if (wasAtBottom) scrollToBottom();
   });
 
-  // Initial setup + signal extension we're ready to receive content
   stampTimestamps();
-  attachListeners();
   scrollToBottom();
   const vscode = acquireVsCodeApi();
   vscode.postMessage({ command: 'ready' });

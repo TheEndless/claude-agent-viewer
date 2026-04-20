@@ -1,12 +1,26 @@
+/**
+ * webviewProvider.ts
+ *
+ * Implements the VS Code sidebar panel ("Agent Viewer") that lists all active
+ * and archived Claude Code agent sessions. Renders agent cards as HTML inside a
+ * WebviewView, handles user actions (preview transcript, open folder, stop, delete),
+ * and keeps the view in sync with AgentService via its onDidChange event.
+ */
+
 import * as vscode from 'vscode';
 import * as fsp from 'fs/promises';
 import { AgentService } from './agentService';
 import { Agent } from './types';
 import { findAgentPids, killAgent } from './processService';
 import { openTranscriptPreview, evict, updateTranscriptPanels } from './transcriptPanel';
+import { logError } from './logger';
 
 const AUTO_REFRESH_INTERVAL = 5000;
 
+/**
+ * VS Code WebviewViewProvider for the Agent Viewer sidebar panel.
+ * Registered against the `agentViewer.panel` view type in package.json.
+ */
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'agentViewer.panel';
   private _view?: vscode.WebviewView;
@@ -15,6 +29,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   constructor(private readonly agentService: AgentService) {}
 
+  /** Called by VS Code when the sidebar panel first becomes visible. Sets up the webview HTML, message handlers, and auto-refresh timer. */
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this._view = webviewView;
     webviewView.webview.options = { enableScripts: true };
@@ -35,20 +50,24 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       this._subscription?.dispose();
     });
 
-    this._subscription = this.agentService.onDidChange((agents) => {
+    const d1 = this.agentService.onDidChange((agents) => {
       this.postAgents();
       updateTranscriptPanels(agents);
     });
+    const d2 = this.agentService.onDidDrop((sessionId) => evict(sessionId));
+    this._subscription = { dispose: () => { d1.dispose(); d2.dispose(); } };
 
     webviewView.webview.html = this.getHtml();
     this.postAgents();
     this.startAutoRefresh();
   }
 
+  /** Manually pushes the current agent list to the webview. Used by command palette refresh. */
   refresh(): void {
     this.postAgents();
   }
 
+  /** Serializes the agent tree and posts a `render` message to the webview. */
   private postAgents(): void {
     if (!this._view) return;
     const serialize = (a: Agent): object => ({
@@ -68,6 +87,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     this._view.webview.postMessage({ command: 'render', agents, ready, now: Date.now() });
   }
 
+  /** Dispatches messages from the webview to the appropriate action handler. */
   private async handleMessage(message: { command: string; sessionId?: string }): Promise<void> {
     const { command, sessionId } = message;
 
@@ -96,12 +116,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-
   private async openFolder(agent: Agent): Promise<void> {
     const uri = vscode.Uri.file(agent.cwd);
     await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
   }
 
+  /** Finds the Claude process(es) for the agent's cwd and prompts the user before sending SIGTERM. */
   private async stopAgent(agent: Agent): Promise<void> {
     const matches = await findAgentPids(agent.cwd);
     if (matches.length === 0) {
@@ -130,10 +150,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     try {
       killAgent(pid);
     } catch (err) {
+      logError(`stopAgent(${pid})`, err);
       vscode.window.showErrorMessage(`Failed to stop pid ${pid}: ${(err as Error).message}`);
     }
   }
 
+  /** Prompts for confirmation then deletes the transcript file and evicts the agent from all caches. */
   private async deleteAgent(agent: Agent): Promise<void> {
     const answer = await vscode.window.showWarningMessage(
       `Delete transcript for "${agent.projectName}"?`,
@@ -145,6 +167,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       await fsp.unlink(agent.transcriptPath);
       evict(agent.sessionId);
     } catch (err) {
+      logError(`deleteAgent(${agent.sessionId})`, err);
       vscode.window.showErrorMessage(
         `Failed to delete transcript: ${(err as Error).message}`,
       );
@@ -163,6 +186,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Returns the full HTML for the sidebar webview, including all CSS and JS for the agent card UI. */
   private getHtml(): string {
     return /*html*/ `<!DOCTYPE html>
 <html lang="en">
@@ -208,17 +232,19 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .card:hover { border-color: color-mix(in srgb, var(--vscode-focusBorder) 60%, transparent); }
 
     .card-top {
+      position: relative;
       display: flex;
       align-items: center;
       gap: 5px;
       height: 30px;
+      overflow: hidden;
       padding: 0 8px;
       cursor: pointer;
       user-select: none;
     }
     .card-top:hover { background: rgba(128,128,128,0.05); }
-    .card-top:hover .card-slot .card-time    { display: none; }
-    .card-top:hover .card-slot .card-actions { display: flex; }
+    .card-top:hover .card-time    { display: none; }
+    .card-top:hover .card-actions { display: flex; }
 
     .card-name {
       flex: 1;
@@ -232,11 +258,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .card-name.no-prompt { color: var(--vscode-disabledForeground); }
 
     .card-slot {
-      width: 72px;
       flex-shrink: 0;
       display: flex;
       align-items: center;
-      justify-content: flex-end;
     }
 
     .card-time {
@@ -248,6 +272,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: none;
       align-items: center;
       gap: 2px;
+      position: absolute;
+      right: 8px;
     }
 
     .card-path {
@@ -263,6 +289,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       text-overflow: ellipsis;
       direction: rtl;
       text-align: left;
+    }
+    .session-id {
+      display: block;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      opacity: 0.5;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 9px;
+      margin-top: 1px;
     }
 
     .sub-toggle {
@@ -288,6 +324,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .card.subs-open .sub-list { display: block; }
 
     .sub-row {
+      position: relative;
       display: flex;
       align-items: center;
       gap: 5px;
@@ -298,8 +335,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       border-top: 1px solid color-mix(in srgb, var(--vscode-widget-border, var(--vscode-input-border)) 50%, transparent);
     }
     .sub-row:hover { background: var(--vscode-list-hoverBackground); }
-    .sub-row:hover .card-slot .sub-time    { display: none; }
-    .sub-row:hover .card-slot .sub-actions { display: flex; }
+    .sub-row:hover .sub-time    { display: none; }
+    .sub-row:hover .sub-actions { display: flex; }
     .sub-row.done-sub { opacity: 0.6; }
 
     .sub-name {
@@ -319,6 +356,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: none;
       align-items: center;
       gap: 2px;
+      position: absolute;
+      right: 8px;
     }
 
     .action-btn {
@@ -402,6 +441,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return subs.reduce((m, s) => Math.max(m, s.mtimeMs), p.mtimeMs);
     }
 
+    function renderActionBtns(stopBtn) {
+      return '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+        '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
+        stopBtn +
+        '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>';
+    }
+
     function renderSubRow(sub, now) {
       const task = sub.taskDescription || (sub.details && sub.details.latestUserPrompt) || sub.sessionId.slice(0, 8);
       const doneCls = sub.state === 'done' ? ' done-sub' : '';
@@ -413,12 +459,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         '<span class="sub-name">' + esc(task) + '</span>' +
         '<div class="card-slot">' +
           '<span class="sub-time">' + relTimeShort(sub.mtimeMs, now) + '</span>' +
-          '<div class="sub-actions">' +
-            '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
-            '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
-            stopBtn +
-            '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
-          '</div>' +
+          '<div class="sub-actions">' + renderActionBtns(stopBtn) + '</div>' +
         '</div>' +
       '</div>';
     }
@@ -456,15 +497,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           '<span class="card-name' + nameCls + '">' + esc(prompt || '(no prompt yet)') + '</span>' +
           '<div class="card-slot">' +
             '<span class="card-time">' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
-            '<div class="card-actions">' +
-              '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
-              '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
-              stopBtn +
-              '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>' +
-            '</div>' +
+            '<div class="card-actions">' + renderActionBtns(stopBtn) + '</div>' +
           '</div>' +
         '</div>' +
-        '<div class="card-path"><span class="proj-path">\u200E' + esc(parent.cwd) + '</span></div>' +
+        '<div class="card-path"><span class="proj-path">\u200E' + esc(parent.cwd) + '</span><span class="session-id">' + esc(parent.sessionId) + '</span></div>' +
         subSection +
       '</div>';
     }
@@ -500,12 +536,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
       const parents = agents.filter(a => !a.parentSessionId);
 
-      const primary = parents.filter(p =>
-        parentEffectiveState(p) !== 'done' || (p.subagents || []).some(s => s.state === 'running')
-      );
-      const archive = parents.filter(p =>
-        parentEffectiveState(p) === 'done' && !(p.subagents || []).some(s => s.state === 'running')
-      );
+      const primary = [], archive = [];
+      for (const p of parents) {
+        const done = parentEffectiveState(p) === 'done' && !(p.subagents || []).some(s => s.state === 'running');
+        (done ? archive : primary).push(p);
+      }
 
       primary.sort((a, b) => parentMaxMtime(b) - parentMaxMtime(a));
       archive.sort((a, b) => b.mtimeMs - a.mtimeMs);

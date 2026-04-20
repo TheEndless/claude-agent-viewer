@@ -41,10 +41,12 @@ interface ParsedEvent {
  */
 export function parseTranscript(jsonlText: string): Turn[] {
   const events: ParsedEvent[] = [];
+  const rawLines: string[] = [];
   for (const rawLine of jsonlText.split('\n')) {
     if (!rawLine.trim()) continue;
     try {
       events.push(JSON.parse(rawLine));
+      rawLines.push(rawLine);
     } catch {
       // skip malformed lines
     }
@@ -66,7 +68,9 @@ export function parseTranscript(jsonlText: string): Turn[] {
     }
   };
 
-  for (const event of events) {
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i];
+    const rawLine = rawLines[i];
     const ts = typeof event.timestamp === 'string' ? event.timestamp : new Date().toISOString();
     const role = event.message?.role;
 
@@ -95,7 +99,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
           output ? `**Output:**\n\`\`\`\n${output}\n\`\`\`` : '',
           prevented ? '⚠ **Prevented continuation**' : '',
         ].filter(Boolean).join('\n');
-        attachSystemEntry({ kind: 'system', label: `${hookEvent} Hook · ${hookScriptName(command)}`, timestamp: ts, body });
+        attachSystemEntry({ kind: 'system', label: `${hookEvent} Hook · ${hookScriptName(command)}`, timestamp: ts, body, rawJson: rawLine });
       } else if (attType === 'hook_non_blocking_error') {
         const msg = String(att.error ?? att.message ?? att.stderr ?? JSON.stringify(att));
         attachSystemEntry({
@@ -104,6 +108,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
           timestamp: ts,
           body: msg,
           isError: true,
+          rawJson: rawLine,
         });
       } else if (attType === 'hook_system_message') {
         const msg = String(att.message ?? att.content ?? JSON.stringify(att));
@@ -112,6 +117,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
           label: `Hook · ${hookEvent || 'system message'}`,
           timestamp: ts,
           body: msg,
+          rawJson: rawLine,
         });
       }
       // Other attachment types (todo_reminder, auto_mode, file-history, etc.) are internal metadata — skip.
@@ -129,21 +135,28 @@ export function parseTranscript(jsonlText: string): Turn[] {
           label: 'Context compacted',
           timestamp: ts,
           body: typeof meta === 'object' && meta !== null ? JSON.stringify(meta, null, 2) : '',
+          rawJson: rawLine,
         });
         continue;
       }
       if (subtype === 'api_error') {
         const err = (event as { error?: unknown }).error;
         const content = (event as { content?: unknown }).content;
-        const body = typeof err === 'string' ? err
-          : typeof content === 'string' ? content
-          : JSON.stringify(err ?? content ?? event);
+        let body: string;
+        if (typeof err === 'string') {
+          body = err;
+        } else if (typeof content === 'string') {
+          body = content;
+        } else {
+          body = JSON.stringify(err ?? content ?? event);
+        }
         attachSystemEntry({
           kind: 'system',
           label: 'API error',
           timestamp: ts,
           body,
           isError: true,
+          rawJson: rawLine,
         });
         continue;
       }
@@ -153,6 +166,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
           label: subtype === 'informational' ? 'Info' : 'Local command',
           timestamp: ts,
           body: JSON.stringify(event),
+          rawJson: rawLine,
         });
         continue;
       }
@@ -166,6 +180,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
         label: 'Session ended',
         timestamp: ts,
         body: JSON.stringify(event),
+        rawJson: rawLine,
       });
       continue;
     }
@@ -175,7 +190,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
       if (currentAssistant) turns.push(currentAssistant);
       assistantIndex++;
       const model = typeof event.message?.model === 'string' ? event.message.model : undefined;
-      currentAssistant = { role: 'assistant', timestamp: ts, attachments: [], entries: [], model, index: assistantIndex };
+      currentAssistant = { role: 'assistant', timestamp: ts, attachments: [], entries: [], model, index: assistantIndex, rawJson: rawLine };
       pendingToolUse.clear();
 
       for (const block of normalizeContent(event.message?.content)) {
@@ -187,6 +202,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
             label: 'Thinking',
             timestamp: ts,
             body: block.thinking as string,
+            rawJson: rawLine,
           });
         } else if (block.type === 'tool_use') {
           const name = typeof block.name === 'string' ? block.name : 'Tool';
@@ -197,6 +213,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
             label: labelForToolUse(name, input),
             timestamp: ts,
             body: JSON.stringify(input),
+            rawJson: rawLine,
           };
           currentAssistant.entries.push(entry);
           if (id) pendingToolUse.set(id, { entry, toolName: name });
@@ -235,7 +252,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
         }
         pendingToolUse.clear();
 
-        const turn: Turn = { role: 'user', timestamp: ts, attachments: [], entries: [] };
+        const turn: Turn = { role: 'user', timestamp: ts, attachments: [], entries: [], rawJson: rawLine };
         if (isCompactSummary) {
           // Mark as a compaction placeholder; visible in UI as "(compacted summary)".
           turn.entries.push({

@@ -1,3 +1,13 @@
+/**
+ * agentService.ts
+ *
+ * Discovers, parses, and tracks Claude Code agent sessions by watching
+ * ~/.claude/projects/ for JSONL transcript files. Exposes a live, sorted list
+ * of Agent objects and fires onDidChange whenever the list or any agent's state
+ * changes. Maintains a separate title cache so expensive full-file scans for
+ * session names are only performed once per session.
+ */
+
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
@@ -6,17 +16,16 @@ import * as vscode from 'vscode';
 import chokidar from 'chokidar';
 import { Agent, AgentDetails, AgentState, RawEvent, ToolCallSummary } from './types';
 import { buildTree } from './agentTree';
+import { logError, logInfo } from './logger';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
-const HEAD_BYTES = 8 * 1024;
-const TITLE_EVENT_TYPES = new Set(['ai-title', 'custom-title', 'last-prompt']);
-const KEEP_EVENTS = 20;
 const RUNNING_WINDOW_MS = 5 * 60 * 1000;
 const DONE_AGE_MS = 6 * 60 * 60 * 1000;
 const DEBOUNCE_MS = 200;
 const STATE_TICK_MS = 5000;
 
+/** Cached session name fields scanned from the full transcript file. */
 interface TitleCache {
   customTitle: string | null;
   aiTitle: string | null;
@@ -24,6 +33,11 @@ interface TitleCache {
   firstUserPrompt: string | null;
 }
 
+/**
+ * Watches the Claude projects directory for JSONL transcript files and
+ * maintains an up-to-date in-memory map of Agent objects. Consumers subscribe
+ * via onDidChange to receive the full sorted agent list after any update.
+ */
 export class AgentService {
   private agents = new Map<string, Agent>();
   private titleCache = new Map<string, TitleCache>();
@@ -31,84 +45,141 @@ export class AgentService {
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
   private _ready = false;
-  private _watcherReady = false;
-  private _pendingRefreshes = 0;
   private _onDidChange = new vscode.EventEmitter<Agent[]>();
   readonly onDidChange = this._onDidChange.event;
+  private _onDidDrop = new vscode.EventEmitter<string>();
+  /** Fires with the sessionId whenever a transcript file is deleted. */
+  readonly onDidDrop = this._onDidDrop.event;
 
+  /** Returns true once the initial scan of the projects directory has completed. */
   isReady(): boolean { return this._ready; }
 
+  /** Begins the initial directory scan and starts the file watcher. */
   start(): void {
+    // Periodic tick ensures time-based state transitions (running → idle → done)
+    // fire even with no file changes. Routes through scheduleEmit so reclassification
+    // always runs on a consistent snapshot, never interleaved with async file reads.
+    this.tickTimer = setInterval(() => this.scheduleEmit('tick'), STATE_TICK_MS);
+    void this.initialize();
+  }
+
+  private async initialize(): Promise<void> {
     if (!fs.existsSync(PROJECTS_ROOT)) {
       this._ready = true;
       this._onDidChange.fire([]);
       return;
     }
 
-    this.watcher = chokidar.watch(`${PROJECTS_ROOT}/**/*.jsonl`, {
-      ignoreInitial: false,
-      persistent: true,
-      awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
-    });
+    // Recursive readdir to find all .jsonl files at any depth.
+    // Subagents live at PROJECTS_ROOT/<project>/<session>/subagents/<session>.jsonl
+    // so a two-level scan misses them. Stats run fully in parallel after.
+    const now = Date.now();
+    try {
+      const entries = await fsp.readdir(PROJECTS_ROOT, { recursive: true, withFileTypes: true });
+      const allFiles = entries
+        .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
+        .map(e => {
+          // Node 20+ uses `parentPath`; older versions used `path`. Support both.
+          const dirent = e as fs.Dirent & { parentPath?: string; path?: string };
+          const dir = dirent.parentPath ?? dirent.path ?? '';
+          return path.join(dir, e.name);
+        });
+      const STAT_BATCH = 50;
+      const statResults: Array<{ path: string; stat: fs.Stats } | null> = [];
+      for (let i = 0; i < allFiles.length; i += STAT_BATCH) {
+        const batch = await Promise.all(allFiles.slice(i, i + STAT_BATCH).map(async (f) => {
+          try { return { path: f, stat: await fsp.stat(f) }; }
+          catch (err) { logError(`stat(${f})`, err); return null; }
+        }));
+        statResults.push(...batch);
+      }
 
-    this.watcher
-      .on('add', (p) => this.refreshFile(p))
-      .on('change', (p) => this.refreshFile(p))
-      .on('unlink', (p) => this.dropFile(p))
-      .on('error', (err) => console.error('[agent-viewer] watcher error:', err))
-      .on('ready', () => { this._watcherReady = true; this.maybeSetReady(); });
+      const recentFiles: Array<{ path: string; stat: fs.Stats }> = [];
+      const archiveFiles: Array<{ path: string; stat: fs.Stats }> = [];
+      for (const r of statResults) {
+        if (!r) continue;
+        (now - r.stat.mtimeMs > DONE_AGE_MS ? archiveFiles : recentFiles).push(r);
+      }
 
-    this.tickTimer = setInterval(() => this.reclassifyAll(), STATE_TICK_MS);
-  }
+      await Promise.all(recentFiles.map(({ path: p, stat }) => this.processFile(p, stat)));
+      this._ready = true;
+      this.scheduleEmit();
 
-  private maybeSetReady(): void {
-    if (this._watcherReady && this._pendingRefreshes === 0 && !this._ready) {
+      // Archives: process in batches to avoid exhausting file descriptors.
+      const BATCH = 20;
+      for (let i = 0; i < archiveFiles.length; i += BATCH) {
+        await Promise.all(archiveFiles.slice(i, i + BATCH).map(({ path: p, stat }) => this.processFile(p, stat, true)));
+        this.scheduleEmit();
+      }
+    } catch (err) { logError('initialize', err); }
+
+    if (!this._ready) {
       this._ready = true;
       this.scheduleEmit();
     }
+
+    logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded`);
+    // Watch for ongoing changes. ignoreInitial: true since we already scanned above.
+    this.watcher = chokidar.watch(`${PROJECTS_ROOT}/**/*.jsonl`, {
+      ignoreInitial: true,
+      persistent: true,
+      alwaysStat: true,
+      awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
+    });
+    this.watcher
+      .on('add',    (p, stats) => { void this.processFile(p, stats); })
+      .on('change', (p, stats) => { void this.processFile(p, stats); })
+      .on('unlink', (p)        => this.dropFile(p))
+      .on('error',  (err)      => logError('watcher', err));
   }
 
+  /** Returns all known agents sorted by most-recently-modified first. */
   getAgents(): Agent[] {
     return Array.from(this.agents.values()).sort(
       (a, b) => b.mtimeMs - a.mtimeMs,
     );
   }
 
-  private async refreshFile(filePath: string): Promise<void> {
-    this._pendingRefreshes++;
+  /**
+   * Parses (or re-parses) a single transcript file and upserts the resulting
+   * Agent into the in-memory map. In archive mode, skips the expensive full-file
+   * title scan since only tail events are needed for old sessions.
+   */
+  private async processFile(filePath: string, stats?: fs.Stats, archiveMode = false): Promise<void> {
     try {
-      const stat = await fsp.stat(filePath);
-      // During initial scan, skip files older than 6 hours — they're archived sessions
-      // that slow startup without adding value to the primary view.
-      if (!this._watcherReady && (Date.now() - stat.mtimeMs) > DONE_AGE_MS) return;
+      const stat = stats ?? await fsp.stat(filePath);
       const sessionId = sessionIdFromPath(filePath);
-      // One-time full-file scan for title events. Subsequent updates use the cached
-      // values (titles don't change). Without this, ai-title/custom-title events
-      // written mid-file are missed by head+tail reads on large transcripts.
       if (!this.titleCache.has(sessionId)) {
-        this.titleCache.set(sessionId, await scanFullFileForTitles(filePath));
+        // Archive mode: skip full-file scan — tail is sufficient and archives are numerous.
+        const titles = archiveMode
+          ? { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null }
+          : await scanFullFileForTitles(filePath);
+        this.titleCache.set(sessionId, titles);
       }
       const events = await this.tailEvents(filePath, stat.size);
       const cached = this.titleCache.get(sessionId)!;
       const agent = buildAgent(filePath, stat.mtimeMs, events, cached);
       this.agents.set(agent.sessionId, agent);
       if (this._ready) this.scheduleEmit();
-    } catch {
-      // File likely vanished mid-read; next unlink event will clean up.
-    } finally {
-      this._pendingRefreshes--;
-      this.maybeSetReady();
+    } catch (err) {
+      logError(`processFile(${filePath})`, err);
     }
   }
 
+  /** Removes a deleted transcript file's agent and title cache entries, then fires onDidDrop. */
   private dropFile(filePath: string): void {
     const sessionId = sessionIdFromPath(filePath);
     this.titleCache.delete(sessionId);
     if (this.agents.delete(sessionId)) {
+      this._onDidDrop.fire(sessionId);
       this.scheduleEmit();
     }
   }
 
+  /**
+   * Reads the last TAIL_BYTES of the file to extract the most recent JSONL events
+   * without loading the entire (potentially large) transcript into memory.
+   */
   private async tailEvents(filePath: string, size: number): Promise<RawEvent[]> {
     const tailStart = Math.max(0, size - TAIL_BYTES);
     const handle = await fsp.open(filePath, 'r');
@@ -125,67 +196,56 @@ export class AgentService {
         try { tailEvents.push(JSON.parse(line) as RawEvent); } catch { /* skip */ }
       }
 
-      // For long files, also read the head to capture title events (ai-title, custom-title)
-      // that were written early in the session and fall outside the tail window.
-      if (tailStart > HEAD_BYTES) {
-        const headBuf = Buffer.alloc(HEAD_BYTES);
-        await handle.read(headBuf, 0, HEAD_BYTES, 0);
-        const headLines = headBuf.toString('utf8').split('\n');
-        headLines.pop(); // last line is likely partial
-        const titleEvents: RawEvent[] = [];
-        for (const line of headLines) {
-          if (!line) continue;
-          try {
-            const evt = JSON.parse(line) as RawEvent;
-            if (typeof evt.type === 'string' && TITLE_EVENT_TYPES.has(evt.type)) {
-              titleEvents.push(evt);
-            }
-          } catch { /* skip */ }
-        }
-        return [...titleEvents, ...tailEvents.slice(-KEEP_EVENTS)];
-      }
-
-      return tailEvents.slice(-KEEP_EVENTS);
+      return tailEvents;
     } finally {
       await handle.close();
     }
   }
 
-  private scheduleEmit(): void {
+  /**
+   * Debounces tree-building and change notification to avoid rapid-fire updates during bulk file scans.
+   * State reclassification runs synchronously inside the callback so it always sees a consistent
+   * agent snapshot — never interleaved with ongoing async file reads.
+   *
+   * `reason='tick'` suppresses the change event when no state transitions occurred, preventing
+   * no-op re-renders every STATE_TICK_MS when all agents are idle or done.
+   */
+  private scheduleEmit(reason: 'tick' | 'change' = 'change'): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.debounceTimer = setTimeout(() => {
-      buildTree(this.agents);
-      assignTaskDescriptions(this.agents);
-      this._onDidChange.fire(this.getAgents());
+      const now = Date.now();
+      let anyChanged = false;
+      for (const [id, agent] of this.agents) {
+        const hasActiveSubagent = agent.subagents.some(s => s.state === 'running');
+        const nextState = classifyState(agent.mtimeMs, now, agent.state === 'done', hasActiveSubagent);
+        if (nextState !== agent.state) {
+          this.agents.set(id, { ...agent, state: nextState });
+          anyChanged = true;
+        }
+      }
+      if (reason === 'change' || anyChanged) {
+        buildTree(this.agents);
+        assignTaskDescriptions(this.agents);
+        this._onDidChange.fire(this.getAgents());
+      }
     }, DEBOUNCE_MS);
   }
 
-  private reclassifyAll(): void {
-    const now = Date.now();
-    let changed = false;
-    for (const [id, agent] of this.agents) {
-      const hasActiveSubagent = agent.subagents.some(s => s.state === 'running');
-      const nextState = classifyState(agent.mtimeMs, now, agent.state === 'done', hasActiveSubagent);
-      if (nextState !== agent.state) {
-        this.agents.set(id, { ...agent, state: nextState });
-        changed = true;
-      }
-    }
-    if (changed) {
-      buildTree(this.agents);
-      assignTaskDescriptions(this.agents);
-      this._onDidChange.fire(this.getAgents());
-    }
-  }
-
+  /** Stops all timers and the file watcher. Call on extension deactivation. */
   dispose(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.watcher?.close();
     this._onDidChange.dispose();
+    this._onDidDrop.dispose();
   }
 }
 
+/**
+ * Constructs an Agent from a file path, its mtime, the tail events, and the
+ * cached title fields. Title cache values win over tail-derived values since
+ * they came from the complete file.
+ */
 function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], titles: TitleCache): Agent {
   const sessionId = sessionIdFromPath(filePath);
   const cwd = resolveCwd(filePath, events);
@@ -203,6 +263,11 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
   return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
 }
 
+/**
+ * Scans the entire transcript file for session name fields (custom-title,
+ * ai-title, last-prompt, first user message). Called once per session on first
+ * discovery; result is cached in titleCache for the session's lifetime.
+ */
 async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
   const out: TitleCache = { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null };
   try {
@@ -226,11 +291,17 @@ async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
           if (text) out.firstUserPrompt = truncate(text, 200);
         }
       } catch { /* skip malformed line */ }
+      // Stop scanning once all four fields are populated — no need to read further.
+      if (out.customTitle && out.aiTitle && out.lastPrompt && out.firstUserPrompt) break;
     }
-  } catch { /* file vanished */ }
+  } catch (err) { logError(`scanFullFileForTitles(${filePath})`, err); }
   return out;
 }
 
+/**
+ * Matches each parent agent's Agent tool_use call descriptions to its subagents
+ * (ordered by mtime) so the sidebar can show a meaningful task label per subagent.
+ */
 function assignTaskDescriptions(agents: Map<string, Agent>): void {
   for (const parent of agents.values()) {
     if (!parent.subagents.length) continue;
@@ -268,6 +339,7 @@ function normalizeCwd(p: string): string {
   return path.normalize(p).replace(/^[a-z]:/, d => d.toUpperCase());
 }
 
+/** Determines an agent's state from its mtime age, termination flag, and subagent activity. */
 function classifyState(mtimeMs: number, now: number, terminated: boolean, hasActiveSubagent = false): AgentState {
   if (terminated) return 'done';
   const age = now - mtimeMs;
@@ -281,6 +353,7 @@ function isTerminator(evt: RawEvent): boolean {
   return evt.type === 'summary';
 }
 
+/** Produces a short human-readable activity string from the most recent meaningful event. */
 function deriveActivity(events: RawEvent[], state: AgentState): string {
   if (state === 'done') return 'Session ended';
   const meaningful = [...events].reverse().find((e) => !isNoise(e));
@@ -350,6 +423,10 @@ function truncate(s: string, n: number): string {
 const MAX_TRAIL = 5;
 const MAX_FILES = 5;
 
+/**
+ * Scans tail events to extract sidebar-displayable details: recent tool calls,
+ * recently touched files, user prompts, titles, and subagent descriptions.
+ */
 function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallDescs: string[] } {
   const trail: ToolCallSummary[] = [];
   const files: string[] = [];
