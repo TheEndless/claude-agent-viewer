@@ -1,11 +1,26 @@
+/**
+ * webviewProvider.ts
+ *
+ * Implements the VS Code sidebar panel ("Agent Viewer") that lists all active
+ * and archived Claude Code agent sessions. Renders agent cards as HTML inside a
+ * WebviewView, handles user actions (preview transcript, open folder, stop, delete),
+ * and keeps the view in sync with AgentService via its onDidChange event.
+ */
+
 import * as vscode from 'vscode';
 import * as fsp from 'fs/promises';
 import { AgentService } from './agentService';
 import { Agent } from './types';
 import { findAgentPids, killAgent } from './processService';
+import { openTranscriptPreview, evict, updateTranscriptPanels } from './transcriptPanel';
+import { logError } from './logger';
 
 const AUTO_REFRESH_INTERVAL = 5000;
 
+/**
+ * VS Code WebviewViewProvider for the Agent Viewer sidebar panel.
+ * Registered against the `agentViewer.panel` view type in package.json.
+ */
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'agentViewer.panel';
   private _view?: vscode.WebviewView;
@@ -14,6 +29,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   constructor(private readonly agentService: AgentService) {}
 
+  /** Called by VS Code when the sidebar panel first becomes visible. Sets up the webview HTML, message handlers, and auto-refresh timer. */
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this._view = webviewView;
     webviewView.webview.options = { enableScripts: true };
@@ -34,20 +50,27 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       this._subscription?.dispose();
     });
 
-    this._subscription = this.agentService.onDidChange(() => this.postAgents());
+    const d1 = this.agentService.onDidChange((agents) => {
+      this.postAgents();
+      updateTranscriptPanels(agents);
+    });
+    const d2 = this.agentService.onDidDrop((sessionId) => evict(sessionId));
+    this._subscription = { dispose: () => { d1.dispose(); d2.dispose(); } };
 
     webviewView.webview.html = this.getHtml();
     this.postAgents();
     this.startAutoRefresh();
   }
 
+  /** Manually pushes the current agent list to the webview. Used by command palette refresh. */
   refresh(): void {
     this.postAgents();
   }
 
+  /** Serializes the agent tree and posts a `render` message to the webview. */
   private postAgents(): void {
     if (!this._view) return;
-    const agents = this.agentService.getAgents().map((a) => ({
+    const serialize = (a: Agent): object => ({
       sessionId: a.sessionId,
       projectName: a.projectName,
       cwd: a.cwd,
@@ -55,19 +78,31 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       activity: a.activity,
       mtimeMs: a.mtimeMs,
       details: a.details,
-    }));
-    this._view.webview.postMessage({ command: 'render', agents, now: Date.now() });
+      parentSessionId: a.parentSessionId,
+      taskDescription: a.taskDescription,
+      subagents: a.subagents.map(serialize),
+    });
+    const agents = this.agentService.getAgents().map(serialize);
+    const ready = this.agentService.isReady();
+    this._view.webview.postMessage({ command: 'render', agents, ready, now: Date.now() });
   }
 
+  /** Dispatches messages from the webview to the appropriate action handler. */
   private async handleMessage(message: { command: string; sessionId?: string }): Promise<void> {
     const { command, sessionId } = message;
+
+    if (command === 'refresh') {
+      this.postAgents();
+      return;
+    }
+
     if (!sessionId) return;
     const agent = this.agentService.getAgents().find((a) => a.sessionId === sessionId);
     if (!agent) return;
 
     switch (command) {
-      case 'viewTranscript':
-        await this.viewTranscript(agent);
+      case 'previewTranscript':
+        openTranscriptPreview(agent);
         return;
       case 'openFolder':
         await this.openFolder(agent);
@@ -81,20 +116,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async viewTranscript(agent: Agent): Promise<void> {
-    try {
-      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(agent.transcriptPath));
-      await vscode.window.showTextDocument(doc, { preview: true });
-    } catch (err) {
-      vscode.window.showErrorMessage(`Could not open transcript: ${(err as Error).message}`);
-    }
-  }
-
   private async openFolder(agent: Agent): Promise<void> {
     const uri = vscode.Uri.file(agent.cwd);
     await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
   }
 
+  /** Finds the Claude process(es) for the agent's cwd and prompts the user before sending SIGTERM. */
   private async stopAgent(agent: Agent): Promise<void> {
     const matches = await findAgentPids(agent.cwd);
     if (matches.length === 0) {
@@ -123,10 +150,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     try {
       killAgent(pid);
     } catch (err) {
+      logError(`stopAgent(${pid})`, err);
       vscode.window.showErrorMessage(`Failed to stop pid ${pid}: ${(err as Error).message}`);
     }
   }
 
+  /** Prompts for confirmation then deletes the transcript file and evicts the agent from all caches. */
   private async deleteAgent(agent: Agent): Promise<void> {
     const answer = await vscode.window.showWarningMessage(
       `Delete transcript for "${agent.projectName}"?`,
@@ -136,7 +165,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     if (answer !== 'Delete') return;
     try {
       await fsp.unlink(agent.transcriptPath);
+      evict(agent.sessionId);
     } catch (err) {
+      logError(`deleteAgent(${agent.sessionId})`, err);
       vscode.window.showErrorMessage(
         `Failed to delete transcript: ${(err as Error).message}`,
       );
@@ -155,6 +186,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Returns the full HTML for the sidebar webview, including all CSS and JS for the agent card UI. */
   private getHtml(): string {
     return /*html*/ `<!DOCTYPE html>
 <html lang="en">
@@ -169,256 +201,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       font-size: var(--vscode-font-size);
       color: var(--vscode-foreground);
       background: var(--vscode-sideBar-background);
-      padding: 0 8px 16px;
+      padding: 0 0 16px;
     }
 
-    .header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 12px 0 8px;
-      position: sticky;
-      top: 0;
-      background: var(--vscode-sideBar-background);
-      z-index: 10;
-    }
-
-    .header h2 {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--vscode-sideBarSectionHeader-foreground);
-    }
-
-    .auto-refresh-indicator {
-      font-size: 10px;
-      color: var(--vscode-disabledForeground);
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .pulse {
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      background: #3fb950;
-      animation: pulse 2s infinite;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 0.3; }
-      50% { opacity: 1; }
-    }
-
-    details.group {
-      margin-bottom: 8px;
-    }
-    details.group summary {
-      list-style: none;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 2px;
-      border-radius: 4px;
-      user-select: none;
-    }
-    details.group summary::-webkit-details-marker { display: none; }
-    details.group summary::before {
-      content: '▸';
-      display: inline-block;
-      font-size: 9px;
-      color: var(--vscode-icon-foreground);
-      transition: transform 0.1s ease;
-      width: 10px;
-    }
-    details.group[open] summary::before {
-      transform: rotate(90deg);
-    }
-    .group-title {
-      font-size: 11px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: var(--vscode-sideBarSectionHeader-foreground);
-    }
-    .group-count {
-      font-size: 10px;
-      background: var(--vscode-badge-background);
-      color: var(--vscode-badge-foreground);
-      padding: 0 6px;
-      border-radius: 8px;
-      line-height: 16px;
-      min-width: 18px;
-      text-align: center;
-    }
-
-    .empty {
-      padding: 8px 18px;
-      color: var(--vscode-disabledForeground);
-      font-size: 11px;
-    }
-
-    .card {
-      background: var(--vscode-editor-background);
-      border: 1px solid var(--vscode-widget-border, transparent);
-      border-radius: 6px;
-      padding: 8px 10px;
-      margin: 4px 0;
-      cursor: pointer;
-    }
-    .card:hover {
-      background: var(--vscode-list-hoverBackground);
-    }
-    .card:hover .card-actions { opacity: 1; }
-
-    .card-details {
-      display: none;
-      margin-top: 10px;
-      padding-top: 8px;
-      border-top: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      cursor: default;
-    }
-    .card.expanded .card-details { display: block; }
-
-    .detail-row {
-      margin-bottom: 6px;
-      line-height: 1.5;
-    }
-    .detail-label {
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      font-size: 9px;
-      color: var(--vscode-sideBarSectionHeader-foreground);
-      margin-bottom: 2px;
-    }
-    .detail-value {
-      color: var(--vscode-foreground);
-      word-break: break-all;
-    }
-    .detail-value.muted {
-      color: var(--vscode-descriptionForeground);
-    }
-
-    .trail {
-      list-style: none;
-      padding: 0;
-      margin: 0;
-    }
-    .trail li {
-      display: flex;
-      gap: 6px;
-      align-items: baseline;
-      padding: 2px 0;
-    }
-    .trail .trail-summary {
-      color: var(--vscode-foreground);
-      flex: 1;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .trail .trail-time {
-      color: var(--vscode-disabledForeground);
-      font-size: 10px;
-      flex-shrink: 0;
-    }
-
-    .files {
-      list-style: none;
-      padding: 0;
-      margin: 0;
-    }
-    .files li {
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 10px;
-      color: var(--vscode-textLink-foreground);
-      padding: 1px 0;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .chev {
-      color: var(--vscode-icon-foreground);
-      opacity: 0.5;
-      font-size: 9px;
-      margin-left: 6px;
-      transition: transform 0.1s ease;
-      display: inline-block;
-    }
-    .card.expanded .chev { transform: rotate(90deg); }
-
-    .card-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-
-    .card-info { flex: 1; min-width: 0; }
-
-    .card-name {
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--vscode-foreground);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      display: flex;
-      align-items: center;
-    }
-    .card-meta {
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-      margin-top: 2px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .status-dot {
-      display: inline-block;
-      width: 7px;
-      height: 7px;
-      border-radius: 50%;
-      margin-right: 6px;
-      flex-shrink: 0;
-    }
-    .status-dot.running {
-      background: #3fb950;
-      box-shadow: 0 0 6px rgba(63, 185, 80, 0.4);
-    }
-    .status-dot.idle { background: #d29922; }
-    .status-dot.done { background: #6e7681; }
-
-    .card-actions {
-      display: flex;
-      align-items: center;
-      gap: 2px;
-      opacity: 0;
-      transition: opacity 0.15s;
-      flex-shrink: 0;
-    }
-    .action-btn {
-      background: none;
-      border: none;
-      color: var(--vscode-descriptionForeground);
-      cursor: pointer;
-      padding: 3px 5px;
-      border-radius: 4px;
-      font-size: 12px;
-      display: flex;
-      align-items: center;
-    }
-    .action-btn:hover {
-      background: var(--vscode-toolbar-hoverBackground);
-      color: var(--vscode-foreground);
-    }
-    .action-btn.danger:hover { color: #f85149; }
 
     .empty-global {
       text-align: center;
@@ -426,23 +211,206 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-disabledForeground);
       font-size: 12px;
     }
+
+    .status-dot {
+      flex-shrink: 0;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+    }
+    .status-dot.running { background: #3fb950; box-shadow: 0 0 4px rgba(63,185,80,0.5); }
+    .status-dot.idle    { background: #d29922; }
+    .status-dot.done    { background: #6e7681; }
+
+    .card {
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-widget-border, var(--vscode-input-border));
+      border-radius: 5px;
+      margin: 3px 8px;
+      overflow: hidden;
+    }
+    .card:hover { border-color: color-mix(in srgb, var(--vscode-focusBorder) 60%, transparent); }
+
+    .card-top {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      height: 30px;
+      overflow: hidden;
+      padding: 0 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .card-top:hover { background: rgba(128,128,128,0.05); }
+    .card-top:hover .card-time    { display: none; }
+    .card-top:hover .card-actions { display: flex; }
+
+    .card-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+      font-size: 13px;
+      color: var(--vscode-foreground);
+    }
+    .card-name.no-prompt { color: var(--vscode-disabledForeground); }
+
+    .card-slot {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+    }
+
+    .card-time {
+      font-size: 10px;
+      color: var(--vscode-disabledForeground);
+    }
+
+    .card-actions {
+      display: none;
+      align-items: center;
+      gap: 2px;
+      position: absolute;
+      right: 8px;
+    }
+
+    .card-path {
+      padding: 0 8px 6px 20px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      overflow: hidden;
+    }
+    .proj-path {
+      display: block;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      direction: rtl;
+      text-align: left;
+    }
+    .session-id {
+      display: block;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      opacity: 0.5;
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 9px;
+      margin-top: 1px;
+    }
+
+    .sub-toggle {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      user-select: none;
+      border-top: 1px solid var(--vscode-widget-border, var(--vscode-input-border));
+    }
+    .sub-toggle:hover { color: var(--vscode-foreground); background: rgba(128,128,128,0.04); }
+    .sub-caret {
+      display: inline-block;
+      font-size: 9px;
+      transition: transform 0.1s;
+      opacity: 0.5;
+    }
+    .card.subs-open .sub-caret { transform: rotate(90deg); }
+    .sub-list { display: none; }
+    .card.subs-open .sub-list { display: block; }
+
+    .sub-row {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      height: 22px;
+      padding: 0 8px 0 20px;
+      cursor: pointer;
+      user-select: none;
+      border-top: 1px solid color-mix(in srgb, var(--vscode-widget-border, var(--vscode-input-border)) 50%, transparent);
+    }
+    .sub-row:hover { background: var(--vscode-list-hoverBackground); }
+    .sub-row:hover .sub-time    { display: none; }
+    .sub-row:hover .sub-actions { display: flex; }
+    .sub-row.done-sub { opacity: 0.6; }
+
+    .sub-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+      font-size: 12px;
+      color: var(--vscode-foreground);
+    }
+    .sub-time {
+      font-size: 10px;
+      color: var(--vscode-disabledForeground);
+    }
+    .sub-actions {
+      display: none;
+      align-items: center;
+      gap: 2px;
+      position: absolute;
+      right: 8px;
+    }
+
+    .action-btn {
+      background: none;
+      border: none;
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      padding: 0 3px;
+      height: 20px;
+      border-radius: 4px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+    }
+    .action-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+    .action-btn.danger:hover { color: #f85149; }
+
+    .archive-divider {
+      border: none;
+      border-top: 1px solid var(--vscode-input-border, rgba(128,128,128,0.2));
+      margin: 6px 0 2px;
+    }
+    .archive-row {
+      display: flex;
+      align-items: center;
+      height: 22px;
+      padding: 0 8px;
+      gap: 4px;
+      cursor: pointer;
+      user-select: none;
+      border-radius: 2px;
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+    }
+    .archive-row:hover { background: var(--vscode-list-hoverBackground); }
+    .archive-section.open > .archive-row > .arch-caret { transform: rotate(90deg); }
+    .arch-caret { display: inline-block; font-size: 9px; transition: transform 0.1s; opacity: 0.5; }
+    .archive-label { flex: 1; }
+    .archive-count { color: var(--vscode-disabledForeground); flex-shrink: 0; }
+
+    .archive-body { display: none; opacity: 0.65; }
+    .archive-section.open > .archive-body { display: block; }
   </style>
 </head>
 <body>
-  <div class="header">
-    <h2>Agents</h2>
-    <span class="auto-refresh-indicator" title="Auto-refreshing every 5s"><span class="pulse"></span></span>
-  </div>
   <div id="root" class="empty-global">Loading agents…</div>
 
   <script>
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
 
-    // Preserve <details> open state across re-renders.
-    const openSections = { running: true, idle: true, done: false };
-    // Preserve per-card expanded state across re-renders.
-    const expanded = new Set();
+    // Preserved expand state: keys are 'parent:<sessionId>' and 'archive'.
+    const openSections = {};
 
     function esc(s) {
       return String(s)
@@ -452,152 +420,191 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         .replace(/"/g, '&quot;');
     }
 
-    function relTime(ms, now) {
+    function relTimeShort(ms, now) {
       const d = now - ms;
       if (d < 10000) return 'now';
-      if (d < 60000) return Math.floor(d / 1000) + 's ago';
-      if (d < 3600000) return Math.floor(d / 60000) + 'm ago';
-      if (d < 86400000) return Math.floor(d / 3600000) + 'h ago';
-      return Math.floor(d / 86400000) + 'd ago';
+      if (d < 60000) return Math.floor(d / 1000) + 's';
+      if (d < 3600000) return Math.floor(d / 60000) + 'm';
+      if (d < 86400000) return Math.floor(d / 3600000) + 'h';
+      return Math.floor(d / 86400000) + 'd';
     }
 
-    function detailRow(label, body) {
-      return \`<div class="detail-row"><div class="detail-label">\${label}</div>\${body}</div>\`;
+    function parentEffectiveState(p) {
+      const subs = p.subagents || [];
+      if (p.state === 'running' || subs.some(s => s.state === 'running')) return 'running';
+      if (p.state === 'idle'    || subs.some(s => s.state === 'idle'))    return 'idle';
+      return 'done';
     }
 
-    function muted(text) {
-      return \`<div class="detail-value muted">\${text}</div>\`;
+    function parentMaxMtime(p) {
+      const subs = p.subagents || [];
+      return subs.reduce((m, s) => Math.max(m, s.mtimeMs), p.mtimeMs);
     }
 
-    function renderTrail(calls, now) {
-      if (!calls || calls.length === 0) return muted('No recent tool calls');
-      const items = calls.map(c => \`<li>
-        <span class="trail-summary">\${esc(c.summary)}</span>
-        \${c.at ? \`<span class="trail-time">\${esc(relTime(c.at, now))}</span>\` : ''}
-      </li>\`).join('');
-      return \`<ul class="trail">\${items}</ul>\`;
+    function renderActionBtns(stopBtn) {
+      return '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+        '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
+        stopBtn +
+        '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>';
     }
 
-    function renderFiles(files) {
-      if (!files || files.length === 0) return muted('No files touched');
-      const items = files.map(f => \`<li>\${esc(f)}</li>\`).join('');
-      return \`<ul class="files">\${items}</ul>\`;
-    }
-
-    function renderDetails(a, now) {
-      const d = a.details || {};
-      const prompt = d.latestUserPrompt
-        ? \`<div class="detail-value">\${esc(d.latestUserPrompt)}</div>\`
-        : muted('No user prompt captured');
-      const subagents = d.subagentCount > 0
-        ? detailRow('Subagents', \`<div class="detail-value">\${d.subagentCount} spawned</div>\`)
+    function renderSubRow(sub, now) {
+      const task = sub.taskDescription || (sub.details && sub.details.latestUserPrompt) || sub.sessionId.slice(0, 8);
+      const doneCls = sub.state === 'done' ? ' done-sub' : '';
+      const stopBtn = sub.state === 'running'
+        ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
         : '';
-      return \`<div class="card-details">
-        \${detailRow('Working directory', \`<div class="detail-value">\${esc(a.cwd)}</div>\`)}
-        \${detailRow('Last activity', \`<div class="detail-value">\${esc(relTime(a.mtimeMs, now))}</div>\`)}
-        \${detailRow('Latest user prompt', prompt)}
-        \${detailRow('Recent tool calls', renderTrail(d.recentToolCalls, now))}
-        \${detailRow('Recent files', renderFiles(d.recentFiles))}
-        \${subagents}
-      </div>\`;
-    }
-
-    function renderCard(a, now) {
-      const stopBtn = a.state === 'running'
-        ? '<button class="action-btn danger" data-act="stop" title="Stop agent">\u25a0</button>'
-        : '';
-      const isOpen = expanded.has(a.sessionId);
-      return '<div class="card' + (isOpen ? ' expanded' : '') + '" data-sid="' + esc(a.sessionId) + '">' +
-        '<div class="card-top">' +
-          '<div class="card-info">' +
-            '<div class="card-name">' +
-              '<span class="status-dot ' + esc(a.state) + '"></span>' +
-              esc(a.projectName) +
-              '<span class="chev">\u25b8</span>' +
-            '</div>' +
-            '<div class="card-meta">' + esc(a.activity) + ' \u00b7 ' + esc(relTime(a.mtimeMs, now)) + '</div>' +
-          '</div>' +
-          '<div class="card-actions">' +
-            '<button class="action-btn" data-act="viewTranscript" title="View transcript">\u{1f4c4}</button>' +
-            '<button class="action-btn" data-act="openFolder" title="Open project folder">\u{1f4c1}</button>' +
-            stopBtn +
-            '<button class="action-btn danger" data-act="delete" title="Delete transcript">\u2715</button>' +
-          '</div>' +
+      return '<div class="sub-row' + doneCls + '" data-sid="' + esc(sub.sessionId) + '">' +
+        '<span class="status-dot ' + esc(sub.state) + '"></span>' +
+        '<span class="sub-name">' + esc(task) + '</span>' +
+        '<div class="card-slot">' +
+          '<span class="sub-time">' + relTimeShort(sub.mtimeMs, now) + '</span>' +
+          '<div class="sub-actions">' + renderActionBtns(stopBtn) + '</div>' +
         '</div>' +
-        renderDetails(a, now) +
       '</div>';
     }
 
-    function renderSection(state, title, list, now) {
-      const open = openSections[state];
-      const body = list.length === 0
-        ? '<div class="empty">No ' + title.toLowerCase() + ' agents</div>'
-        : list.map(a => renderCard(a, now)).join('');
-      return '<details class="group" data-state="' + state + '"' + (open ? ' open' : '') + '>' +
-        '<summary>' +
-          '<span class="group-title">' + title + '</span>' +
-          '<span class="group-count">' + list.length + '</span>' +
-        '</summary>' + body +
-      '</details>';
+    function renderCard(parent, now) {
+      const key = 'parent:' + parent.sessionId;
+      const allSubs = parent.subagents || [];
+      const activeSubs = allSubs.filter(s => s.state !== 'done');
+      const effState = parentEffectiveState(parent);
+      const subsOpen = openSections[key + ':subs'] !== undefined
+        ? openSections[key + ':subs']
+        : effState === 'running' && activeSubs.length > 0;
+
+      const d = parent.details || {};
+      const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
+      const nameCls = prompt ? '' : ' no-prompt';
+
+      const stopBtn = effState === 'running'
+        ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
+        : '';
+
+      const subSection = activeSubs.length > 0
+        ? '<div class="sub-toggle" data-sub-key="' + esc(key) + '">' +
+            '<span class="sub-caret">\u25b6</span>' +
+            '<span>' + activeSubs.length + ' subagent' + (activeSubs.length !== 1 ? 's' : '') + '</span>' +
+          '</div>' +
+          '<div class="sub-list">' +
+            activeSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
+          '</div>'
+        : '';
+
+      return '<div class="card' + (subsOpen ? ' subs-open' : '') + '" data-key="' + esc(key) + '" data-sid="' + esc(parent.sessionId) + '">' +
+        '<div class="card-top">' +
+          '<span class="status-dot ' + esc(effState) + '"></span>' +
+          '<span class="card-name' + nameCls + '">' + esc(prompt || '(no prompt yet)') + '</span>' +
+          '<div class="card-slot">' +
+            '<span class="card-time">' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
+            '<div class="card-actions">' + renderActionBtns(stopBtn) + '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="card-path"><span class="proj-path">\u200E' + esc(parent.cwd) + '</span><span class="session-id">' + esc(parent.sessionId) + '</span></div>' +
+        subSection +
+      '</div>';
     }
 
-    function render(agents, now) {
-      // Drop expanded-state entries for agents that no longer exist.
-      const live = new Set(agents.map(a => a.sessionId));
-      for (const sid of expanded) if (!live.has(sid)) expanded.delete(sid);
+    function renderArchive(doneParents, now) {
+      const open = openSections['archive'] || false;
+      const count = doneParents.length;
+      return '<hr class="archive-divider">' +
+        '<div class="archive-section' + (open ? ' open' : '') + '" data-key="archive">' +
+          '<div class="archive-row">' +
+            '<span class="arch-caret">\u25b6</span>' +
+            '<span class="archive-label">' + (open ? 'Hide archive' : 'Show archive') + '</span>' +
+            '<span class="archive-count">' + count + ' session' + (count !== 1 ? 's' : '') + '</span>' +
+          '</div>' +
+          '<div class="archive-body">' +
+            doneParents.map(p => renderCard(p, now)).join('') +
+          '</div>' +
+        '</div>';
+    }
 
-      if (agents.length === 0) {
+    function render(agents, now, ready) {
+      if (!ready) {
+        root.className = 'empty-global';
+        root.innerHTML = 'Scanning\u2026';
+        return;
+      }
+      if (!agents || agents.length === 0) {
         root.className = 'empty-global';
         root.innerHTML = 'No agents yet \u2014 run <code>claude</code> in any project';
         return;
       }
       root.className = '';
-      const running = agents.filter(a => a.state === 'running');
-      const idle = agents.filter(a => a.state === 'idle');
-      const done = agents.filter(a => a.state === 'done');
-      root.innerHTML =
-        renderSection('running', 'Running', running, now) +
-        renderSection('idle', 'Idle', idle, now) +
-        renderSection('done', 'Done', done, now);
-    }
 
-    // Track <details> open state so polling re-renders don't collapse the user's view.
-    root.addEventListener('toggle', (e) => {
-      const el = e.target;
-      if (el instanceof HTMLDetailsElement && el.classList.contains('group')) {
-        const state = el.dataset.state;
-        if (state) openSections[state] = el.open;
+      const parents = agents.filter(a => !a.parentSessionId);
+
+      const primary = [], archive = [];
+      for (const p of parents) {
+        const done = parentEffectiveState(p) === 'done' && !(p.subagents || []).some(s => s.state === 'running');
+        (done ? archive : primary).push(p);
       }
-    }, true);
+
+      primary.sort((a, b) => parentMaxMtime(b) - parentMaxMtime(a));
+      archive.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      root.innerHTML = primary.map(p => renderCard(p, now)).join('') + renderArchive(archive, now);
+    }
 
     root.addEventListener('click', (e) => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
+
+      // Action buttons — handled first so they don't fall through.
       const btn = target.closest('[data-act]');
       if (btn) {
-        const card = btn.closest('[data-sid]');
-        if (!card) return;
-        vscode.postMessage({ command: btn.getAttribute('data-act'), sessionId: card.getAttribute('data-sid') });
+        const sidEl = btn.closest('[data-sid]');
+        const sid = sidEl ? sidEl.getAttribute('data-sid') : null;
+        if (sid) vscode.postMessage({ command: btn.getAttribute('data-act'), sessionId: sid });
         return;
       }
-      const card = target.closest('.card[data-sid]');
-      if (!card) return;
-      // Clicks inside the already-expanded details pane shouldn't collapse it.
-      if (target.closest('.card-details')) return;
-      const sid = card.getAttribute('data-sid');
-      if (!sid) return;
-      if (expanded.has(sid)) {
-        expanded.delete(sid);
-        card.classList.remove('expanded');
-      } else {
-        expanded.add(sid);
-        card.classList.add('expanded');
+
+      // Archive toggle row.
+      const archiveRow = target.closest('.archive-row');
+      if (archiveRow) {
+        const section = archiveRow.closest('.archive-section');
+        if (!section) return;
+        const isOpen = section.classList.toggle('open');
+        openSections['archive'] = isOpen;
+        const lbl = archiveRow.querySelector('.archive-label');
+        if (lbl) lbl.textContent = isOpen ? 'Hide archive' : 'Show archive';
+        return;
+      }
+
+      // Sub-toggle: collapse/expand subagent list within a card.
+      const subToggle = target.closest('.sub-toggle');
+      if (subToggle) {
+        const card = subToggle.closest('.card');
+        if (!card) return;
+        const isOpen = card.classList.toggle('subs-open');
+        const key = card.dataset.key;
+        if (key) openSections[key + ':subs'] = isOpen;
+        return;
+      }
+
+      // Sub-row click opens preview.
+      const subRow = target.closest('.sub-row');
+      if (subRow) {
+        const sid = subRow.getAttribute('data-sid');
+        if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
+        return;
+      }
+
+      // Card-top click opens preview.
+      const cardTop = target.closest('.card-top');
+      if (cardTop) {
+        const card = cardTop.closest('.card');
+        const sid = card ? card.getAttribute('data-sid') : null;
+        if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
+        return;
       }
     });
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (msg && msg.command === 'render') render(msg.agents, msg.now);
+      if (msg && msg.command === 'render') render(msg.agents, msg.now, msg.ready);
     });
   </script>
 </body>

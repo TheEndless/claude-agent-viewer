@@ -2,7 +2,7 @@
   "name": "agent-viewer",
   "displayName": "Agent Viewer",
   "description": "View running and past Claude Code agents on this machine",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "agent-viewer",
   "license": "MIT",
   "repository": {
@@ -12,7 +12,9 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
+  "categories": [
+    "Other"
+  ],
   "activationEvents": [],
   "main": "./dist/extension.js",
   "contributes": {
@@ -55,15 +57,19 @@
     "vscode:prepublish": "npm run build",
     "build": "node esbuild.js --production",
     "watch": "node esbuild.js --watch",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "vitest run src/test"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
     "esbuild": "^0.24.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.4"
   },
   "dependencies": {
-    "chokidar": "^3.6.0"
+    "@types/markdown-it": "^14.1.2",
+    "chokidar": "^3.6.0",
+    "markdown-it": "^14.1.1"
   }
 }
