@@ -52,15 +52,6 @@ export interface TurnAttachment {
   data?: string;        // base64 for images; raw text for documents
 }
 
-export interface HookInfo {
-  hookType: string;        // e.g. "Stop", "PostToolUse"
-  command: string;
-  durationMs: number;
-  hasOutput: boolean;
-  preventedContinuation: boolean;
-  errors: string[];
-}
-
 export interface TurnEntry {
   kind: 'tool_use' | 'tool_result' | 'thinking' | 'system';
   label: string;        // e.g. "Bash - ls -la", "Result - Bash", "Thinking"
@@ -68,7 +59,6 @@ export interface TurnEntry {
   body: string;         // raw content - caller decides JSON vs markdown
   rawJson?: string;     // full content block JSON from the JSONL line
   result?: TurnEntry;   // paired tool_result (tool_use only)
-  hooks?: HookInfo[];   // stop_hook_summary data (tool_use only)
   isError?: boolean;    // tool_result is_error=true OR api_error/hook error system entries
 }
 
