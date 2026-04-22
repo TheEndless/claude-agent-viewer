@@ -108,7 +108,7 @@ export class AgentService {
       // Archives: process in batches to avoid exhausting file descriptors.
       const BATCH = 20;
       for (let i = 0; i < archiveFiles.length; i += BATCH) {
-        await Promise.all(archiveFiles.slice(i, i + BATCH).map(({ path: p, stat }) => this.processFile(p, stat, true)));
+        await Promise.all(archiveFiles.slice(i, i + BATCH).map(({ path: p, stat }) => this.processFile(p, stat)));
         this.scheduleEmit();
       }
     } catch (err) { logError('initialize', err); }
@@ -142,19 +142,14 @@ export class AgentService {
 
   /**
    * Parses (or re-parses) a single transcript file and upserts the resulting
-   * Agent into the in-memory map. In archive mode, skips the expensive full-file
-   * title scan since only tail events are needed for old sessions.
+   * Agent into the in-memory map. Title scan runs once per session and is cached.
    */
-  private async processFile(filePath: string, stats?: fs.Stats, archiveMode = false): Promise<void> {
+  private async processFile(filePath: string, stats?: fs.Stats): Promise<void> {
     try {
       const stat = stats ?? await fsp.stat(filePath);
       const sessionId = sessionIdFromPath(filePath);
       if (!this.titleCache.has(sessionId)) {
-        // Archive mode: skip full-file scan — tail is sufficient and archives are numerous.
-        const titles = archiveMode
-          ? { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null }
-          : await scanFullFileForTitles(filePath);
-        this.titleCache.set(sessionId, titles);
+        this.titleCache.set(sessionId, await scanFullFileForTitles(filePath));
       }
       const events = await this.tailEvents(filePath, stat.size);
       const cached = this.titleCache.get(sessionId)!;
