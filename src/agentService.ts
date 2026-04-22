@@ -44,6 +44,9 @@ export class AgentService {
   private watcher?: chokidar.FSWatcher;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
+  // Pending unlink timers keyed by file path. An 'add' event for the same path
+  // cancels the timer before it fires, handling atomic-write rename sequences.
+  private pendingDrops = new Map<string, NodeJS.Timeout>();
   private _ready = false;
   private _onDidChange = new vscode.EventEmitter<Agent[]>();
   readonly onDidChange = this._onDidChange.event;
@@ -127,9 +130,21 @@ export class AgentService {
       awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
     });
     this.watcher
-      .on('add',    (p, stats) => { void this.processFile(p, stats); })
+      .on('add',    (p, stats) => {
+        // Cancel any pending drop for this path (atomic-write rename sequence).
+        const t = this.pendingDrops.get(p);
+        if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
+        void this.processFile(p, stats);
+      })
       .on('change', (p, stats) => { void this.processFile(p, stats); })
-      .on('unlink', (p)        => this.dropFile(p))
+      .on('unlink', (p)        => {
+        // Defer removal to absorb atomic rename (unlink → add within ~500ms).
+        const t = setTimeout(() => {
+          this.pendingDrops.delete(p);
+          this.dropFile(p);
+        }, 500);
+        this.pendingDrops.set(p, t);
+      })
       .on('error',  (err)      => logError('watcher', err));
   }
 
@@ -251,6 +266,8 @@ export class AgentService {
   dispose(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    for (const t of this.pendingDrops.values()) clearTimeout(t);
+    this.pendingDrops.clear();
     this.watcher?.close();
     this._onDidChange.dispose();
     this._onDidDrop.dispose();
