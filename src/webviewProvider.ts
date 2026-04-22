@@ -221,6 +221,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .status-dot.running { background: #3fb950; box-shadow: 0 0 4px rgba(63,185,80,0.5); }
     .status-dot.idle    { background: #d29922; }
     .status-dot.done    { background: #6e7681; }
+    @keyframes sub-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .sub-active-dot {
+      display: inline-block; flex-shrink: 0;
+      width: 5px; height: 5px; border-radius: 50%;
+      background: #3fb950;
+      animation: sub-pulse 1.4s ease-in-out infinite;
+    }
 
     .card {
       background: var(--vscode-editor-background);
@@ -479,10 +486,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
         : '';
 
+      const activeSubs = allSubs.filter(s => s.state !== 'done');
       const subSection = shownSubs.length > 0
         ? '<div class="sub-toggle" data-sub-key="' + esc(key) + '">' +
             '<span class="sub-caret">\u25b6</span>' +
             '<span>' + shownSubs.length + ' subagent' + (shownSubs.length !== 1 ? 's' : '') + '</span>' +
+            (activeSubs.length > 0 ? '<span class="sub-active-dot" title="' + activeSubs.length + ' active"></span>' : '') +
           '</div>' +
           '<div class="sub-list">' +
             shownSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
