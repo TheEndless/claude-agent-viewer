@@ -39,12 +39,14 @@ describe('buildTreeForTesting', () => {
     expect(parent.subagents).toContain(child);
   });
 
-  it('orphan subagent (no matching parent) stays at top level with no parentSessionId', () => {
+  it('orphan subagent (no matching parent) still gets parentSessionId set from path', () => {
     const agents = new Map<string, Agent>();
     const child = makeAgent('/home/user/.claude/projects/myapp/abc123/subagents/def456.jsonl');
     agents.set('def456', child);
     buildTreeForTesting(agents);
-    expect(child.parentSessionId).toBeUndefined();
+    // parentSessionId is always derived from the path so orphans are excluded
+    // from the root list even before their parent file is processed.
+    expect(child.parentSessionId).toBe('abc123');
   });
 
   it('resets subagents arrays on each call', () => {

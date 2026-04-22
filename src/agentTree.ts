@@ -33,14 +33,13 @@ export function buildTree(agents: Map<string, Agent>): void {
 
     const beforeSubagents = normalised.slice(0, subagentsIdx);
     const parentSessionId = beforeSubagents.slice(beforeSubagents.lastIndexOf('/') + 1);
+    // Always set parentSessionId from path so orphan subagents are excluded from
+    // the root list even before their parent file has been processed.
+    agent.parentSessionId = parentSessionId;
     const parent = agents.get(parentSessionId);
-
     if (parent) {
-      agent.parentSessionId = parentSessionId;
       parent.subagents.push(agent);
     }
-    // Orphan: parent not found in map - leave parentSessionId undefined so the
-    // agent remains at the top level of the tree.
   }
 }
 
