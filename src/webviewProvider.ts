@@ -466,8 +466,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const key = 'parent:' + parent.sessionId;
       const allSubs = parent.subagents || [];
       const effState = parentEffectiveState(parent);
-      // Archived parents show all subagents (all done); live parents show only active ones.
-      const shownSubs = effState === 'done' ? allSubs : allSubs.filter(s => s.state !== 'done');
+      const shownSubs = allSubs;
       const subsOpen = openSections[key + ':subs'] !== undefined
         ? openSections[key + ':subs']
         : effState === 'running' && shownSubs.length > 0;
