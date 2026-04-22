@@ -221,12 +221,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .status-dot.running { background: #3fb950; box-shadow: 0 0 4px rgba(63,185,80,0.5); }
     .status-dot.idle    { background: #d29922; }
     .status-dot.done    { background: #6e7681; }
-    @keyframes sub-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
     .sub-active-dot {
       display: inline-block; flex-shrink: 0;
-      width: 5px; height: 5px; border-radius: 50%;
+      width: 4px; height: 4px; border-radius: 50%;
       background: #3fb950;
-      animation: sub-pulse 1.4s ease-in-out infinite;
     }
 
     .card {
