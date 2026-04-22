@@ -469,7 +469,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const shownSubs = allSubs;
       const subsOpen = openSections[key + ':subs'] !== undefined
         ? openSections[key + ':subs']
-        : effState === 'running' && allSubs.some(s => s.state !== 'done');
+        : false;
 
       const d = parent.details || {};
       const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
