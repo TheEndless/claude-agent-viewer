@@ -15,7 +15,7 @@ import * as fsp from 'fs/promises';
 import * as vscode from 'vscode';
 import chokidar from 'chokidar';
 import { Agent, AgentDetails, AgentState, RawEvent, ToolCallSummary } from './types';
-import { buildTree } from './agentTree';
+import { buildTree, parentSessionIdFromPath } from './agentTree';
 import { logError, logInfo } from './logger';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
@@ -67,26 +67,9 @@ export class AgentService {
   }
 
   private async initialize(): Promise<void> {
-    if (!fs.existsSync(PROJECTS_ROOT)) {
-      this._ready = true;
-      this._onDidChange.fire([]);
-      return;
-    }
-
-    // Recursive readdir to find all .jsonl files at any depth.
-    // Subagents live at PROJECTS_ROOT/<project>/<session>/subagents/<session>.jsonl
-    // so a two-level scan misses them. Stats run fully in parallel after.
     const now = Date.now();
     try {
-      const entries = await fsp.readdir(PROJECTS_ROOT, { recursive: true, withFileTypes: true });
-      const allFiles = entries
-        .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
-        .map(e => {
-          // Node 20+ uses `parentPath`; older versions used `path`. Support both.
-          const dirent = e as fs.Dirent & { parentPath?: string; path?: string };
-          const dir = dirent.parentPath ?? dirent.path ?? '';
-          return path.join(dir, e.name);
-        });
+      const allFiles = await findJsonlFiles(PROJECTS_ROOT);
       const STAT_BATCH = 50;
       const statResults: Array<{ path: string; stat: fs.Stats } | null> = [];
       for (let i = 0; i < allFiles.length; i += STAT_BATCH) {
@@ -154,16 +137,8 @@ export class AgentService {
    * when complete. Used by the sidebar refresh button.
    */
   async refresh(): Promise<void> {
-    if (!fs.existsSync(PROJECTS_ROOT)) return;
     try {
-      const entries = await fsp.readdir(PROJECTS_ROOT, { recursive: true, withFileTypes: true });
-      const allFiles = entries
-        .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
-        .map(e => {
-          const dirent = e as fs.Dirent & { parentPath?: string; path?: string };
-          const dir = dirent.parentPath ?? dirent.path ?? '';
-          return path.join(dir, e.name);
-        });
+      const allFiles = await findJsonlFiles(PROJECTS_ROOT);
       await Promise.all(allFiles.map(f => this.processFile(f)));
       this.scheduleEmit();
     } catch (err) { logError('refresh', err); }
@@ -279,6 +254,18 @@ export class AgentService {
  * cached title fields. Title cache values win over tail-derived values since
  * they came from the complete file.
  */
+/** Returns all .jsonl file paths under rootDir at any depth. Throws if rootDir is unreadable. */
+async function findJsonlFiles(rootDir: string): Promise<string[]> {
+  const entries = await fsp.readdir(rootDir, { recursive: true, withFileTypes: true });
+  return entries
+    .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
+    .map(e => {
+      // Node 20+ uses `parentPath`; older versions used `path`. Support both.
+      const dirent = e as fs.Dirent & { parentPath?: string; path?: string };
+      return path.join(dirent.parentPath ?? dirent.path ?? '', e.name);
+    });
+}
+
 function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], titles: TitleCache): Agent {
   const sessionId = sessionIdFromPath(filePath);
   const cwd = resolveCwd(filePath, events);
@@ -293,12 +280,8 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
   details.aiTitle = titles.aiTitle ?? details.aiTitle;
   details.lastPrompt = titles.lastPrompt ?? details.lastPrompt;
   details.latestUserPrompt = details.latestUserPrompt ?? titles.firstUserPrompt;
-  // Derive parentSessionId at construction time so the agent is never briefly
-  // visible at root between agents.set() and the next buildTree() call.
-  const normalised = filePath.replace(/\\/g, '/');
-  const subIdx = normalised.lastIndexOf('/subagents/');
-  const before = subIdx !== -1 ? normalised.slice(0, subIdx) : '';
-  const parentSessionId = subIdx !== -1 ? before.slice(before.lastIndexOf('/') + 1) : undefined;
+  // Set at construction time so the agent is never briefly at root before buildTree runs.
+  const parentSessionId = parentSessionIdFromPath(filePath);
   return { sessionId, transcriptPath: filePath, parentSessionId, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
 }
 

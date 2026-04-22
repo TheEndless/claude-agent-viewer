@@ -471,10 +471,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const key = 'parent:' + parent.sessionId;
       const allSubs = parent.subagents || [];
       const effState = parentEffectiveState(parent);
-      const shownSubs = allSubs;
-      const subsOpen = openSections[key + ':subs'] !== undefined
-        ? openSections[key + ':subs']
-        : false;
+      const subsOpen = openSections[key + ':subs'] || false;
 
       const d = parent.details || {};
       const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
@@ -485,14 +482,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         : '';
 
       const activeSubs = allSubs.filter(s => s.state !== 'done');
-      const subSection = shownSubs.length > 0
+      const subSection = allSubs.length > 0
         ? '<div class="sub-toggle" data-sub-key="' + esc(key) + '">' +
             '<span class="sub-caret">\u25b6</span>' +
-            '<span>' + shownSubs.length + ' subagent' + (shownSubs.length !== 1 ? 's' : '') + '</span>' +
+            '<span>' + allSubs.length + ' subagent' + (allSubs.length !== 1 ? 's' : '') + '</span>' +
             (activeSubs.length > 0 ? '<span class="sub-active-dot" title="' + activeSubs.length + ' active"></span>' : '') +
           '</div>' +
           '<div class="sub-list">' +
-            shownSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
+            allSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
           '</div>'
         : '';
 
