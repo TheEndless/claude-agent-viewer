@@ -62,9 +62,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     this.startAutoRefresh();
   }
 
-  /** Manually pushes the current agent list to the webview. Used by command palette refresh. */
+  /** Forces a re-scan of session files and re-renders the sidebar. */
   refresh(): void {
-    this.postAgents();
+    void this.agentService.refresh();
   }
 
   /** Serializes the agent tree and posts a `render` message to the webview. */

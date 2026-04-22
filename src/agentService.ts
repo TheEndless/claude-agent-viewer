@@ -133,6 +133,27 @@ export class AgentService {
       .on('error',  (err)      => logError('watcher', err));
   }
 
+  /**
+   * Scans the projects directory for any new session files not yet tracked,
+   * then re-processes all known files to pick up any changes. Fires onDidChange
+   * when complete. Used by the sidebar refresh button.
+   */
+  async refresh(): Promise<void> {
+    if (!fs.existsSync(PROJECTS_ROOT)) return;
+    try {
+      const entries = await fsp.readdir(PROJECTS_ROOT, { recursive: true, withFileTypes: true });
+      const allFiles = entries
+        .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
+        .map(e => {
+          const dirent = e as fs.Dirent & { parentPath?: string; path?: string };
+          const dir = dirent.parentPath ?? dirent.path ?? '';
+          return path.join(dir, e.name);
+        });
+      await Promise.all(allFiles.map(f => this.processFile(f)));
+      this.scheduleEmit();
+    } catch (err) { logError('refresh', err); }
+  }
+
   /** Returns all known agents sorted by most-recently-modified first. */
   getAgents(): Agent[] {
     return Array.from(this.agents.values()).sort(
