@@ -293,7 +293,13 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
   details.aiTitle = titles.aiTitle ?? details.aiTitle;
   details.lastPrompt = titles.lastPrompt ?? details.lastPrompt;
   details.latestUserPrompt = details.latestUserPrompt ?? titles.firstUserPrompt;
-  return { sessionId, transcriptPath: filePath, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
+  // Derive parentSessionId at construction time so the agent is never briefly
+  // visible at root between agents.set() and the next buildTree() call.
+  const normalised = filePath.replace(/\\/g, '/');
+  const subIdx = normalised.lastIndexOf('/subagents/');
+  const before = subIdx !== -1 ? normalised.slice(0, subIdx) : '';
+  const parentSessionId = subIdx !== -1 ? before.slice(before.lastIndexOf('/') + 1) : undefined;
+  return { sessionId, transcriptPath: filePath, parentSessionId, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
 }
 
 /**
