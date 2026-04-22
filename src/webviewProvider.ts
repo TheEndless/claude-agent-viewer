@@ -272,8 +272,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: none;
       align-items: center;
       gap: 2px;
-      position: absolute;
-      right: 8px;
     }
 
     .card-path {
@@ -356,8 +354,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       display: none;
       align-items: center;
       gap: 2px;
-      position: absolute;
-      right: 8px;
     }
 
     .action-btn {
@@ -398,8 +394,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .archive-label { flex: 1; }
     .archive-count { color: var(--vscode-disabledForeground); flex-shrink: 0; }
 
-    .archive-body { display: none; opacity: 0.65; }
+    .archive-body { display: none; opacity: 0.8; }
     .archive-section.open > .archive-body { display: block; }
+    /* done-sub dimming is for live parents' finished subs; inside archive, the archive-body opacity already handles it. */
+    .archive-body .sub-row.done-sub { opacity: 1; }
   </style>
 </head>
 <body>
@@ -467,11 +465,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     function renderCard(parent, now) {
       const key = 'parent:' + parent.sessionId;
       const allSubs = parent.subagents || [];
-      const activeSubs = allSubs.filter(s => s.state !== 'done');
       const effState = parentEffectiveState(parent);
+      // Archived parents show all subagents (all done); live parents show only active ones.
+      const shownSubs = effState === 'done' ? allSubs : allSubs.filter(s => s.state !== 'done');
       const subsOpen = openSections[key + ':subs'] !== undefined
         ? openSections[key + ':subs']
-        : effState === 'running' && activeSubs.length > 0;
+        : effState === 'running' && shownSubs.length > 0;
 
       const d = parent.details || {};
       const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
@@ -481,13 +480,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
         : '';
 
-      const subSection = activeSubs.length > 0
+      const subSection = shownSubs.length > 0
         ? '<div class="sub-toggle" data-sub-key="' + esc(key) + '">' +
             '<span class="sub-caret">\u25b6</span>' +
-            '<span>' + activeSubs.length + ' subagent' + (activeSubs.length !== 1 ? 's' : '') + '</span>' +
+            '<span>' + shownSubs.length + ' subagent' + (shownSubs.length !== 1 ? 's' : '') + '</span>' +
           '</div>' +
           '<div class="sub-list">' +
-            activeSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
+            shownSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
           '</div>'
         : '';
 
