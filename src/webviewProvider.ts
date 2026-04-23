@@ -104,6 +104,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       case 'previewTranscript':
         openTranscriptPreview(agent);
         return;
+      case 'openJsonl':
+        await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(agent.transcriptPath));
+        return;
       case 'openFolder':
         await this.openFolder(agent);
         return;
@@ -121,12 +124,17 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     await vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: true });
   }
 
+  private agentDisplayName(agent: Agent): string {
+    const d = agent.details;
+    return d?.customTitle || d?.aiTitle || d?.latestUserPrompt || agent.projectName;
+  }
+
   /** Finds the Claude process(es) for the agent's cwd and prompts the user before sending SIGTERM. */
   private async stopAgent(agent: Agent): Promise<void> {
     const matches = await findAgentPids(agent.cwd);
     if (matches.length === 0) {
       vscode.window.showWarningMessage(
-        `No running Claude process found for ${agent.projectName}.`,
+        `No running Claude process found for ${this.agentDisplayName(agent)}.`,
       );
       return;
     }
@@ -142,7 +150,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       pid = pick.pid;
     }
     const answer = await vscode.window.showWarningMessage(
-      `Stop Claude process for "${agent.projectName}" (pid ${pid})?`,
+      `Stop Claude process for "${this.agentDisplayName(agent)}" (pid ${pid})?`,
       { modal: true },
       'Stop',
     );
@@ -158,7 +166,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   /** Prompts for confirmation then deletes the transcript file and evicts the agent from all caches. */
   private async deleteAgent(agent: Agent): Promise<void> {
     const answer = await vscode.window.showWarningMessage(
-      `Delete transcript for "${agent.projectName}"?`,
+      `Delete transcript for "${this.agentDisplayName(agent)}"?`,
       { modal: true },
       'Delete',
     );
@@ -445,7 +453,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function renderActionBtns(stopBtn) {
-      return '<button class="action-btn" data-act="previewTranscript" title="Preview">\ud83d\udcac</button>' +
+      return '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">\ud83d\udcac</button>' +
+        '<button class="action-btn" data-act="openJsonl" title="Open raw JSONL">\ud83d\udcc4</button>' +
         '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
         stopBtn +
         '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>';
