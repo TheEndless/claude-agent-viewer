@@ -199,11 +199,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   /** Returns the full HTML for the sidebar webview, including all CSS and JS for the agent card UI. */
   private getHtml(): string {
+    const nonce = [...Array(32)].map(() => Math.random().toString(36)[2]).join('');
     return /*html*/ `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -488,7 +490,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   <div class="filter-bar"><input class="filter-input" id="filter-input" placeholder="Filter agents…" /></div>
   <div id="root" class="empty-global">Loading agents…</div>
 
-  <script>
+  <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
     const filterInput = document.getElementById('filter-input');
