@@ -2,7 +2,7 @@ export type AgentState = 'running' | 'idle' | 'done';
 
 export interface ToolCallSummary {
   summary: string;
-  at: number;
+  at: number; // Unix ms timestamp; 0 when unknown
 }
 
 export interface AgentDetails {
@@ -21,14 +21,17 @@ export interface Agent {
   cwd: string;
   projectName: string;
   state: AgentState;
-  activity: string;
+  activityHistory: ToolCallSummary[]; // last ≤3 meaningful events, newest first
+  model: string;        // short model name, e.g. "sonnet-4-6"; empty string if unknown
+  turnCount: number;    // assistant turns seen in the tail (approximation for long sessions)
+  contextPct: number;   // input_tokens / 200000 * 100; 0 if unknown
   mtimeMs: number;
   pid?: number;
   details: AgentDetails;
-  parentSessionId?: string;  // set if this agent is a subagent
-  subagents: Agent[];        // populated by tree-building pass; always initialized to []
-  taskDescription?: string;  // set during tree-build; shown in sidebar as subagent label
-  agentCallDescs?: string[]; // descriptions from this agent's own Agent tool_use calls; NOT serialized to webview
+  parentSessionId?: string;
+  subagents: Agent[];
+  taskDescription?: string;
+  agentCallDescs?: string[];
 }
 
 export interface RawEvent {
@@ -39,6 +42,12 @@ export interface RawEvent {
   message?: {
     role?: string;
     content?: unknown;
+    model?: string;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+    };
   };
   [key: string]: unknown;
 }
@@ -48,27 +57,27 @@ export interface RawEvent {
 export interface TurnAttachment {
   type: 'image' | 'document';
   name?: string;
-  mediaType?: string;   // image only - e.g. "image/png"
-  data?: string;        // base64 for images; raw text for documents
+  mediaType?: string;
+  data?: string;
 }
 
 export interface TurnEntry {
   kind: 'tool_use' | 'tool_result' | 'thinking' | 'system';
-  label: string;        // e.g. "Bash - ls -la", "Result - Bash", "Thinking"
-  timestamp: string;    // ISO 8601
-  body: string;         // raw content - caller decides JSON vs markdown
-  rawJson?: string;     // full content block JSON from the JSONL line
-  result?: TurnEntry;   // paired tool_result (tool_use only)
-  isError?: boolean;    // tool_result is_error=true OR api_error/hook error system entries
+  label: string;
+  timestamp: string;
+  body: string;
+  rawJson?: string;
+  result?: TurnEntry;
+  isError?: boolean;
 }
 
 export interface Turn {
   role: 'user' | 'assistant';
-  timestamp: string;    // ISO 8601 - from first event in the turn
-  text?: string;        // markdown bubble text
+  timestamp: string;
+  text?: string;
   attachments: TurnAttachment[];
-  entries: TurnEntry[]; // tool/thinking/system entries; empty on user turns
-  model?: string;       // from message.model (assistant turns only)
-  index?: number;       // 1-based assistant turn counter
-  rawJson?: string;     // the raw JSONL line that originated this turn
+  entries: TurnEntry[];
+  model?: string;
+  index?: number;
+  rawJson?: string;
 }
