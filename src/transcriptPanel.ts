@@ -66,6 +66,11 @@ export function openTranscriptPreview(agent: Agent): void {
   });
   // Show shell immediately — content loads once webview signals ready.
   panel.webview.html = buildWebviewHtml(agent.projectName);
+  panel.webview.onDidReceiveMessage(async (msg) => {
+    if (msg.command === 'exportMarkdown') {
+      await handleExportMarkdown(agent, panel);
+    }
+  });
   renderedCount.delete(agent.sessionId);
   // Declare sub as let so the fallbackTimer closure can reference it after assignment.
   // If the webview crashes or never fires 'ready', send turns anyway after 10s
@@ -192,6 +197,47 @@ async function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: n
   for (let i = chunks.length - 1; i >= 0; i--) {
     postUpdate(webview, chunks[i], 'prepend');
     await yld();
+  }
+}
+
+/** Formats the agent's transcript as markdown and prompts the user to save it. */
+async function handleExportMarkdown(agent: Agent, panel: vscode.WebviewPanel): Promise<void> {
+  try {
+    const { turns } = await getTurns(agent);
+    const d = agent.details;
+    const title = d.customTitle || d.aiTitle || d.latestUserPrompt || agent.sessionId.slice(0, 8);
+    const lines: string[] = [`# ${title}`, '', `**Session:** \`${agent.sessionId}\``, `**Project:** ${agent.cwd}`, ''];
+
+    for (const turn of turns) {
+      const ts = turn.timestamp ? ` *(${new Date(turn.timestamp).toLocaleString()})* ` : '';
+      if (turn.role === 'user') {
+        lines.push(`## User${ts}`, '');
+        if (turn.text) lines.push(turn.text, '');
+      } else {
+        lines.push(`## Agent${ts}`, '');
+        if (turn.text) lines.push(turn.text, '');
+        for (const entry of turn.entries) {
+          if (entry.kind === 'tool_use') {
+            lines.push(`### ${entry.label}`, '', '```', entry.body, '```', '');
+            if (entry.result) {
+              lines.push(`**Result:**`, '', '```', entry.result.body.slice(0, 2000), '```', '');
+            }
+          }
+        }
+      }
+    }
+
+    const saveUri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(`${agent.projectName}-transcript.md`),
+      filters: { Markdown: ['md'] },
+      title: 'Export transcript as Markdown',
+    });
+    if (!saveUri) return;
+    await fsp.writeFile(saveUri.fsPath, lines.join('\n'), 'utf-8');
+    vscode.window.showInformationMessage(`Transcript exported to ${saveUri.fsPath}`);
+  } catch (err) {
+    logError('exportMarkdown', err);
+    vscode.window.showErrorMessage(`Export failed: ${(err as Error).message}`);
   }
 }
 
@@ -967,6 +1013,9 @@ ${turnsHtml}
   });
 
   const vscode = acquireVsCodeApi();
+  document.getElementById('tb-export-btn')?.addEventListener('click', () => {
+    vscode.postMessage({ command: 'exportMarkdown' });
+  });
   vscode.postMessage({ command: 'ready' });
 </script>
 </body>
