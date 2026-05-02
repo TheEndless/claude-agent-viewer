@@ -789,13 +789,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         const doneAgents   = sortedAgents.filter(a => parentEffectiveState(a) === 'done');
         const endedOpen    = openSections['ended:'+group.key] || false;
 
+        // Remove stale cards
         for (const [sid, el] of cardEls) {
           if (body.contains(el) && !group.agents.find(a=>a.sessionId===sid)) {
             el.remove(); cardEls.delete(sid);
           }
         }
 
-        for (const agent of activeAgents) {
+        // Update or create all cards without touching DOM order yet
+        for (const agent of sortedAgents) {
           let cardEl = cardEls.get(agent.sessionId);
           if (!cardEl) {
             const tmp = document.createElement('div');
@@ -805,16 +807,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           } else {
             patchCard(cardEl, agent, now);
           }
-          cardEl.style.display = '';
-          body.appendChild(cardEl);
         }
 
+        // Update or create ended toggle
         let endedToggle = body.querySelector('.ended-toggle');
         if (doneAgents.length > 0) {
           if (!endedToggle) {
             endedToggle = document.createElement('div');
             endedToggle.className = 'ended-toggle';
-            body.appendChild(endedToggle);
           }
           endedToggle.innerHTML = '<span class="sub-caret">'+(endedOpen?'▼':'▶')+'</span> '+doneAgents.length+' ended';
           endedToggle.dataset.endedKey = group.key;
@@ -822,16 +822,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           if (endedToggle) { endedToggle.remove(); endedToggle = null; }
         }
 
+        // Set DOM order: active cards → toggle → done cards
+        for (const agent of activeAgents) {
+          const cardEl = cardEls.get(agent.sessionId);
+          cardEl.style.display = '';
+          body.appendChild(cardEl);
+        }
+        if (endedToggle) body.appendChild(endedToggle);
         for (const agent of doneAgents) {
-          let cardEl = cardEls.get(agent.sessionId);
-          if (!cardEl) {
-            const tmp = document.createElement('div');
-            tmp.innerHTML = renderCard(agent, now);
-            cardEl = tmp.firstElementChild;
-            cardEls.set(agent.sessionId, cardEl);
-          } else {
-            patchCard(cardEl, agent, now);
-          }
+          const cardEl = cardEls.get(agent.sessionId);
           cardEl.style.display = endedOpen ? '' : 'none';
           body.appendChild(cardEl);
         }
