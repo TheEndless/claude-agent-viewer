@@ -414,159 +414,433 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .archive-section.open > .archive-body { display: block; }
     /* done-sub dimming is for live parents' finished subs; inside archive, the archive-body opacity already handles it. */
     .archive-body .sub-row.done-sub { opacity: 1; }
+
+    /* ── project groups ── */
+    .proj-group { margin-top: 4px; }
+    .proj-header {
+      display: flex; align-items: center; gap: 6px;
+      height: 24px; padding: 0 8px;
+      cursor: pointer; user-select: none;
+      border-radius: 3px;
+    }
+    .proj-header:hover { background: rgba(128,128,128,0.05); }
+    .proj-caret { font-size: 9px; opacity: 0.5; transition: transform 0.1s; flex-shrink: 0; }
+    .proj-group.open .proj-caret { transform: rotate(90deg); }
+    .proj-name { flex: 1; font-size: 11px; font-weight: 600; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .proj-badge {
+      font-size: 9px; padding: 1px 5px; border-radius: 3px; flex-shrink: 0;
+    }
+    .proj-badge.running { background: rgba(63,185,80,.12); border: 1px solid rgba(63,185,80,.2); color: #3fb950; }
+    .proj-badge.idle    { background: rgba(210,153,34,.1);  border: 1px solid rgba(210,153,34,.2); color: #d29922; }
+    .proj-badge.done    { background: rgba(110,118,129,.1); border: 1px solid rgba(110,118,129,.2); color: #6e7681; }
+    .proj-body { display: none; }
+    .proj-group.open .proj-body { display: block; }
+    .proj-group.inactive { opacity: 0.75; }
+
+    /* ── filter bar ── */
+    .filter-bar { padding: 5px 8px 4px; }
+    .filter-input {
+      width: 100%; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border);
+      color: var(--vscode-input-foreground); border-radius: 4px; padding: 3px 8px;
+      font-size: 11px; font-family: var(--vscode-font-family); outline: none;
+    }
+    .filter-input:focus { border-color: var(--vscode-focusBorder); }
+
+    /* ── activity timeline ── */
+    .activity-timeline { padding: 0 8px 6px 20px; display: flex; flex-direction: column; gap: 3px; }
+    .act-row { display: flex; align-items: center; gap: 5px; font-size: 11px; }
+    .act-pip { width: 3px; height: 3px; border-radius: 50%; flex-shrink: 0; }
+    .act-row.act-current .act-pip   { background: var(--vscode-textLink-foreground, #4fc1ff); }
+    .act-row.act-current .act-label { color: var(--vscode-textLink-foreground, #4fc1ff); }
+    .act-row.act-prev1 { opacity: 0.55; }
+    .act-row.act-prev2 { opacity: 0.32; }
+    .act-row .act-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--vscode-descriptionForeground); }
+    .act-row .act-time  { font-size: 10px; color: var(--vscode-disabledForeground); flex-shrink: 0; }
+    .stuck-badge {
+      margin: 0 8px 6px; padding: 2px 7px; border-radius: 3px; font-size: 10px;
+    }
+    .stuck-loop { background: rgba(120,53,15,.4); border: 1px solid rgba(120,53,15,.6); color: #fb923c; }
+    .stuck-stall { background: rgba(55,48,163,.3); border: 1px solid rgba(55,48,163,.5); color: #a5b4fc; }
+
+    /* ── meta-bar ── */
+    .meta-bar { display: flex; align-items: center; gap: 6px; padding: 0 8px 5px 20px; font-size: 10px; color: var(--vscode-disabledForeground); }
+    .model-chip {
+      display: inline-flex; align-items: center;
+      background: rgba(79,193,255,.08); border: 1px solid rgba(79,193,255,.15);
+      border-radius: 3px; padding: 0 5px; height: 14px; font-size: 9px;
+      color: var(--vscode-textLink-foreground, #4fc1ff); white-space: nowrap; flex-shrink: 0;
+    }
+    .meta-sep { color: var(--vscode-input-border); flex-shrink: 0; }
+    .ctx-wrap { display: flex; align-items: center; gap: 4px; }
+    .ctx-bar-bg { width: 40px; height: 3px; border-radius: 2px; background: rgba(128,128,128,.2); overflow: hidden; }
+    .ctx-bar-fill { height: 100%; border-radius: 2px; background: var(--vscode-textLink-foreground, #4fc1ff); opacity: .65; transition: width 0.3s; }
+    .ctx-pct { font-size: 9px; }
+
+    /* ── subagent state dots ── */
+    .sub-state-dots { display: flex; gap: 3px; margin-left: 3px; }
+    .ssd { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; }
+    .ssd.running { background: #3fb950; box-shadow: 0 0 3px rgba(63,185,80,.5); }
+    .ssd.idle    { background: #d29922; }
+    .ssd.done    { background: #6e7681; }
   </style>
 </head>
 <body>
+  <div class="filter-bar"><input class="filter-input" id="filter-input" placeholder="Filter agents…" /></div>
   <div id="root" class="empty-global">Loading agents…</div>
 
   <script>
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
+    const filterInput = document.getElementById('filter-input');
 
-    // Preserved expand state: keys are 'parent:<sessionId>' and 'archive'.
     const openSections = {};
+    const projGroupEls = new Map();
+    const cardEls = new Map();
 
     function esc(s) {
-      return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
 
     function relTimeShort(ms, now) {
+      if (!ms) return '';
       const d = now - ms;
       if (d < 10000) return 'now';
-      if (d < 60000) return Math.floor(d / 1000) + 's';
-      if (d < 3600000) return Math.floor(d / 60000) + 'm';
-      if (d < 86400000) return Math.floor(d / 3600000) + 'h';
-      return Math.floor(d / 86400000) + 'd';
+      if (d < 60000) return Math.floor(d/1000)+'s';
+      if (d < 3600000) return Math.floor(d/60000)+'m';
+      if (d < 86400000) return Math.floor(d/3600000)+'h';
+      return Math.floor(d/86400000)+'d';
     }
 
     function parentEffectiveState(p) {
-      const subs = p.subagents || [];
-      if (p.state === 'running' || subs.some(s => s.state === 'running')) return 'running';
-      if (p.state === 'idle'    || subs.some(s => s.state === 'idle'))    return 'idle';
+      const subs = p.subagents||[];
+      if (p.state==='running'||subs.some(s=>s.state==='running')) return 'running';
+      if (p.state==='idle'   ||subs.some(s=>s.state==='idle'))    return 'idle';
       return 'done';
     }
 
     function parentMaxMtime(p) {
-      const subs = p.subagents || [];
-      return subs.reduce((m, s) => Math.max(m, s.mtimeMs), p.mtimeMs);
+      return (p.subagents||[]).reduce((m,s)=>Math.max(m,s.mtimeMs),p.mtimeMs);
+    }
+
+    function projectKey(cwd) {
+      const parts = cwd.replace(/\\/g,'/').split('/').filter(Boolean);
+      return parts.slice(-2).join('/') || cwd;
+    }
+
+    function projectLabel(cwd) {
+      const parts = cwd.replace(/\\/g,'/').split('/').filter(Boolean);
+      if (parts.length >= 2) return parts.slice(-2).join(' / ');
+      return parts[parts.length-1] || cwd;
+    }
+
+    function groupByProject(parents) {
+      const map = new Map();
+      for (const p of parents) {
+        const key = projectKey(p.cwd);
+        if (!map.has(key)) map.set(key, { key, label: projectLabel(p.cwd), agents: [] });
+        map.get(key).agents.push(p);
+      }
+      return map;
+    }
+
+    function groupBadge(agents) {
+      const running = agents.filter(a => parentEffectiveState(a)==='running').length;
+      const idle    = agents.filter(a => parentEffectiveState(a)==='idle').length;
+      if (running) return { cls:'running', text: running+' running' };
+      if (idle)    return { cls:'idle',    text: idle+' idle' };
+      return { cls:'done', text: agents.length+' done' };
+    }
+
+    function rollupSubagentDots(subagents) {
+      const counts = { running:0, idle:0, done:0 };
+      for (const s of subagents) counts[s.state]=(counts[s.state]||0)+1;
+      let html = '';
+      if (counts.running) html += '<span class="ssd running" title="'+counts.running+' running"></span>';
+      if (counts.idle)    html += '<span class="ssd idle"    title="'+counts.idle+' idle"></span>';
+      if (counts.done)    html += '<span class="ssd done"    title="'+counts.done+' done"></span>';
+      return html ? '<div class="sub-state-dots">'+html+'</div>' : '';
+    }
+
+    const RECENCY_WINDOW_MS = 2 * 60 * 1000;
+    const STALL_MS = 8 * 60 * 1000;
+
+    function renderTimeline(activityHistory, now) {
+      if (!activityHistory || activityHistory.length === 0) return '';
+      const current = activityHistory[0];
+      let html = '<div class="activity-timeline">';
+      html += '<div class="act-row act-current"><span class="act-pip"></span>'
+           + '<span class="act-label">'+esc(current.summary)+'</span>'
+           + '<span class="act-time">'+relTimeShort(current.at, now)+'</span></div>';
+      const classes = ['act-prev1','act-prev2'];
+      for (let i = 1; i < activityHistory.length && i < 3; i++) {
+        const entry = activityHistory[i];
+        if (current.at && entry.at && (current.at - entry.at) > RECENCY_WINDOW_MS) break;
+        html += '<div class="act-row '+classes[i-1]+'">'
+             + '<span class="act-pip"></span>'
+             + '<span class="act-label">'+esc(entry.summary)+'</span>'
+             + '<span class="act-time">'+relTimeShort(entry.at, now)+'</span></div>';
+      }
+      html += '</div>';
+      return html;
+    }
+
+    function renderStuckBadge(activityHistory, state, now) {
+      if (state !== 'running' || !activityHistory || activityHistory.length === 0) return '';
+      const current = activityHistory[0];
+      if (activityHistory.length >= 3 &&
+          activityHistory[0].summary === activityHistory[1].summary &&
+          activityHistory[1].summary === activityHistory[2].summary) {
+        return '<div class="stuck-badge stuck-loop">⧓ Possibly looping — same command 3\xd7</div>';
+      }
+      if (current.at && (now - current.at) > STALL_MS) {
+        const mins = Math.floor((now - current.at) / 60000);
+        return '<div class="stuck-badge stuck-stall">⏱ No new activity for '+mins+' min</div>';
+      }
+      return '';
+    }
+
+    function renderMetaBar(agent) {
+      if (!agent.model && !agent.turnCount && !agent.contextPct) return '';
+      let html = '<div class="meta-bar">';
+      if (agent.model) html += '<span class="model-chip">⚡ '+esc(agent.model)+'</span>';
+      if (agent.model && agent.turnCount) html += '<span class="meta-sep">\xb7</span>';
+      if (agent.turnCount) html += '<span>'+agent.turnCount+' turn'+(agent.turnCount!==1?'s':'')+'</span>';
+      if (agent.contextPct) {
+        if (agent.model || agent.turnCount) html += '<span class="meta-sep">\xb7</span>';
+        html += '<div class="ctx-wrap"><div class="ctx-bar-bg"><div class="ctx-bar-fill" style="width:'+agent.contextPct+'%"></div></div>'
+             + '<span class="ctx-pct">'+agent.contextPct+'%</span></div>';
+      }
+      html += '</div>';
+      return html;
     }
 
     function renderActionBtns(stopBtn) {
-      return '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">\ud83d\udcac</button>' +
-        '<button class="action-btn" data-act="openJsonl" title="Open raw JSONL">\ud83d\udcc4</button>' +
-        '<button class="action-btn" data-act="openFolder" title="Open folder">\ud83d\udcc1</button>' +
-        stopBtn +
-        '<button class="action-btn danger" data-act="delete" title="Delete">\u2715</button>';
+      return '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">💬</button>'
+           + '<button class="action-btn" data-act="openJsonl" title="Open raw JSONL">📄</button>'
+           + '<button class="action-btn" data-act="openFolder" title="Open folder">📁</button>'
+           + stopBtn
+           + '<button class="action-btn danger" data-act="delete" title="Delete">✕</button>';
     }
 
     function renderSubRow(sub, now) {
-      const task = sub.taskDescription || (sub.details && sub.details.latestUserPrompt) || sub.sessionId.slice(0, 8);
-      const doneCls = sub.state === 'done' ? ' done-sub' : '';
-      const stopBtn = sub.state === 'running'
-        ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
-        : '';
-      return '<div class="sub-row' + doneCls + '" data-sid="' + esc(sub.sessionId) + '">' +
-        '<span class="status-dot ' + esc(sub.state) + '"></span>' +
-        '<span class="sub-name">' + esc(task) + '</span>' +
-        '<div class="card-slot">' +
-          '<span class="sub-time">' + relTimeShort(sub.mtimeMs, now) + '</span>' +
-          '<div class="sub-actions">' + renderActionBtns(stopBtn) + '</div>' +
-        '</div>' +
-      '</div>';
+      const task = sub.taskDescription||(sub.details&&sub.details.latestUserPrompt)||sub.sessionId.slice(0,8);
+      const doneCls = sub.state==='done' ? ' done-sub' : '';
+      const stopBtn = sub.state==='running'
+        ? '<button class="action-btn danger" data-act="stop" title="Stop">■</button>' : '';
+      return '<div class="sub-row'+doneCls+'" data-sid="'+esc(sub.sessionId)+'">'
+           + '<span class="status-dot '+esc(sub.state)+'"></span>'
+           + '<span class="sub-name">'+esc(task)+'</span>'
+           + '<div class="card-slot">'
+           +   '<span class="sub-time">'+relTimeShort(sub.mtimeMs,now)+'</span>'
+           +   '<div class="sub-actions">'+renderActionBtns(stopBtn)+'</div>'
+           + '</div></div>';
     }
 
     function renderCard(parent, now) {
-      const key = 'parent:' + parent.sessionId;
-      const allSubs = parent.subagents || [];
+      const key = 'proj:'+projectKey(parent.cwd)+':subs:'+parent.sessionId;
+      const allSubs = parent.subagents||[];
       const effState = parentEffectiveState(parent);
-      const subsOpen = openSections[key + ':subs'] || false;
+      const subsOpen = openSections[key]||false;
 
-      const d = parent.details || {};
-      const prompt = d.customTitle || d.aiTitle || d.latestUserPrompt || d.lastPrompt || null;
+      const d = parent.details||{};
+      const prompt = d.customTitle||d.aiTitle||d.latestUserPrompt||d.lastPrompt||null;
       const nameCls = prompt ? '' : ' no-prompt';
 
-      const stopBtn = effState === 'running'
-        ? '<button class="action-btn danger" data-act="stop" title="Stop">\u25a0</button>'
-        : '';
+      const stopBtn = effState==='running'
+        ? '<button class="action-btn danger" data-act="stop" title="Stop">■</button>' : '';
 
-      const activeSubs = allSubs.filter(s => s.state !== 'done');
       const subSection = allSubs.length > 0
-        ? '<div class="sub-toggle" data-sub-key="' + esc(key) + '">' +
-            '<span class="sub-caret">\u25b6</span>' +
-            '<span>' + allSubs.length + ' subagent' + (allSubs.length !== 1 ? 's' : '') + '</span>' +
-            (activeSubs.length > 0 ? '<span class="sub-active-dot" title="' + activeSubs.length + ' active"></span>' : '') +
-          '</div>' +
-          '<div class="sub-list">' +
-            allSubs.slice().sort((a, b) => b.mtimeMs - a.mtimeMs).map(s => renderSubRow(s, now)).join('') +
-          '</div>'
+        ? '<div class="sub-toggle" data-sub-key="'+esc(key)+'">'
+          + '<span class="sub-caret">▶</span>'
+          + '<span>'+allSubs.length+' subagent'+(allSubs.length!==1?'s':'')+'</span>'
+          + rollupSubagentDots(allSubs)
+          + '</div>'
+          + '<div class="sub-list">'
+          + allSubs.slice().sort((a,b)=>b.mtimeMs-a.mtimeMs).map(s=>renderSubRow(s,now)).join('')
+          + '</div>'
         : '';
 
-      return '<div class="card' + (subsOpen ? ' subs-open' : '') + '" data-key="' + esc(key) + '" data-sid="' + esc(parent.sessionId) + '">' +
-        '<div class="card-top">' +
-          '<span class="status-dot ' + esc(effState) + '"></span>' +
-          '<span class="card-name' + nameCls + '">' + esc(prompt || '(no prompt yet)') + '</span>' +
-          '<div class="card-slot">' +
-            '<span class="card-time">' + relTimeShort(parentMaxMtime(parent), now) + '</span>' +
-            '<div class="card-actions">' + renderActionBtns(stopBtn) + '</div>' +
-          '</div>' +
-        '</div>' +
-        '<div class="card-path"><span class="proj-path">\u200E' + esc(parent.cwd) + '</span><span class="session-id">' + esc(parent.sessionId) + '</span></div>' +
-        subSection +
-      '</div>';
+      return '<div class="card'+(subsOpen?' subs-open':'')+'" data-key="'+esc(key)+'" data-sid="'+esc(parent.sessionId)+'">'
+           + '<div class="card-top">'
+           +   '<span class="status-dot '+esc(effState)+'" style="transition:background 0.3s"></span>'
+           +   '<span class="card-name'+nameCls+'">'+esc(prompt||'(no prompt yet)')+'</span>'
+           +   '<div class="card-slot">'
+           +     '<span class="card-time">'+relTimeShort(parentMaxMtime(parent),now)+'</span>'
+           +     '<div class="card-actions">'+renderActionBtns(stopBtn)+'</div>'
+           +   '</div>'
+           + '</div>'
+           + '<div class="card-path"><span class="proj-path">‎'+esc(parent.cwd)+'</span><span class="session-id">'+esc(parent.sessionId)+'</span></div>'
+           + renderMetaBar(parent)
+           + renderTimeline(parent.activityHistory, now)
+           + renderStuckBadge(parent.activityHistory, effState, now)
+           + subSection
+           + '</div>';
     }
 
-    function renderArchive(doneParents, now) {
-      const open = openSections['archive'] || false;
-      const count = doneParents.length;
-      return '<hr class="archive-divider">' +
-        '<div class="archive-section' + (open ? ' open' : '') + '" data-key="archive">' +
-          '<div class="archive-row">' +
-            '<span class="arch-caret">\u25b6</span>' +
-            '<span class="archive-label">' + (open ? 'Hide archive' : 'Show archive') + '</span>' +
-            '<span class="archive-count">' + count + ' session' + (count !== 1 ? 's' : '') + '</span>' +
-          '</div>' +
-          '<div class="archive-body">' +
-            doneParents.map(p => renderCard(p, now)).join('') +
-          '</div>' +
-        '</div>';
+    function patchCard(cardEl, agent, now) {
+      const effState = parentEffectiveState(agent);
+      const d = agent.details||{};
+      const prompt = d.customTitle||d.aiTitle||d.latestUserPrompt||d.lastPrompt||'(no prompt yet)';
+
+      const dot = cardEl.querySelector('.status-dot:first-child');
+      if (dot) { dot.className = 'status-dot '+effState; }
+
+      const nameEl = cardEl.querySelector('.card-name');
+      if (nameEl) { nameEl.textContent = prompt; nameEl.className = 'card-name'+(prompt==='(no prompt yet)'?' no-prompt':''); }
+
+      const timeEl = cardEl.querySelector('.card-time');
+      if (timeEl) timeEl.textContent = relTimeShort(parentMaxMtime(agent), now);
+
+      const existingMeta = cardEl.querySelector('.meta-bar');
+      const newMeta = renderMetaBar(agent);
+      if (existingMeta) existingMeta.outerHTML = newMeta || '';
+      else if (newMeta) {
+        const pathEl = cardEl.querySelector('.card-path');
+        if (pathEl) pathEl.insertAdjacentHTML('afterend', newMeta);
+      }
+
+      const existingTimeline = cardEl.querySelector('.activity-timeline');
+      const newTimeline = renderTimeline(agent.activityHistory, now);
+      if (existingTimeline) existingTimeline.outerHTML = newTimeline || '';
+      else if (newTimeline) {
+        const metaEl = cardEl.querySelector('.meta-bar');
+        const anchor = metaEl || cardEl.querySelector('.card-path');
+        if (anchor) anchor.insertAdjacentHTML('afterend', newTimeline);
+      }
+
+      const existingBadge = cardEl.querySelector('.stuck-badge');
+      const newBadge = renderStuckBadge(agent.activityHistory, effState, now);
+      if (existingBadge) existingBadge.outerHTML = newBadge || '';
+      else if (newBadge) {
+        const tl = cardEl.querySelector('.activity-timeline');
+        if (tl) tl.insertAdjacentHTML('afterend', newBadge);
+      }
+
+      const toggleEl = cardEl.querySelector('.sub-toggle');
+      const allSubs = agent.subagents||[];
+      if (toggleEl && allSubs.length > 0) {
+        toggleEl.innerHTML = '<span class="sub-caret">▶</span>'
+          + '<span>'+allSubs.length+' subagent'+(allSubs.length!==1?'s':'')+'</span>'
+          + rollupSubagentDots(allSubs);
+      }
+
+      const stopBtn = cardEl.querySelector('.card-actions [data-act="stop"]');
+      if (effState !== 'running' && stopBtn) stopBtn.remove();
     }
+
+    function reconcile(groups, now) {
+      for (const [key, el] of projGroupEls) {
+        if (!groups.has(key)) { el.remove(); projGroupEls.delete(key); }
+      }
+
+      const sorted = [...groups.values()].sort((a, b) => {
+        const aActive = a.agents.some(p=>parentEffectiveState(p)!=='done');
+        const bActive = b.agents.some(p=>parentEffectiveState(p)!=='done');
+        if (aActive !== bActive) return bActive ? 1 : -1;
+        const aMtime = Math.max(...a.agents.map(parentMaxMtime));
+        const bMtime = Math.max(...b.agents.map(parentMaxMtime));
+        return bMtime - aMtime;
+      });
+
+      for (const group of sorted) {
+        const isActive = group.agents.some(p=>parentEffectiveState(p)!=='done');
+        let groupEl = projGroupEls.get(group.key);
+
+        if (!groupEl) {
+          groupEl = document.createElement('div');
+          groupEl.className = 'proj-group'+(isActive?' open':'')+(isActive?'':' inactive');
+          groupEl.dataset.projKey = group.key;
+          const badge = groupBadge(group.agents);
+          groupEl.innerHTML = '<div class="proj-header" data-proj-key="'+esc(group.key)+'">'
+            + '<span class="proj-caret">▶</span>'
+            + '<span class="proj-name">'+esc(group.label)+'</span>'
+            + '<span class="proj-badge '+badge.cls+'">'+esc(badge.text)+'</span>'
+            + '</div><div class="proj-body"></div>';
+          if (openSections['proj:'+group.key] !== undefined) {
+            groupEl.classList.toggle('open', openSections['proj:'+group.key]);
+          }
+          projGroupEls.set(group.key, groupEl);
+        } else {
+          const badgeEl = groupEl.querySelector('.proj-badge');
+          const badge = groupBadge(group.agents);
+          if (badgeEl) { badgeEl.className = 'proj-badge '+badge.cls; badgeEl.textContent = badge.text; }
+          groupEl.classList.toggle('inactive', !isActive);
+        }
+
+        root.appendChild(groupEl);
+
+        const body = groupEl.querySelector('.proj-body');
+        const sortedAgents = group.agents.slice().sort((a,b)=>parentMaxMtime(b)-parentMaxMtime(a));
+
+        for (const [sid, el] of cardEls) {
+          if (body.contains(el) && !group.agents.find(a=>a.sessionId===sid)) {
+            el.remove(); cardEls.delete(sid);
+          }
+        }
+
+        for (const agent of sortedAgents) {
+          let cardEl = cardEls.get(agent.sessionId);
+          if (!cardEl) {
+            const tmp = document.createElement('div');
+            tmp.innerHTML = renderCard(agent, now);
+            cardEl = tmp.firstElementChild;
+            cardEls.set(agent.sessionId, cardEl);
+          } else {
+            patchCard(cardEl, agent, now);
+          }
+          body.appendChild(cardEl);
+        }
+      }
+    }
+
+    function applyFilter(query) {
+      const q = query.toLowerCase().trim();
+      for (const [key, groupEl] of projGroupEls) {
+        const group = lastGroups ? lastGroups.get(key) : null;
+        if (!group) continue;
+        let anyMatch = false;
+        for (const [sid, cardEl] of cardEls) {
+          if (!groupEl.querySelector('.proj-body').contains(cardEl)) continue;
+          const agent = group.agents.find(a=>a.sessionId===sid);
+          if (!agent) continue;
+          const d = agent.details||{};
+          const text = [
+            d.customTitle||'', d.aiTitle||'', d.latestUserPrompt||'',
+            agent.cwd, agent.projectName,
+            ...(agent.activityHistory||[]).map(h=>h.summary),
+          ].join(' ').toLowerCase();
+          const match = !q || text.includes(q);
+          cardEl.style.display = match ? '' : 'none';
+          if (match) anyMatch = true;
+        }
+        groupEl.style.display = (!q || anyMatch) ? '' : 'none';
+      }
+    }
+
+    let lastGroups = null;
 
     function render(agents, now, ready) {
       if (!ready) {
         root.className = 'empty-global';
-        root.innerHTML = 'Scanning\u2026';
+        root.innerHTML = 'Scanning…';
         return;
       }
       if (!agents || agents.length === 0) {
         root.className = 'empty-global';
-        root.innerHTML = 'No agents yet \u2014 run <code>claude</code> in any project';
+        root.innerHTML = 'No agents yet — run <code>claude</code> in any project';
         return;
       }
       root.className = '';
-
       const parents = agents.filter(a => !a.parentSessionId);
-
-      const primary = [], archive = [];
-      for (const p of parents) {
-        const done = parentEffectiveState(p) === 'done' && !(p.subagents || []).some(s => s.state === 'running');
-        (done ? archive : primary).push(p);
-      }
-
-      primary.sort((a, b) => parentMaxMtime(b) - parentMaxMtime(a));
-      archive.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-      root.innerHTML = primary.map(p => renderCard(p, now)).join('') + renderArchive(archive, now);
+      lastGroups = groupByProject(parents);
+      reconcile(lastGroups, now);
+      applyFilter(filterInput ? filterInput.value : '');
     }
 
     root.addEventListener('click', (e) => {
       const target = e.target instanceof Element ? e.target : null;
       if (!target) return;
 
-      // Action buttons — handled first so they don't fall through.
       const btn = target.closest('[data-act]');
       if (btn) {
         const sidEl = btn.closest('[data-sid]');
@@ -575,52 +849,56 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // Archive toggle row.
-      const archiveRow = target.closest('.archive-row');
-      if (archiveRow) {
-        const section = archiveRow.closest('.archive-section');
-        if (!section) return;
-        const isOpen = section.classList.toggle('open');
-        openSections['archive'] = isOpen;
-        const lbl = archiveRow.querySelector('.archive-label');
-        if (lbl) lbl.textContent = isOpen ? 'Hide archive' : 'Show archive';
+      const projHeader = target.closest('.proj-header');
+      if (projHeader) {
+        const groupEl = projHeader.closest('.proj-group');
+        if (!groupEl) return;
+        const isOpen = groupEl.classList.toggle('open');
+        const key = groupEl.dataset.projKey;
+        if (key) openSections['proj:'+key] = isOpen;
         return;
       }
 
-      // Sub-toggle: collapse/expand subagent list within a card.
       const subToggle = target.closest('.sub-toggle');
       if (subToggle) {
         const card = subToggle.closest('.card');
         if (!card) return;
         const isOpen = card.classList.toggle('subs-open');
         const key = card.dataset.key;
-        if (key) openSections[key + ':subs'] = isOpen;
+        if (key) openSections[key] = isOpen;
         return;
       }
 
-      // Sub-row click opens preview.
       const subRow = target.closest('.sub-row');
-      if (subRow) {
+      if (subRow && !target.closest('[data-act]')) {
         const sid = subRow.getAttribute('data-sid');
         if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
         return;
       }
 
-      // Card-top click opens preview.
       const cardTop = target.closest('.card-top');
       if (cardTop) {
         const card = cardTop.closest('.card');
         const sid = card ? card.getAttribute('data-sid') : null;
         if (sid) vscode.postMessage({ command: 'previewTranscript', sessionId: sid });
-        return;
       }
     });
 
+    if (filterInput) {
+      filterInput.addEventListener('input', () => applyFilter(filterInput.value));
+      filterInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { filterInput.value = ''; applyFilter(''); filterInput.blur(); }
+      });
+    }
+
     window.addEventListener('message', (event) => {
-      const msg = event.data;
-      if (msg && msg.command === 'render') render(msg.agents, msg.now, msg.ready);
+      const { command, agents, ready, now } = event.data;
+      if (command === 'render') render(agents, now, ready);
     });
+
+    vscode.postMessage({ command: 'refresh' });
   </script>
+
 </body>
 </html>`;
   }
