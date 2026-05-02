@@ -546,12 +546,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function projectKey(cwd) {
-      const parts = cwd.replace(/\\\\/g,'/').split('/').filter(Boolean);
+      const parts = cwd.split('/').filter(Boolean);
       return parts.slice(-3).join('/') || cwd;
     }
 
     function projectLabel(cwd) {
-      const parts = cwd.replace(/\\\\/g,'/').split('/').filter(Boolean);
+      const parts = cwd.split('/').filter(Boolean);
       if (parts.length >= 2) return parts.slice(-3).join(' / ');
       return parts[parts.length-1] || cwd;
     }

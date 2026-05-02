@@ -373,8 +373,8 @@ function resolveCwd(filePath: string, events: RawEvent[]): string {
 }
 
 function normalizeCwd(p: string): string {
-  // Normalize slashes; uppercase drive letter for consistent Windows display (e.g. c:\ -> C:\).
-  return path.normalize(p).replace(/^[a-z]:/, d => d.toUpperCase());
+  // Always use forward slashes; uppercase drive letter (e.g. c:/foo -> C:/foo).
+  return p.replace(/\\/g, '/').replace(/^[a-z]:/, d => d.toUpperCase());
 }
 
 /** Determines an agent's state from its mtime age, termination flag, and subagent activity. */
