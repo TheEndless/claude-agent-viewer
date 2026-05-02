@@ -199,13 +199,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   /** Returns the full HTML for the sidebar webview, including all CSS and JS for the agent card UI. */
   private getHtml(): string {
-    const nonce = [...Array(32)].map(() => Math.random().toString(36)[2]).join('');
     return /*html*/ `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -490,7 +489,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   <div class="filter-bar"><input class="filter-input" id="filter-input" placeholder="Filter agents…" /></div>
   <div id="root" class="empty-global">Loading agents…</div>
 
-  <script nonce="${nonce}">
+  <script>
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
     const filterInput = document.getElementById('filter-input');
@@ -617,9 +616,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function renderActionBtns(stopBtn) {
-      return '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">💬</button>'
-           + '<button class="action-btn" data-act="openJsonl" title="Open raw JSONL">📄</button>'
-           + '<button class="action-btn" data-act="openFolder" title="Open folder">📁</button>'
+      return '<button class="action-btn" data-act="previewTranscript" title="Preview transcript">&#x1F4AC;</button>'
+           + '<button class="action-btn" data-act="openJsonl" title="Open raw JSONL">&#x1F4C4;</button>'
+           + '<button class="action-btn" data-act="openFolder" title="Open folder">&#x1F4C1;</button>'
            + stopBtn
            + '<button class="action-btn danger" data-act="delete" title="Delete">✕</button>';
     }
