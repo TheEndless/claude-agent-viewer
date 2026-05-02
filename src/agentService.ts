@@ -384,6 +384,30 @@ function deriveActivity(events: RawEvent[], state: AgentState): string {
   return label ?? (state === 'running' ? 'Working…' : 'Idle');
 }
 
+/**
+ * Collects the last ≤3 meaningful events from tail events as an activity history,
+ * newest first. Uses the same event-labelling logic as deriveActivity.
+ */
+function buildActivityHistory(events: RawEvent[], state: AgentState): ToolCallSummary[] {
+  if (state === 'done') return [{ summary: 'Session ended', at: 0 }];
+  const history: ToolCallSummary[] = [];
+  for (let i = events.length - 1; i >= 0 && history.length < 3; i--) {
+    const evt = events[i];
+    if (isNoise(evt)) continue;
+    const label = labelFromEvent(evt);
+    if (!label) continue;
+    const ts = typeof evt.timestamp === 'string' ? Date.parse(evt.timestamp) || 0 : 0;
+    history.push({ summary: label, at: ts });
+  }
+  if (history.length === 0) {
+    history.push({ summary: state === 'running' ? 'Working…' : 'Idle', at: 0 });
+  }
+  return history;
+}
+
+/** Exported only for unit testing. */
+export const buildActivityHistoryForTesting = buildActivityHistory;
+
 function isNoise(evt: RawEvent): boolean {
   const t = typeof evt.type === 'string' ? evt.type : '';
   return t === 'queue-operation';
