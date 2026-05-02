@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { assignTaskDescriptionsForTesting, buildActivityHistoryForTesting } from '../agentService';
+import { assignTaskDescriptionsForTesting, buildActivityHistoryForTesting, extractSessionMetaForTesting } from '../agentService';
 import { Agent, RawEvent } from '../types';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -11,12 +11,9 @@ function makeParent(sessionId: string, descs: string[]): Agent {
     cwd: '/app',
     projectName: 'app',
     state: 'running',
-    activityHistory: [],
-    model: '',
-    turnCount: 0,
-    contextPct: 0,
+    activity: '',
     mtimeMs: 1000,
-    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: 'do the thing', lastPrompt: null, customTitle: null, aiTitle: null, subagentCount: descs.length },
+    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: 'do the thing', subagentCount: descs.length },
     subagents: [],
     agentCallDescs: descs,
   };
@@ -29,50 +26,22 @@ function makeSub(sessionId: string, mtimeMs = 500, prompt: string | null = null)
     cwd: '/app',
     projectName: 'app',
     state: 'running',
-    activityHistory: [],
-    model: '',
-    turnCount: 0,
-    contextPct: 0,
+    activity: '',
     mtimeMs,
-    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: prompt, lastPrompt: null, customTitle: null, aiTitle: null, subagentCount: 0 },
+    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: prompt, subagentCount: 0 },
     subagents: [],
   };
 }
-
-function bashEvent(command: string, timestamp = '2024-01-01T00:00:00.000Z'): RawEvent {
-  return {
-    type: 'assistant',
-    timestamp,
-    message: {
-      role: 'assistant',
-      content: [{ type: 'tool_use', name: 'Bash', input: { command } }],
-    },
-  };
-}
-
-function thinkingEvent(timestamp = '2024-01-01T00:01:00.000Z'): RawEvent {
-  return {
-    type: 'assistant',
-    timestamp,
-    message: { role: 'assistant', content: [{ type: 'text', text: 'thinking...' }] },
-  };
-}
-
-function summaryEvent(): RawEvent {
-  return { type: 'summary' };
-}
-
-// ── assignTaskDescriptions ────────────────────────────────────────────────────
 
 describe('assignTaskDescriptionsForTesting', () => {
   it('assigns descriptions from agentCallDescs in chronological (mtimeMs asc) order', () => {
     const parent = makeParent('parent1', ['Task A', 'Task B']);
     const sub1 = makeSub('sub1', 100);
     const sub2 = makeSub('sub2', 200);
-    parent.subagents = [sub2, sub1];
+    parent.subagents = [sub2, sub1]; // intentionally out of order to test sort
     const agents = new Map([['parent1', parent], ['sub1', sub1], ['sub2', sub2]]);
     assignTaskDescriptionsForTesting(agents);
-    expect(sub1.taskDescription).toBe('Task A');
+    expect(sub1.taskDescription).toBe('Task A'); // earlier mtime → first description
     expect(sub2.taskDescription).toBe('Task B');
   });
 
@@ -150,5 +119,62 @@ describe('buildActivityHistoryForTesting', () => {
     const events: RawEvent[] = [bashEvent('ls', '2024-06-15T12:30:00.000Z')];
     const result = buildActivityHistoryForTesting(events, 'running');
     expect(result[0].at).toBe(Date.parse('2024-06-15T12:30:00.000Z'));
+  });
+});
+
+// ── extractSessionMeta ────────────────────────────────────────────────────────
+
+function assistantEvent(model: string, inputTokens: number, timestamp = '2024-01-01T00:00:00.000Z'): RawEvent {
+  return {
+    type: 'assistant',
+    timestamp,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'response' }],
+      model: `claude-${model}`,
+      usage: { input_tokens: inputTokens, output_tokens: 100 },
+    },
+  };
+}
+
+describe('extractSessionMetaForTesting', () => {
+  it('strips claude- prefix from model name', () => {
+    const { model } = extractSessionMetaForTesting([assistantEvent('sonnet-4-6', 10000)]);
+    expect(model).toBe('sonnet-4-6');
+  });
+
+  it('counts assistant turns', () => {
+    const events: RawEvent[] = [
+      assistantEvent('sonnet-4-6', 5000),
+      assistantEvent('sonnet-4-6', 10000),
+      assistantEvent('sonnet-4-6', 15000),
+    ];
+    const { turnCount } = extractSessionMetaForTesting(events);
+    expect(turnCount).toBe(3);
+  });
+
+  it('computes contextPct from last assistant input_tokens', () => {
+    const events: RawEvent[] = [
+      assistantEvent('sonnet-4-6', 50000),
+      assistantEvent('sonnet-4-6', 100000),
+    ];
+    const { contextPct } = extractSessionMetaForTesting(events);
+    expect(contextPct).toBe(50); // 100000 / 200000 * 100
+  });
+
+  it('returns zeros when no assistant events', () => {
+    const { model, turnCount, contextPct } = extractSessionMetaForTesting([]);
+    expect(model).toBe('');
+    expect(turnCount).toBe(0);
+    expect(contextPct).toBe(0);
+  });
+
+  it('uses the last model seen (latest turn wins)', () => {
+    const events: RawEvent[] = [
+      assistantEvent('haiku-4-5', 5000),
+      assistantEvent('sonnet-4-6', 10000),
+    ];
+    const { model } = extractSessionMetaForTesting(events);
+    expect(model).toBe('sonnet-4-6');
   });
 });

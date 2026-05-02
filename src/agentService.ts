@@ -272,8 +272,9 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
   const projectName = path.basename(cwd);
   const terminated = events.some(isTerminator);
   const state = classifyState(mtimeMs, Date.now(), terminated);
-  const activity = deriveActivity(events, state);
+  const activityHistory = buildActivityHistory(events, state);
   const { details, agentCallDescs } = extractDetails(events);
+  const meta = extractSessionMeta(events);
   // Merge cached title/prompt values (scanned once from whole file) with tail-derived details.
   // Cached values win for titles since they were collected from the complete file.
   details.customTitle = titles.customTitle ?? details.customTitle;
@@ -282,7 +283,22 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
   details.latestUserPrompt = details.latestUserPrompt ?? titles.firstUserPrompt;
   // Set at construction time so the agent is never briefly at root before buildTree runs.
   const parentSessionId = parentSessionIdFromPath(filePath);
-  return { sessionId, transcriptPath: filePath, parentSessionId, cwd, projectName, state, activity, mtimeMs, details, subagents: [], agentCallDescs };
+  return {
+    sessionId,
+    transcriptPath: filePath,
+    parentSessionId,
+    cwd,
+    projectName,
+    state,
+    activityHistory,
+    model: meta.model,
+    turnCount: meta.turnCount,
+    contextPct: meta.contextPct,
+    mtimeMs,
+    details,
+    subagents: [],
+    agentCallDescs,
+  };
 }
 
 /**
@@ -407,6 +423,49 @@ function buildActivityHistory(events: RawEvent[], state: AgentState): ToolCallSu
 
 /** Exported only for unit testing. */
 export const buildActivityHistoryForTesting = buildActivityHistory;
+
+/** Context window size for all current Claude models (200k tokens). */
+const CONTEXT_WINDOW = 200_000;
+
+interface SessionMeta {
+  model: string;
+  turnCount: number;
+  contextPct: number;
+}
+
+/**
+ * Extracts model name, turn count, and context window usage from tail events.
+ * All three values are approximations for long sessions where the tail doesn't
+ * include all turns.
+ */
+function extractSessionMeta(events: RawEvent[]): SessionMeta {
+  let model = '';
+  let turnCount = 0;
+  let lastInputTokens = 0;
+
+  for (const evt of events) {
+    if (evt.type !== 'assistant') continue;
+    turnCount++;
+    const msg = evt.message;
+    if (!msg) continue;
+    if (typeof msg.model === 'string' && msg.model) {
+      // Strip "claude-" prefix for compact display, e.g. "claude-sonnet-4-6" → "sonnet-4-6"
+      model = msg.model.replace(/^claude-/, '');
+    }
+    if (typeof msg.usage?.input_tokens === 'number') {
+      lastInputTokens = msg.usage.input_tokens;
+    }
+  }
+
+  const contextPct = lastInputTokens > 0
+    ? Math.round((lastInputTokens / CONTEXT_WINDOW) * 100)
+    : 0;
+
+  return { model, turnCount, contextPct };
+}
+
+/** Exported only for unit testing. */
+export const extractSessionMetaForTesting = extractSessionMeta;
 
 function isNoise(evt: RawEvent): boolean {
   const t = typeof evt.type === 'string' ? evt.type : '';
