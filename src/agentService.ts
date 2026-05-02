@@ -369,12 +369,19 @@ function resolveCwd(filePath: string, events: RawEvent[]): string {
   // Fallback: decode dir name. Encoding is lossy (dashes → slashes), so this
   // is a best effort only when events lack a cwd field.
   const dir = path.basename(path.dirname(filePath));
-  return dir.startsWith('-') ? dir.replace(/-/g, path.sep) : dir;
+  const raw = dir.startsWith('-') ? dir.replace(/-/g, '/') : dir;
+  return normalizeCwd(raw);
 }
 
 function normalizeCwd(p: string): string {
-  // Always use forward slashes; uppercase drive letter (e.g. c:/foo -> C:/foo).
-  return p.replace(/\\/g, '/').replace(/^[a-z]:/, d => d.toUpperCase());
+  // BEL () in cwd strings comes from Claude Code serializing  in a Windows path
+  // as \u0007 in JSON, which consumes the backslash+a. Restore  first, then strip
+  // remaining control chars, normalize to forward slashes, uppercase drive letter.
+  return p
+    .replace(/\x07/g, '\\a')
+    .replace(/[\x00-\x1f]/g, '')
+    .replace(/\\/g, '/')
+    .replace(/^[a-z]:/, d => d.toUpperCase());
 }
 
 /** Determines an agent's state from its mtime age, termination flag, and subagent activity. */

@@ -693,8 +693,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
            +   '</div>'
            + '</div>'
            + '<div class="card-path"><span class="proj-path">‎'+esc(parent.cwd)+'</span><span class="session-id">'+esc(parent.sessionId)+'</span></div>'
-           + renderMetaBar(parent)
-           + renderTimeline(parent.activityHistory, now)
+           + (effState !== 'done' ? renderMetaBar(parent) : '')
+           + (effState !== 'done' ? renderTimeline(parent.activityHistory, now) : '')
            + renderStuckBadge(parent.activityHistory, effState, now)
            + subSection
            + '</div>';
@@ -715,7 +715,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       if (timeEl) timeEl.textContent = relTimeShort(parentMaxMtime(agent), now);
 
       const existingMeta = cardEl.querySelector('.meta-bar');
-      const newMeta = renderMetaBar(agent);
+      const newMeta = effState !== 'done' ? renderMetaBar(agent) : '';
       if (existingMeta) existingMeta.outerHTML = newMeta || '';
       else if (newMeta) {
         const pathEl = cardEl.querySelector('.card-path');
@@ -723,7 +723,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
 
       const existingTimeline = cardEl.querySelector('.activity-timeline');
-      const newTimeline = renderTimeline(agent.activityHistory, now);
+      const newTimeline = effState !== 'done' ? renderTimeline(agent.activityHistory, now) : '';
       if (existingTimeline) existingTimeline.outerHTML = newTimeline || '';
       else if (newTimeline) {
         const metaEl = cardEl.querySelector('.meta-bar');
