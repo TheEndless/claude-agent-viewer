@@ -11,9 +11,12 @@ function makeParent(sessionId: string, descs: string[]): Agent {
     cwd: '/app',
     projectName: 'app',
     state: 'running',
-    activity: '',
+    activityHistory: [],
+    model: '',
+    turnCount: 0,
+    contextPct: 0,
     mtimeMs: 1000,
-    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: 'do the thing', subagentCount: descs.length },
+    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: 'do the thing', lastPrompt: null, customTitle: null, aiTitle: null, subagentCount: descs.length },
     subagents: [],
     agentCallDescs: descs,
   };
@@ -26,11 +29,37 @@ function makeSub(sessionId: string, mtimeMs = 500, prompt: string | null = null)
     cwd: '/app',
     projectName: 'app',
     state: 'running',
-    activity: '',
+    activityHistory: [],
+    model: '',
+    turnCount: 0,
+    contextPct: 0,
     mtimeMs,
-    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: prompt, subagentCount: 0 },
+    details: { recentToolCalls: [], recentFiles: [], latestUserPrompt: prompt, lastPrompt: null, customTitle: null, aiTitle: null, subagentCount: 0 },
     subagents: [],
   };
+}
+
+function bashEvent(command: string, timestamp = '2024-01-01T00:00:00.000Z'): RawEvent {
+  return {
+    type: 'assistant',
+    timestamp,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', name: 'Bash', input: { command } }],
+    },
+  };
+}
+
+function thinkingEvent(timestamp = '2024-01-01T00:01:00.000Z'): RawEvent {
+  return {
+    type: 'assistant',
+    timestamp,
+    message: { role: 'assistant', content: [{ type: 'text', text: 'thinking...' }] },
+  };
+}
+
+function summaryEvent(): RawEvent {
+  return { type: 'summary' };
 }
 
 describe('assignTaskDescriptionsForTesting', () => {
