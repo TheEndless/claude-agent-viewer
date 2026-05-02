@@ -437,6 +437,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .proj-body { display: none; }
     .proj-group.open .proj-body { display: block; }
     .proj-group.inactive { opacity: 0.75; }
+    .archived-section { margin-top: 6px; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,.2)); }
+    .archived-header { display: flex; align-items: center; gap: 4px; padding: 5px 8px; cursor: pointer; user-select: none; font-size: 11px; color: var(--vscode-descriptionForeground); }
+    .archived-header:hover { color: var(--vscode-foreground); background: rgba(128,128,128,.05); }
+    .archived-caret { font-size: 9px; opacity: 0.5; transition: transform 0.1s; flex-shrink: 0; }
+    .archived-section.open .archived-caret { transform: rotate(90deg); }
+    .archived-count { color: var(--vscode-disabledForeground); margin-left: 2px; }
+    .archived-body { display: none; }
+    .archived-section.open .archived-body { display: block; }
 
     /* ── filter bar ── */
     .filter-bar { padding: 5px 8px 4px; }
@@ -506,6 +514,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const openSections = {};
     const projGroupEls = new Map();
     const cardEls = new Map();
+    let archivedEl = null;
 
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -756,6 +765,26 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         return bMtime - aMtime;
       });
 
+      // Build/update archived section
+      const inactiveGroups = sorted.filter(g => !g.agents.some(p=>parentEffectiveState(p)!=='done'));
+      if (inactiveGroups.length > 0) {
+        if (!archivedEl) {
+          archivedEl = document.createElement('div');
+          archivedEl.className = 'archived-section' + (openSections['archived'] ? ' open' : '');
+          archivedEl.innerHTML = '<div class="archived-header">'
+            + '<span class="archived-caret">▶</span>'
+            + '<span>Archived</span>'
+            + '<span class="archived-count"></span>'
+            + '</div><div class="archived-body"></div>';
+        }
+        const countEl = archivedEl.querySelector('.archived-count');
+        if (countEl) countEl.textContent = '('+inactiveGroups.length+')';
+        root.appendChild(archivedEl);
+      } else if (archivedEl) {
+        archivedEl.remove();
+      }
+      const archivedBody = archivedEl ? archivedEl.querySelector('.archived-body') : null;
+
       for (const group of sorted) {
         const isActive = group.agents.some(p=>parentEffectiveState(p)!=='done');
         let groupEl = projGroupEls.get(group.key);
@@ -781,7 +810,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           groupEl.classList.toggle('inactive', !isActive);
         }
 
-        root.appendChild(groupEl);
+        if (isActive) {
+          root.appendChild(groupEl);
+        } else if (archivedBody) {
+          archivedBody.appendChild(groupEl);
+        }
 
         const body = groupEl.querySelector('.proj-body');
         const sortedAgents = group.agents.slice().sort((a,b)=>parentMaxMtime(b)-parentMaxMtime(a));
@@ -907,6 +940,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           openSections['ended:'+key] = !openSections['ended:'+key];
           if (lastGroups) reconcile(lastGroups, Date.now());
         }
+        return;
+      }
+
+      const archivedHeader = target.closest('.archived-header');
+      if (archivedHeader) {
+        const section = archivedHeader.closest('.archived-section');
+        if (section) openSections['archived'] = section.classList.toggle('open');
         return;
       }
 
