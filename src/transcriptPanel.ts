@@ -294,6 +294,7 @@ function renderAssistantTurn(turn: Turn): string {
       <div class="avatar agent"><svg><use href="#icon-agent"/></svg></div>
       <span class="turn-label">Agent</span>
       <span class="turn-ts">${metaPrefix}<span data-iso="${esc(turn.timestamp)}"></span></span>
+      ${turn.text ? `<button class="copy-btn" data-copy="${esc(turn.text)}" title="Copy response">📋</button>` : ''}
     </div>
     <div class="turn-content"><div class="turn-inner">
       ${toolHtml}${bubbleHtml}${sysHtml}
@@ -456,6 +457,13 @@ function renderAttachment(att: TurnAttachment): string {
 /** Returns the full HTML shell for the transcript webview panel, including all CSS and JS. */
 function buildWebviewHtml(title: string): string {
   const turnsHtml = '<div class="empty-state loading">Loading\u2026</div>';
+  const toolbarHtml = `<div class="toolbar">
+  <button class="tb-btn" id="tb-search-btn" title="Search (Ctrl+F)">\ud83d\udd0d Search</button>
+  <input class="tb-search-input" id="tb-search-input" placeholder="Search\u2026" />
+  <span class="tb-spacer"></span>
+  <button class="tb-btn tb-jump" id="tb-jump-btn" title="Jump to latest">\u2193 Latest</button>
+  <button class="tb-btn" id="tb-export-btn" title="Export as markdown">\ud83d\udcbe Export</button>
+</div>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -652,6 +660,41 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .bubble-raw[open] summary::before { transform: rotate(90deg); }
 .bubble-raw summary:hover { background: rgba(128,128,128,0.06); }
 .bubble-raw-body { padding: 6px 10px 8px; font-size: 11px; font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; overflow-x: auto; }
+.toolbar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 4px;
+  padding: 4px 8px;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--vscode-input-border);
+}
+.tb-btn {
+  background: none; border: 1px solid transparent; border-radius: 4px;
+  color: var(--vscode-descriptionForeground); cursor: pointer;
+  padding: 2px 8px; font-size: 11px; font-family: inherit;
+  white-space: nowrap;
+}
+.tb-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); border-color: var(--vscode-input-border); }
+.tb-search-input {
+  flex: 1; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border);
+  color: var(--vscode-input-foreground); border-radius: 4px;
+  padding: 2px 8px; font-size: 11px; font-family: inherit; outline: none; display: none;
+}
+.tb-search-input.visible { display: block; }
+.tb-search-input:focus { border-color: var(--vscode-focusBorder); }
+.tb-spacer { flex: 1; }
+.tb-jump { display: none; }
+.tb-jump.visible { display: inline-block; }
+.search-highlight { background: rgba(255,215,0,0.3); border-radius: 2px; }
+.copy-btn {
+  display: none; background: none; border: none; cursor: pointer;
+  color: var(--vscode-descriptionForeground); padding: 1px 4px;
+  font-size: 11px; border-radius: 3px; margin-left: 4px;
+}
+.turn-head:hover .copy-btn { display: inline-flex; align-items: center; }
+.copy-btn:hover { background: var(--vscode-toolbar-hoverBackground); color: var(--vscode-foreground); }
+body { display: flex; flex-direction: column; }
+.toolbar { flex-shrink: 0; }
+.scroll { flex: 1; height: unset !important; }
 </style>
 </head>
 <body>
@@ -707,6 +750,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
   <img id="lightbox-img" src="" alt="">
 </div>
 
+${toolbarHtml}
 <div class="scroll" id="scroll">
 ${turnsHtml}
 </div>
@@ -751,6 +795,14 @@ ${turnsHtml}
 
   // Delegated click handling — attached once, works for any future content.
   scroll.addEventListener('click', (ev) => {
+    const copyBtn = ev.target.closest && ev.target.closest('.copy-btn');
+    if (copyBtn) {
+      navigator.clipboard.writeText(copyBtn.dataset.copy || '').catch(() => {});
+      const orig = copyBtn.textContent;
+      copyBtn.textContent = '✓';
+      setTimeout(() => { copyBtn.textContent = orig; }, 1200);
+      return;
+    }
     const summary = ev.target.closest && ev.target.closest('summary');
     if (summary) {
       const details = summary.closest('details.bubble-raw');
@@ -790,6 +842,15 @@ ${turnsHtml}
     const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
     userScrolled = !atBottom;
   });
+
+  const jumpBtn = document.getElementById('tb-jump-btn');
+
+  function updateJumpVisibility() {
+    const atBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+    if (jumpBtn) jumpBtn.classList.toggle('visible', !atBottom);
+  }
+
+  jumpBtn && jumpBtn.addEventListener('click', () => scrollToBottom());
 
   document.getElementById('lightbox').addEventListener('click', () => {
     document.getElementById('lightbox').classList.remove('open');
@@ -846,10 +907,65 @@ ${turnsHtml}
     }
     stampTimestamps();
     if (wasAtBottom) scrollToBottom();
+    updateJumpVisibility();
   });
 
   stampTimestamps();
   scrollToBottom();
+
+  const searchBtn   = document.getElementById('tb-search-btn');
+  const searchInput = document.getElementById('tb-search-input');
+
+  function clearHighlights() {
+    scroll.querySelectorAll('.search-highlight').forEach(el => {
+      el.replaceWith(document.createTextNode(el.textContent));
+    });
+    scroll.normalize();
+  }
+
+  function highlightText(query) {
+    clearHighlights();
+    if (!query) return;
+    const walker = document.createTreeWalker(scroll, NodeFilter.SHOW_TEXT, null);
+    const nodes = [];
+    while (walker.nextNode()) nodes.push(walker.currentNode);
+    const lq = query.toLowerCase();
+    for (const node of nodes) {
+      const idx = node.textContent.toLowerCase().indexOf(lq);
+      if (idx === -1) continue;
+      const mark = document.createElement('mark');
+      mark.className = 'search-highlight';
+      const after = node.splitText(idx);
+      after.splitText(query.length);
+      mark.appendChild(after.cloneNode(true));
+      after.replaceWith(mark);
+    }
+    const first = scroll.querySelector('.search-highlight');
+    if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  searchBtn && searchBtn.addEventListener('click', () => {
+    searchInput.classList.toggle('visible');
+    if (searchInput.classList.contains('visible')) searchInput.focus();
+    else { clearHighlights(); searchInput.value = ''; }
+  });
+
+  searchInput && searchInput.addEventListener('input', () => highlightText(searchInput.value));
+  searchInput && searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      clearHighlights(); searchInput.value = '';
+      searchInput.classList.remove('visible');
+      searchInput.blur();
+    }
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+      e.preventDefault();
+      if (searchInput) { searchInput.classList.add('visible'); searchInput.focus(); }
+    }
+  });
+
   const vscode = acquireVsCodeApi();
   vscode.postMessage({ command: 'ready' });
 </script>
