@@ -765,7 +765,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         return bMtime - aMtime;
       });
 
-      // Build/update archived section
+      // Build/update archived section (appended to root after the active-group loop)
       const inactiveGroups = sorted.filter(g => !g.agents.some(p=>parentEffectiveState(p)!=='done'));
       if (inactiveGroups.length > 0) {
         if (!archivedEl) {
@@ -779,11 +779,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         }
         const countEl = archivedEl.querySelector('.archived-count');
         if (countEl) countEl.textContent = '('+inactiveGroups.length+')';
-        root.appendChild(archivedEl);
       } else if (archivedEl) {
         archivedEl.remove();
       }
-      const archivedBody = archivedEl ? archivedEl.querySelector('.archived-body') : null;
+      const archivedBody = archivedEl && inactiveGroups.length > 0 ? archivedEl.querySelector('.archived-body') : null;
 
       for (const group of sorted) {
         const isActive = group.agents.some(p=>parentEffectiveState(p)!=='done');
@@ -868,6 +867,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           body.appendChild(cardEl);
         }
       }
+
+      // Archived section always sits at the bottom of root
+      if (archivedEl && inactiveGroups.length > 0) root.appendChild(archivedEl);
     }
 
     function applyFilter(query) {
