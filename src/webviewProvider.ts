@@ -483,6 +483,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .ssd.running { background: #3fb950; box-shadow: 0 0 3px rgba(63,185,80,.5); }
     .ssd.idle    { background: #d29922; }
     .ssd.done    { background: #6e7681; }
+
+    /* ── ended sessions toggle ── */
+    .ended-toggle {
+      display: flex; align-items: center; gap: 4px;
+      padding: 3px 8px 3px 10px; margin: 1px 4px;
+      font-size: 11px; color: var(--vscode-descriptionForeground);
+      cursor: pointer; user-select: none; border-radius: 3px;
+    }
+    .ended-toggle:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
   </style>
 </head>
 <body>
@@ -500,6 +509,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    function stripTags(s) {
+      return s ? String(s).replace(/<[^>]*>/g, '').trim() : s;
     }
 
     function relTimeShort(ms, now) {
@@ -624,7 +637,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function renderSubRow(sub, now) {
-      const task = sub.taskDescription||(sub.details&&sub.details.latestUserPrompt)||sub.sessionId.slice(0,8);
+      const task = stripTags(sub.taskDescription||(sub.details&&sub.details.latestUserPrompt)||sub.sessionId.slice(0,8));
       const doneCls = sub.state==='done' ? ' done-sub' : '';
       const stopBtn = sub.state==='running'
         ? '<button class="action-btn danger" data-act="stop" title="Stop">■</button>' : '';
@@ -644,7 +657,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const subsOpen = openSections[key]||false;
 
       const d = parent.details||{};
-      const prompt = d.customTitle||d.aiTitle||d.latestUserPrompt||d.lastPrompt||null;
+      const prompt = stripTags(d.customTitle||d.aiTitle||d.latestUserPrompt||d.lastPrompt||null);
       const nameCls = prompt ? '' : ' no-prompt';
 
       const stopBtn = effState==='running'
@@ -681,7 +694,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     function patchCard(cardEl, agent, now) {
       const effState = parentEffectiveState(agent);
       const d = agent.details||{};
-      const prompt = d.customTitle||d.aiTitle||d.latestUserPrompt||d.lastPrompt||'(no prompt yet)';
+      const prompt = stripTags(d.customTitle||d.aiTitle||d.latestUserPrompt||d.lastPrompt||'(no prompt yet)');
 
       const dot = cardEl.querySelector('.status-dot:first-child');
       if (dot) { dot.className = 'status-dot '+effState; }
@@ -772,6 +785,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
         const body = groupEl.querySelector('.proj-body');
         const sortedAgents = group.agents.slice().sort((a,b)=>parentMaxMtime(b)-parentMaxMtime(a));
+        const activeAgents = sortedAgents.filter(a => parentEffectiveState(a) !== 'done');
+        const doneAgents   = sortedAgents.filter(a => parentEffectiveState(a) === 'done');
+        const endedOpen    = openSections['ended:'+group.key] || false;
 
         for (const [sid, el] of cardEls) {
           if (body.contains(el) && !group.agents.find(a=>a.sessionId===sid)) {
@@ -779,7 +795,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        for (const agent of sortedAgents) {
+        for (const agent of activeAgents) {
           let cardEl = cardEls.get(agent.sessionId);
           if (!cardEl) {
             const tmp = document.createElement('div');
@@ -789,6 +805,34 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           } else {
             patchCard(cardEl, agent, now);
           }
+          cardEl.style.display = '';
+          body.appendChild(cardEl);
+        }
+
+        let endedToggle = body.querySelector('.ended-toggle');
+        if (doneAgents.length > 0) {
+          if (!endedToggle) {
+            endedToggle = document.createElement('div');
+            endedToggle.className = 'ended-toggle';
+            body.appendChild(endedToggle);
+          }
+          endedToggle.innerHTML = '<span class="sub-caret">'+(endedOpen?'▼':'▶')+'</span> '+doneAgents.length+' ended';
+          endedToggle.dataset.endedKey = group.key;
+        } else {
+          if (endedToggle) { endedToggle.remove(); endedToggle = null; }
+        }
+
+        for (const agent of doneAgents) {
+          let cardEl = cardEls.get(agent.sessionId);
+          if (!cardEl) {
+            const tmp = document.createElement('div');
+            tmp.innerHTML = renderCard(agent, now);
+            cardEl = tmp.firstElementChild;
+            cardEls.set(agent.sessionId, cardEl);
+          } else {
+            patchCard(cardEl, agent, now);
+          }
+          cardEl.style.display = endedOpen ? '' : 'none';
           body.appendChild(cardEl);
         }
       }
@@ -819,18 +863,22 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     let lastGroups = null;
+    let rootIsEmpty = true;
 
     function render(agents, now, ready) {
       if (!ready) {
         root.className = 'empty-global';
         root.innerHTML = 'Scanning…';
+        rootIsEmpty = true;
         return;
       }
       if (!agents || agents.length === 0) {
         root.className = 'empty-global';
         root.innerHTML = 'No agents yet — run <code>claude</code> in any project';
+        rootIsEmpty = true;
         return;
       }
+      if (rootIsEmpty) { root.innerHTML = ''; rootIsEmpty = false; }
       root.className = '';
       const parents = agents.filter(a => !a.parentSessionId);
       lastGroups = groupByProject(parents);
@@ -847,6 +895,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         const sidEl = btn.closest('[data-sid]');
         const sid = sidEl ? sidEl.getAttribute('data-sid') : null;
         if (sid) vscode.postMessage({ command: btn.getAttribute('data-act'), sessionId: sid });
+        return;
+      }
+
+      const endedToggle = target.closest('.ended-toggle');
+      if (endedToggle) {
+        const key = endedToggle.dataset.endedKey;
+        if (key) {
+          openSections['ended:'+key] = !openSections['ended:'+key];
+          if (lastGroups) reconcile(lastGroups, Date.now());
+        }
         return;
       }
 
