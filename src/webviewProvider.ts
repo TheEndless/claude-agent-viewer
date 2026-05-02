@@ -844,10 +844,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         const group = lastGroups ? lastGroups.get(key) : null;
         if (!group) continue;
         let anyMatch = false;
+        const endedOpen = openSections['ended:'+key] || false;
         for (const [sid, cardEl] of cardEls) {
           if (!groupEl.querySelector('.proj-body').contains(cardEl)) continue;
           const agent = group.agents.find(a=>a.sessionId===sid);
           if (!agent) continue;
+          const isDone = parentEffectiveState(agent) === 'done';
+          if (isDone && !endedOpen) { cardEl.style.display = 'none'; continue; }
           const d = agent.details||{};
           const text = [
             d.customTitle||'', d.aiTitle||'', d.latestUserPrompt||'',
