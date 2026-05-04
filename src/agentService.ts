@@ -109,9 +109,11 @@ export class AgentService {
       this.scheduleEmit();
     }
 
-    logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded`);
+    logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded (${Array.from(this.agents.values()).filter(a => a.parentSessionId).length} subagents)`);
     // Watch for ongoing changes. ignoreInitial: true since we already scanned above.
-    this.watcher = chokidar.watch(`${PROJECTS_ROOT}/**/*.jsonl`, {
+    // Forward slashes required for the glob portion; chokidar normalizes the base path.
+    const watchGlob = PROJECTS_ROOT.replace(/\\/g, '/') + '/**/*.jsonl';
+    this.watcher = chokidar.watch(watchGlob, {
       ignoreInitial: true,
       persistent: true,
       alwaysStat: true,
@@ -249,6 +251,8 @@ export class AgentService {
       if (reason === 'change' || anyChanged) {
         buildTree(this.agents);
         assignTaskDescriptions(this.agents);
+        const subCount = Array.from(this.agents.values()).filter(a => a.parentSessionId).length;
+        logInfo('emit', `agents=${this.agents.size} subagents=${subCount}`);
         this._onDidChange.fire(this.getAgents());
       }
     }, DEBOUNCE_MS);
