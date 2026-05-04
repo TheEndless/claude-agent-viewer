@@ -95,7 +95,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const { command, sessionId } = message;
 
     if (command === 'refresh') {
-      this.postAgents();
+      this._view?.webview.postMessage({ command: 'reset' });
+      this.refresh();
       return;
     }
 
@@ -996,7 +997,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener('message', (event) => {
       const { command, agents, ready, now } = event.data;
-      if (command === 'render') render(agents, now, ready);
+      if (command === 'reset') {
+        root.innerHTML = 'Scanning…';
+        projGroupEls.clear();
+        cardEls.clear();
+        archivedEl = null;
+      } else if (command === 'render') {
+        render(agents, now, ready);
+      }
     });
 
     vscode.postMessage({ command: 'refresh' });
