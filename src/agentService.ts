@@ -24,6 +24,7 @@ const RUNNING_WINDOW_MS = 5 * 60 * 1000;
 const DONE_AGE_MS = 6 * 60 * 60 * 1000;
 const DEBOUNCE_MS = 200;
 const STATE_TICK_MS = 5000;
+const DISCOVERY_TICK_MS = 30_000;
 
 /** Cached session name fields scanned from the full transcript file. */
 interface TitleCache {
@@ -44,6 +45,7 @@ export class AgentService {
   private watcher?: chokidar.FSWatcher;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
+  private discoveryTimer?: NodeJS.Timeout;
   // Pending unlink timers keyed by file path. An 'add' event for the same path
   // cancels the timer before it fires, handling atomic-write rename sequences.
   private pendingDrops = new Map<string, NodeJS.Timeout>();
@@ -63,6 +65,9 @@ export class AgentService {
     // fire even with no file changes. Routes through scheduleEmit so reclassification
     // always runs on a consistent snapshot, never interleaved with async file reads.
     this.tickTimer = setInterval(() => this.scheduleEmit('tick'), STATE_TICK_MS);
+    // Periodic discovery pass: pick up any files the chokidar watcher missed
+    // (e.g. new subagent directories created after the watcher started on Windows).
+    this.discoveryTimer = setInterval(() => void this.discoverNewFiles(), DISCOVERY_TICK_MS);
     void this.initialize();
   }
 
@@ -142,6 +147,18 @@ export class AgentService {
       await Promise.all(allFiles.map(f => this.processFile(f)));
       this.scheduleEmit();
     } catch (err) { logError('refresh', err); }
+  }
+
+  /** Processes only files not yet tracked — called periodically to recover from missed watcher events. */
+  private async discoverNewFiles(): Promise<void> {
+    try {
+      const allFiles = await findJsonlFiles(PROJECTS_ROOT);
+      const newFiles = allFiles.filter(f => !this.agents.has(sessionIdFromPath(f)));
+      if (newFiles.length > 0) {
+        await Promise.all(newFiles.map(f => this.processFile(f)));
+        this.scheduleEmit();
+      }
+    } catch (err) { logError('discoverNewFiles', err); }
   }
 
   /** Returns all known agents sorted by most-recently-modified first. */
@@ -241,6 +258,7 @@ export class AgentService {
   dispose(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     for (const t of this.pendingDrops.values()) clearTimeout(t);
     this.pendingDrops.clear();
     this.watcher?.close();
