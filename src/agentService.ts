@@ -180,11 +180,14 @@ export class AgentService {
     try {
       const stat = stats ?? await fsp.stat(filePath);
       const sessionId = sessionIdFromPath(filePath);
-      if (!this.titleCache.has(sessionId)) {
-        this.titleCache.set(sessionId, await scanFullFileForTitles(filePath));
+      // Capture in a local var before the tailEvents await so a concurrent
+      // refresh() clearing titleCache can't make the get() return undefined.
+      let cached = this.titleCache.get(sessionId);
+      if (!cached) {
+        cached = await scanFullFileForTitles(filePath);
+        this.titleCache.set(sessionId, cached);
       }
       const events = await this.tailEvents(filePath, stat.size);
-      const cached = this.titleCache.get(sessionId)!;
       const agent = buildAgent(filePath, stat.mtimeMs, events, cached);
       this.agents.set(agent.sessionId, agent);
       if (this._ready) this.scheduleEmit();
