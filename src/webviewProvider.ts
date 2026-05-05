@@ -64,6 +64,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   /** Forces a re-scan of session files and re-renders the sidebar. */
   refresh(): void {
+    this._view?.webview.postMessage({ command: 'reset' });
     void this.agentService.refresh();
   }
 

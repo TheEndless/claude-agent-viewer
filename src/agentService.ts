@@ -149,6 +149,7 @@ export class AgentService {
       this.agents.clear();
       this.titleCache.clear();
       this._ready = false;
+      if (this.watcher) { await this.watcher.close(); this.watcher = undefined; }
       await this.initialize();
     } catch (err) { logError('refresh', err); }
   }
