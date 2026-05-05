@@ -701,9 +701,15 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .todo-txt.done { text-decoration: line-through; opacity: 0.5; }
 .todo-txt.active { color: var(--vscode-focusBorder); }
 
-.lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 100; align-items: center; justify-content: center; cursor: zoom-out; }
+.lightbox { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.82); z-index: 100; align-items: center; justify-content: center; cursor: zoom-out; }
 .lightbox.open { display: flex; }
-.lightbox img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: 6px; }
+.lightbox img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: 6px; cursor: default; }
+.lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(255,255,255,0.12); border: none; color: #fff; font-size: 36px; line-height: 1; width: 44px; height: 64px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; opacity: 0.7; transition: opacity 0.15s, background 0.15s; z-index: 101; }
+.lb-nav:hover { opacity: 1; background: rgba(255,255,255,0.22); }
+.lb-nav:disabled { opacity: 0.15; cursor: default; }
+.lb-prev { left: 14px; }
+.lb-next { right: 14px; }
+.lb-counter { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.55); color: #fff; font-size: 11px; padding: 2px 10px; border-radius: 10px; pointer-events: none; }
 
 .bubble-raw { border-top: 1px solid color-mix(in srgb, var(--vscode-input-border) 60%, transparent); overflow: hidden; }
 .entry-raw.bubble-raw { border-top-color: color-mix(in srgb, currentColor 20%, transparent); }
@@ -800,7 +806,10 @@ body { display: flex; flex-direction: column; }
 </svg>
 
 <div class="lightbox" id="lightbox">
+  <button class="lb-nav lb-prev" id="lb-prev" title="Previous image">&#8249;</button>
   <img id="lightbox-img" src="" alt="">
+  <button class="lb-nav lb-next" id="lb-next" title="Next image">&#8250;</button>
+  <div class="lb-counter" id="lb-counter"></div>
 </div>
 
 ${toolbarHtml}
@@ -883,8 +892,9 @@ ${turnsHtml}
     }
     const img = ev.target.closest && ev.target.closest('.attach-image');
     if (img) {
-      document.getElementById('lightbox-img').src = img.querySelector('img').src;
-      document.getElementById('lightbox').classList.add('open');
+      const allImgs = Array.from(scroll.querySelectorAll('.attach-image img'));
+      const clicked = img.querySelector('img');
+      lbOpen(allImgs, allImgs.indexOf(clicked));
     }
   });
   function scrollToBottom() {
@@ -910,8 +920,45 @@ ${turnsHtml}
 
   jumpBtn && jumpBtn.addEventListener('click', () => scrollToBottom());
 
-  document.getElementById('lightbox').addEventListener('click', () => {
-    document.getElementById('lightbox').classList.remove('open');
+  // Gallery lightbox state
+  let lbImages = [];
+  let lbIndex = 0;
+  const lightbox = document.getElementById('lightbox');
+  const lbImg = document.getElementById('lightbox-img');
+  const lbCounter = document.getElementById('lb-counter');
+  const lbPrev = document.getElementById('lb-prev');
+  const lbNext = document.getElementById('lb-next');
+
+  function lbShow(idx) {
+    lbIndex = Math.max(0, Math.min(idx, lbImages.length - 1));
+    lbImg.src = lbImages[lbIndex].src;
+    lbImg.alt = lbImages[lbIndex].alt || '';
+    lbCounter.textContent = lbImages.length > 1 ? `${lbIndex + 1} / ${lbImages.length}` : '';
+    lbPrev.disabled = lbIndex === 0;
+    lbNext.disabled = lbIndex === lbImages.length - 1;
+    lbPrev.style.display = lbImages.length > 1 ? '' : 'none';
+    lbNext.style.display = lbImages.length > 1 ? '' : 'none';
+  }
+
+  function lbOpen(imgs, idx) {
+    lbImages = imgs;
+    lightbox.classList.add('open');
+    lbShow(idx);
+  }
+
+  function lbClose() { lightbox.classList.remove('open'); lbImg.src = ''; }
+
+  lightbox.addEventListener('click', (ev) => {
+    if (ev.target === lightbox || ev.target === lbImg) lbClose();
+  });
+  lbPrev.addEventListener('click', (ev) => { ev.stopPropagation(); lbShow(lbIndex - 1); });
+  lbNext.addEventListener('click', (ev) => { ev.stopPropagation(); lbShow(lbIndex + 1); });
+
+  document.addEventListener('keydown', (ev) => {
+    if (!lightbox.classList.contains('open')) return;
+    if (ev.key === 'ArrowLeft')  { lbShow(lbIndex - 1); ev.preventDefault(); }
+    if (ev.key === 'ArrowRight') { lbShow(lbIndex + 1); ev.preventDefault(); }
+    if (ev.key === 'Escape')     { lbClose(); }
   });
 
   let openEidsAtReplace = new Set();
