@@ -14,7 +14,8 @@ import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
 import { parseTranscript } from './transcriptParser';
 import { logError } from './logger';
 
-const md = new MarkdownIt({ html: false, linkify: true, typographer: true });
+const md     = new MarkdownIt({ html: false, linkify: true, typographer: true });
+const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: true, breaks: true });
 
 /** Derives the webview panel tab title from the session's best available name. */
 function transcriptTabTitle(agent: Agent): string {
@@ -303,7 +304,7 @@ function renderRawDetails(turn: Turn): string {
 /** Renders a user turn as a right-aligned chat bubble with optional attachments. */
 function renderUserTurn(turn: Turn): string {
   const attachHtml = turn.attachments.map(renderAttachment).join('');
-  const textHtml = turn.text ? md.render(turn.text) : '';
+  const textHtml = turn.text ? mdUser.render(turn.text) : '';
   const bubbleInner = (attachHtml ? `<div class="bubble-attachments">${attachHtml}</div>` : '') + textHtml;
   return `<div class="turn user">
     <div class="turn-head">
