@@ -441,8 +441,9 @@ function renderResultSection(result: TurnEntry): string {
   const markerIcon = result.isError
     ? '<svg class="result-marker-icon"><use href="#icon-warning"/></svg>'
     : '<svg class="result-marker-icon"><use href="#icon-return"/></svg>';
+  const caretIcon = '<svg class="result-caret"><use href="#icon-chevron"/></svg>';
   return `<div class="result-section${errorCls}">
-    <div class="result-label">${markerIcon}<span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${esc(preview)}</span>` : ''}</div>
+    <div class="result-label">${markerIcon}<span>${esc(result.label)}</span>${preview ? `<span class="p-preview">${esc(preview)}</span>` : ''}${caretIcon}</div>
     <div class="result-body ${bodyCls}">${bodyHtml}</div>
   </div>`;
 }
@@ -679,11 +680,16 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry-body-content.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
 .entry-body-content.raw pre { margin: 0; background: none; border: none; padding: 0; }
 .entry-body-content.raw code { font-family: inherit; background: none; border: none; padding: 0; color: var(--vscode-editor-foreground); }
-.result-section { margin-top: 8px; border-top: 1px solid var(--vscode-input-border); padding-top: 6px; }
-.result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; margin-bottom: 5px; }
+.result-section { margin-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); padding-top: 4px; }
+.result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; cursor: pointer; user-select: none; padding: 2px 0; }
+.result-label:hover { color: var(--vscode-foreground); }
+.result-caret { width: 10px; height: 10px; flex-shrink: 0; margin-left: auto; opacity: 0.5; transition: transform 0.15s; }
+.result-section.open .result-caret { transform: rotate(180deg); }
 .result-marker-icon { width: 11px; height: 11px; flex-shrink: 0; }
-.result-body { font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.5; max-height: 160px; overflow-y: auto; }
+.result-body { display: none; font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.5; max-height: 200px; overflow-y: auto; margin-top: 4px; }
+.result-section.open .result-body { display: block; }
 .result-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
+.result-body.raw pre { margin: 0; }
 .result-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; }
 .result-body.md p { margin: 0 0 0.3em; }
 .result-body.md p:last-child { margin: 0; }
@@ -853,6 +859,11 @@ ${turnsHtml}
     if (summary) {
       const details = summary.closest('details.bubble-raw');
       if (details && !details.open) renderRawBody(details); // open is old state at click time
+    }
+    const resultLabel = ev.target.closest && ev.target.closest('.result-label');
+    if (resultLabel) {
+      resultLabel.closest('.result-section')?.classList.toggle('open');
+      return;
     }
     const header = ev.target.closest && ev.target.closest('.entry-header');
     if (header) {
