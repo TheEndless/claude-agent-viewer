@@ -999,7 +999,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const { command, agents, ready, now } = event.data;
       if (command === 'reset') {
+        root.className = 'empty-global';
         root.innerHTML = 'Scanning…';
+        rootIsEmpty = true;
         projGroupEls.clear();
         cardEls.clear();
         archivedEl = null;
