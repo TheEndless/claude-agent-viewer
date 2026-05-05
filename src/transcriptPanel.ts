@@ -689,7 +689,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .result-body { display: none; font-size: 10.5px; color: var(--vscode-editor-foreground); line-height: 1.35; max-height: 200px; overflow-y: auto; margin-top: 3px; }
 .result-section.open .result-body { display: block; }
 .result-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
-.result-body.raw pre, .result-body.raw code { margin: 0; padding: 0; background: none; border: none; font-family: inherit; color: inherit; }
+.result-body.raw pre, .result-body.raw code { margin: 0; padding: 0; background: none; border: none; font-family: inherit; color: inherit; white-space: inherit; word-break: inherit; }
 .result-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
 .result-body.md p { margin: 0 0 0.3em; }
 .result-body.md p:last-child { margin: 0; }
