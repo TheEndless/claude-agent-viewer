@@ -655,9 +655,9 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .result-section.is-error .result-label { color: #f85149; }
 .result-section.is-error { border-top-color: color-mix(in srgb, #f85149 40%, transparent); }
 
-.entry-body { display: none; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+.entry-body { display: none; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
 .entry.open > .entry-body { display: block; }
-.entry-body-content { max-height: 200px; overflow-y: auto; padding: 6px 10px 8px; font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.5; }
+.entry-body-content { max-height: 180px; overflow-y: auto; padding: 5px 10px 5px; font-size: 11px; color: var(--vscode-editor-foreground); line-height: 1.4; }
 .entry-raw { border-radius: 0 0 7px 7px; border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
 
 .entry-body-content.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; }
@@ -680,16 +680,16 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .entry-body-content.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
 .entry-body-content.raw pre { margin: 0; background: none; border: none; padding: 0; }
 .entry-body-content.raw code { font-family: inherit; background: none; border: none; padding: 0; color: var(--vscode-editor-foreground); }
-.result-section { margin-top: 6px; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); padding-top: 4px; }
-.result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; cursor: pointer; user-select: none; padding: 2px 0; }
+.result-section { margin-top: 4px; border-top: 1px solid color-mix(in srgb, currentColor 10%, transparent); padding-top: 3px; }
+.result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; cursor: pointer; user-select: none; padding: 1px 0; }
 .result-label:hover { color: var(--vscode-foreground); }
 .result-caret { width: 10px; height: 10px; flex-shrink: 0; margin-left: auto; opacity: 0.5; transition: transform 0.15s; }
 .result-section.open .result-caret { transform: rotate(180deg); }
 .result-marker-icon { width: 11px; height: 11px; flex-shrink: 0; }
-.result-body { display: none; font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.5; max-height: 200px; overflow-y: auto; margin-top: 4px; }
+.result-body { display: none; font-size: 10.5px; color: var(--vscode-editor-foreground); line-height: 1.35; max-height: 180px; overflow-y: auto; margin-top: 3px; }
 .result-section.open .result-body { display: block; }
-.result-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre-wrap; word-break: break-all; }
-.result-body.raw pre { margin: 0; }
+.result-body.raw { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; word-break: normal; }
+.result-body.raw pre, .result-body.raw code { margin: 0; padding: 0; background: none; border: none; font-family: inherit; color: inherit; }
 .result-body.json { font-family: "Cascadia Code","Fira Code",Consolas,monospace; white-space: pre; }
 .result-body.md p { margin: 0 0 0.3em; }
 .result-body.md p:last-child { margin: 0; }
