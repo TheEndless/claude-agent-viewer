@@ -684,7 +684,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .result-label { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--vscode-symbolIcon-variableForeground); font-weight: 500; cursor: pointer; user-select: none; padding: 1px 0; }
 .result-label:hover { color: var(--vscode-foreground); }
 .result-caret { width: 10px; height: 10px; flex-shrink: 0; margin-left: auto; opacity: 0.5; transition: transform 0.15s; }
-.result-section.open .result-caret { transform: rotate(180deg); }
+.result-section.open .result-caret { transform: rotate(90deg); }
 .result-marker-icon { width: 11px; height: 11px; flex-shrink: 0; }
 .result-body { display: none; font-size: 10.5px; color: var(--vscode-editor-foreground); line-height: 1.35; max-height: 200px; overflow-y: auto; margin-top: 3px; }
 .result-section.open .result-body { display: block; }
