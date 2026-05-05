@@ -934,7 +934,7 @@ ${turnsHtml}
     lbImg.src = entry.src;
     lbImg.alt = entry.alt;
     const hasMultiple = lbImages.length > 1;
-    lbCounter.textContent = hasMultiple ? `${lbIndex + 1} / ${lbImages.length}` : '';
+    lbCounter.textContent = hasMultiple ? (lbIndex + 1) + ' / ' + lbImages.length : '';
     lbPrev.disabled = lbIndex === 0;
     lbNext.disabled = lbIndex === lbImages.length - 1;
   }
