@@ -507,7 +507,6 @@ function buildWebviewHtml(title: string): string {
   const toolbarHtml = `<div class="toolbar">
   <button class="tb-btn" id="tb-search-btn" title="Search (Ctrl+F)">\ud83d\udd0d Search</button>
   <input class="tb-search-input" id="tb-search-input" placeholder="Search\u2026" />
-  <span class="tb-spacer"></span>
   <button class="tb-btn tb-jump" id="tb-jump-btn" title="Jump to latest">\u2193 Latest</button>
   <button class="tb-btn" id="tb-export-btn" title="Export as markdown">\ud83d\udcbe Export</button>
 </div>`;
@@ -740,8 +739,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 }
 .tb-search-input.visible { display: block; }
 .tb-search-input:focus { border-color: var(--vscode-focusBorder); }
-.tb-spacer { flex: 1; }
-.tb-jump { display: none; }
+.tb-jump { display: none; margin-left: auto; }
 .tb-jump.visible { display: inline-block; }
 .search-highlight { background: rgba(255,215,0,0.3); border-radius: 2px; }
 .copy-btn {
@@ -857,7 +855,8 @@ ${turnsHtml}
 
   // Delegated click handling — attached once, works for any future content.
   scroll.addEventListener('click', (ev) => {
-    const copyBtn = ev.target.closest && ev.target.closest('.copy-btn');
+    const t = ev.target;
+    const copyBtn = t.closest?.('.copy-btn');
     if (copyBtn) {
       navigator.clipboard.writeText(copyBtn.dataset.copy || '').catch(() => {});
       const orig = copyBtn.textContent;
@@ -865,17 +864,17 @@ ${turnsHtml}
       setTimeout(() => { copyBtn.textContent = orig; }, 1200);
       return;
     }
-    const summary = ev.target.closest && ev.target.closest('summary');
+    const summary = t.closest?.('summary');
     if (summary) {
       const details = summary.closest('details.bubble-raw');
       if (details && !details.open) renderRawBody(details); // open is old state at click time
     }
-    const resultLabel = ev.target.closest && ev.target.closest('.result-label');
+    const resultLabel = t.closest?.('.result-label');
     if (resultLabel) {
       resultLabel.closest('.result-section')?.classList.toggle('open');
       return;
     }
-    const header = ev.target.closest && ev.target.closest('.entry-header');
+    const header = t.closest?.('.entry-header');
     if (header) {
       const entry = header.closest('.entry');
       if (entry) {
@@ -890,11 +889,11 @@ ${turnsHtml}
       }
       return;
     }
-    const img = ev.target.closest && ev.target.closest('.attach-image');
-    if (img) {
+    const imgWrap = t.closest?.('.attach-image');
+    if (imgWrap) {
       const allImgs = Array.from(scroll.querySelectorAll('.attach-image img'));
-      const clicked = img.querySelector('img');
-      lbOpen(allImgs, allImgs.indexOf(clicked));
+      const clicked = imgWrap.querySelector('img');
+      lbOpen(allImgs.map(el => ({ src: el.src, alt: el.alt })), allImgs.indexOf(clicked));
     }
   });
   function scrollToBottom() {
@@ -931,17 +930,20 @@ ${turnsHtml}
 
   function lbShow(idx) {
     lbIndex = Math.max(0, Math.min(idx, lbImages.length - 1));
-    lbImg.src = lbImages[lbIndex].src;
-    lbImg.alt = lbImages[lbIndex].alt || '';
-    lbCounter.textContent = lbImages.length > 1 ? `${lbIndex + 1} / ${lbImages.length}` : '';
+    const entry = lbImages[lbIndex];
+    lbImg.src = entry.src;
+    lbImg.alt = entry.alt;
+    const hasMultiple = lbImages.length > 1;
+    lbCounter.textContent = hasMultiple ? `${lbIndex + 1} / ${lbImages.length}` : '';
     lbPrev.disabled = lbIndex === 0;
     lbNext.disabled = lbIndex === lbImages.length - 1;
-    lbPrev.style.display = lbImages.length > 1 ? '' : 'none';
-    lbNext.style.display = lbImages.length > 1 ? '' : 'none';
   }
 
   function lbOpen(imgs, idx) {
     lbImages = imgs;
+    const hasMultiple = imgs.length > 1;
+    lbPrev.style.display = hasMultiple ? '' : 'none';
+    lbNext.style.display = hasMultiple ? '' : 'none';
     lightbox.classList.add('open');
     lbShow(idx);
   }
@@ -954,12 +956,6 @@ ${turnsHtml}
   lbPrev.addEventListener('click', (ev) => { ev.stopPropagation(); lbShow(lbIndex - 1); });
   lbNext.addEventListener('click', (ev) => { ev.stopPropagation(); lbShow(lbIndex + 1); });
 
-  document.addEventListener('keydown', (ev) => {
-    if (!lightbox.classList.contains('open')) return;
-    if (ev.key === 'ArrowLeft')  { lbShow(lbIndex - 1); ev.preventDefault(); }
-    if (ev.key === 'ArrowRight') { lbShow(lbIndex + 1); ev.preventDefault(); }
-    if (ev.key === 'Escape')     { lbClose(); }
-  });
 
   let openEidsAtReplace = new Set();
   window.addEventListener('message', e => {
@@ -1022,9 +1018,9 @@ ${turnsHtml}
   const searchInput = document.getElementById('tb-search-input');
 
   function clearHighlights() {
-    scroll.querySelectorAll('.search-highlight').forEach(el => {
-      el.replaceWith(document.createTextNode(el.textContent));
-    });
+    const marks = scroll.querySelectorAll('.search-highlight');
+    if (!marks.length) return;
+    marks.forEach(el => el.replaceWith(document.createTextNode(el.textContent)));
     scroll.normalize();
   }
 
@@ -1049,13 +1045,19 @@ ${turnsHtml}
     if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
+  let _hlTimer;
+  function highlightDebounced(query) {
+    clearTimeout(_hlTimer);
+    _hlTimer = setTimeout(() => highlightText(query), 200);
+  }
+
   searchBtn && searchBtn.addEventListener('click', () => {
     searchInput.classList.toggle('visible');
     if (searchInput.classList.contains('visible')) searchInput.focus();
     else { clearHighlights(); searchInput.value = ''; }
   });
 
-  searchInput && searchInput.addEventListener('input', () => highlightText(searchInput.value));
+  searchInput && searchInput.addEventListener('input', () => highlightDebounced(searchInput.value));
   searchInput && searchInput.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       clearHighlights(); searchInput.value = '';
@@ -1065,6 +1067,12 @@ ${turnsHtml}
   });
 
   document.addEventListener('keydown', (e) => {
+    if (lightbox.classList.contains('open')) {
+      if (e.key === 'ArrowLeft')  { lbShow(lbIndex - 1); e.preventDefault(); }
+      if (e.key === 'ArrowRight') { lbShow(lbIndex + 1); e.preventDefault(); }
+      if (e.key === 'Escape')     { lbClose(); }
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
       e.preventDefault();
       if (searchInput) { searchInput.classList.add('visible'); searchInput.focus(); }
