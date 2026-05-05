@@ -139,15 +139,17 @@ export class AgentService {
   }
 
   /**
-   * Scans the projects directory for any new session files not yet tracked,
-   * then re-processes all known files to pick up any changes. Fires onDidChange
-   * when complete. Used by the sidebar refresh button.
+   * Full reset: clears all in-memory state and re-runs the initial scan from
+   * scratch. Used by the sidebar refresh button so the view is guaranteed to
+   * reflect the current filesystem state with no stale entries.
    */
   async refresh(): Promise<void> {
     try {
-      const allFiles = await findJsonlFiles(PROJECTS_ROOT);
-      await Promise.all(allFiles.map(f => this.processFile(f)));
-      this.scheduleEmit();
+      if (this.debounceTimer) { clearTimeout(this.debounceTimer); this.debounceTimer = undefined; }
+      this.agents.clear();
+      this.titleCache.clear();
+      this._ready = false;
+      await this.initialize();
     } catch (err) { logError('refresh', err); }
   }
 
