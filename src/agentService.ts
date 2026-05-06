@@ -23,8 +23,10 @@ const TAIL_BYTES = 64 * 1024;
 const RUNNING_WINDOW_MS = 5 * 60 * 1000;
 const DONE_AGE_MS = 6 * 60 * 60 * 1000;
 const DEBOUNCE_MS = 200;
-const STATE_TICK_MS = 5000;
-const DISCOVERY_TICK_MS = 30_000;
+const STATE_TICK_MS         =  5_000;   // tick rate while panel is visible
+const STATE_TICK_MS_HIDDEN  = 60_000;   // tick rate while panel is hidden
+const DISCOVERY_TICK_MS         = 30_000;
+const DISCOVERY_TICK_MS_HIDDEN  = 120_000;
 
 /** Cached session name fields scanned from the full transcript file. */
 interface TitleCache {
@@ -61,6 +63,25 @@ export class AgentService {
 
   /** Returns true once the initial scan of the projects directory has completed. */
   isReady(): boolean { return this._ready; }
+
+  /**
+   * Called by the webview provider when the sidebar panel's visibility changes.
+   * Slows background timers when hidden to reduce idle overhead, and immediately
+   * emits the current state when the panel becomes visible again.
+   */
+  setVisible(visible: boolean): void {
+    if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
+    this.tickTimer = setInterval(
+      () => this.scheduleEmit('tick'),
+      visible ? STATE_TICK_MS : STATE_TICK_MS_HIDDEN,
+    );
+    this.discoveryTimer = setInterval(
+      () => void this.discoverNewFiles(),
+      visible ? DISCOVERY_TICK_MS : DISCOVERY_TICK_MS_HIDDEN,
+    );
+    if (visible) this.scheduleEmit();
+  }
 
   /** Begins the initial directory scan and starts the file watcher. */
   start(): void {

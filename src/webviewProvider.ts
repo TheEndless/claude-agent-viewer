@@ -35,15 +35,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage((message) => this.handleMessage(message));
 
     webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) this.postAgents();
+      this.agentService.setVisible(webviewView.visible);
     });
 
     webviewView.onDidDispose(() => {
+      this.agentService.setVisible(false);
       this._subscription?.dispose();
     });
 
     const d1 = this.agentService.onDidChange((agents) => {
-      this.postAgents();
+      if (webviewView.visible) this.postAgents();
       updateTranscriptPanels(agents);
     });
     const d2 = this.agentService.onDidDrop((sessionId) => evict(sessionId));
