@@ -65,6 +65,11 @@ export function openTranscriptPreview(agent: Agent): void {
     renderedCount.delete(agent.sessionId);
     parseCache.delete(agent.sessionId);
   });
+  // When the panel becomes visible after being hidden, catch up on any
+  // updates that were skipped while it was in the background.
+  panel.onDidChangeViewState(({ webviewPanel }) => {
+    if (webviewPanel.visible) void sendTurnsUpdate(webviewPanel.webview, agent);
+  });
   // Show shell immediately — content loads once webview signals ready.
   panel.webview.html = buildWebviewHtml(agent.projectName);
   panel.webview.onDidReceiveMessage(async (msg) => {
@@ -96,7 +101,7 @@ export function openTranscriptPreview(agent: Agent): void {
 export function updateTranscriptPanels(agents: Agent[]): void {
   for (const agent of agents) {
     const panel = openPanels.get(agent.sessionId);
-    if (!panel) continue;
+    if (!panel || !panel.visible) continue;
     const cached = parseCache.get(agent.sessionId);
     if (cached && cached.mtimeMs === agent.mtimeMs) continue;
     void sendTurnsUpdate(panel.webview, agent);
