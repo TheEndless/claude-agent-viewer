@@ -15,7 +15,6 @@ import { findAgentPids, killAgent } from './processService';
 import { openTranscriptPreview, evict, updateTranscriptPanels } from './transcriptPanel';
 import { logError } from './logger';
 
-const AUTO_REFRESH_INTERVAL = 5000;
 
 /**
  * VS Code WebviewViewProvider for the Agent Viewer sidebar panel.
@@ -24,7 +23,6 @@ const AUTO_REFRESH_INTERVAL = 5000;
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'agentViewer.panel';
   private _view?: vscode.WebviewView;
-  private _refreshTimer?: ReturnType<typeof setInterval>;
   private _subscription?: vscode.Disposable;
 
   constructor(private readonly agentService: AgentService) {}
@@ -37,16 +35,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage((message) => this.handleMessage(message));
 
     webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) {
-        this.startAutoRefresh();
-        this.postAgents();
-      } else {
-        this.stopAutoRefresh();
-      }
+      if (webviewView.visible) this.postAgents();
     });
 
     webviewView.onDidDispose(() => {
-      this.stopAutoRefresh();
       this._subscription?.dispose();
     });
 
@@ -59,7 +51,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this.getHtml();
     this.postAgents();
-    this.startAutoRefresh();
   }
 
   /** Forces a re-scan of session files and re-renders the sidebar. */
@@ -187,17 +178,6 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private startAutoRefresh(): void {
-    this.stopAutoRefresh();
-    this._refreshTimer = setInterval(() => this.postAgents(), AUTO_REFRESH_INTERVAL);
-  }
-
-  private stopAutoRefresh(): void {
-    if (this._refreshTimer) {
-      clearInterval(this._refreshTimer);
-      this._refreshTimer = undefined;
-    }
-  }
 
   /** Returns the full HTML for the sidebar webview, including all CSS and JS for the agent card UI. */
   private getHtml(): string {

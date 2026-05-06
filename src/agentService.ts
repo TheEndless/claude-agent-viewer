@@ -49,6 +49,9 @@ export class AgentService {
   // Pending unlink timers keyed by file path. An 'add' event for the same path
   // cancels the timer before it fires, handling atomic-write rename sequences.
   private pendingDrops = new Map<string, NodeJS.Timeout>();
+  // Per-file debounce timers for 'change' events — avoids processing the same
+  // file on every individual write when Claude Code is actively running.
+  private changeDebounce = new Map<string, NodeJS.Timeout>();
   private _ready = false;
   private _onDidChange = new vscode.EventEmitter<Agent[]>();
   readonly onDidChange = this._onDidChange.event;
@@ -117,7 +120,9 @@ export class AgentService {
       ignoreInitial: true,
       persistent: true,
       alwaysStat: true,
-      awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
+      // No awaitWriteFinish — its internal polling (50ms intervals) is too
+      // aggressive when Claude Code is actively writing. Our parser already
+      // skips malformed partial lines, so we don't need write-stability checks.
     });
     this.watcher
       .on('add',    (p, stats) => {
@@ -126,7 +131,17 @@ export class AgentService {
         if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
         void this.processFile(p, stats);
       })
-      .on('change', (p, stats) => { void this.processFile(p, stats); })
+      .on('change', (p, stats) => {
+        // Debounce per-file: Claude Code writes many lines per second during
+        // active sessions. Process once after writes settle rather than on
+        // every individual write event.
+        const existing = this.changeDebounce.get(p);
+        if (existing) clearTimeout(existing);
+        this.changeDebounce.set(p, setTimeout(() => {
+          this.changeDebounce.delete(p);
+          void this.processFile(p, stats);
+        }, 500));
+      })
       .on('unlink', (p)        => {
         // Defer removal to absorb atomic rename (unlink → add within ~500ms).
         const t = setTimeout(() => {
@@ -146,6 +161,8 @@ export class AgentService {
   async refresh(): Promise<void> {
     try {
       if (this.debounceTimer) { clearTimeout(this.debounceTimer); this.debounceTimer = undefined; }
+      for (const t of this.changeDebounce.values()) clearTimeout(t);
+      this.changeDebounce.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._ready = false;
@@ -271,6 +288,8 @@ export class AgentService {
     if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     for (const t of this.pendingDrops.values()) clearTimeout(t);
     this.pendingDrops.clear();
+    for (const t of this.changeDebounce.values()) clearTimeout(t);
+    this.changeDebounce.clear();
     this.watcher?.close();
     this._onDidChange.dispose();
     this._onDidDrop.dispose();
