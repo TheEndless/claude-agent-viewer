@@ -8,11 +8,11 @@
  */
 
 import * as vscode from 'vscode';
-import * as fsp from 'fs/promises';
 import MarkdownIt from 'markdown-it';
 import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
-import { parseTranscript } from './transcriptParser';
+import { parseTranscriptWithState, parseTranscriptDelta, ParseState } from './transcriptParser';
 import { logError } from './logger';
+import { readFileSlice } from './fileUtils';
 
 const md     = new MarkdownIt({ html: false, linkify: true, typographer: true });
 const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: true, breaks: true });
@@ -25,31 +25,42 @@ function transcriptTabTitle(agent: Agent): string {
 }
 
 /** Valid modes for webview update messages. */
-type IpcMode = 'replace' | 'append' | 'prepend' | 'diag';
+type IpcMode = 'replace' | 'append' | 'prepend' | 'diag' | 'replace_last_turn';
 
 /** Posts an update message to the webview with a compile-time-checked mode. */
 function postUpdate(webview: vscode.Webview, html: string, mode: IpcMode): void {
   webview.postMessage({ command: 'update', html, mode });
 }
 
-const parseCache = new Map<string, { turns: Turn[]; mtimeMs: number }>();
+// Keyed by sessionId → { turns, size, state }. Invalidated by file size change (not mtime),
+// since JSONL files are append-only — size unchanged means no new content.
+// `state` carries the parser's mid-turn context so subsequent reads only need
+// to process new bytes rather than re-parsing the whole file.
+const parseCache = new Map<string, { turns: Turn[]; size: number; state: ParseState }>();
 const openPanels = new Map<string, vscode.WebviewPanel>();
 // Number of turns we have already rendered into each panel's webview.
 // Used to append only newly-added turns on subsequent updates instead of
 // wiping and re-chunking the whole transcript every time a message arrives.
 const renderedCount = new Map<string, number>();
+// Coalescing guards for per-panel async updates. When a sendTurnsUpdate is running
+// and a newer agent arrives (e.g. from a rapid onDidChange burst), we store it here
+// and re-run once the current update finishes — preventing pile-up under load.
+const panelInflight = new Set<string>();
+const panelLatestAgent = new Map<string, { webview: vscode.Webview; agent: Agent }>();
+// Tracks the agent.mtimeMs at the time of the last completed render per panel.
+// updateTranscriptPanels skips queueing a re-render when mtime hasn't advanced,
+// eliminating unnecessary stat()+readFile() calls on panels that are already current.
+const lastRenderedMtime = new Map<string, number>();
 
 /**
  * Opens (or reveals) the transcript preview panel for the given agent.
- * Forces a fresh parse of the transcript file on each explicit open to avoid
- * serving stale cached turns after the file has been replaced.
+ * Cache is left intact for re-reveals so the panel shows content immediately;
+ * the size-based guard in getTurns handles detecting new content.
  */
 export function openTranscriptPreview(agent: Agent): void {
-  // Force fresh read on explicit user action — bypass any stale cache entry.
-  parseCache.delete(agent.sessionId);
   const existing = openPanels.get(agent.sessionId);
   if (existing) {
-    void sendTurnsUpdate(existing.webview, agent);
+    queuePanelUpdate(agent.sessionId, existing.webview, agent);
     existing.reveal(vscode.ViewColumn.One);
     return;
   }
@@ -64,17 +75,22 @@ export function openTranscriptPreview(agent: Agent): void {
     openPanels.delete(agent.sessionId);
     renderedCount.delete(agent.sessionId);
     parseCache.delete(agent.sessionId);
+    panelInflight.delete(agent.sessionId);
+    panelLatestAgent.delete(agent.sessionId);
+    lastRenderedMtime.delete(agent.sessionId);
   });
   // When the panel becomes visible after being hidden, catch up on any
   // updates that were skipped while it was in the background.
   panel.onDidChangeViewState(({ webviewPanel }) => {
-    if (webviewPanel.visible) void sendTurnsUpdate(webviewPanel.webview, agent);
+    if (webviewPanel.visible) queuePanelUpdate(agent.sessionId, webviewPanel.webview, agent);
   });
   // Show shell immediately — content loads once webview signals ready.
-  panel.webview.html = buildWebviewHtml(agent.projectName);
+  panel.webview.html = buildWebviewHtml(agent);
   panel.webview.onDidReceiveMessage(async (msg) => {
     if (msg.command === 'exportMarkdown') {
       await handleExportMarkdown(agent, panel);
+    } else if (msg.command === 'openJsonl') {
+      await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(agent.transcriptPath));
     }
   });
   renderedCount.delete(agent.sessionId);
@@ -84,27 +100,66 @@ export function openTranscriptPreview(agent: Agent): void {
   let sub: vscode.Disposable;
   const fallbackTimer = setTimeout(() => {
     sub.dispose();
-    void sendTurnsUpdate(panel.webview, agent);
+    queuePanelUpdate(agent.sessionId, panel.webview, agent);
   }, 10_000);
   sub = panel.webview.onDidReceiveMessage((msg) => {
     if (msg.command !== 'ready') return;
     clearTimeout(fallbackTimer);
     sub.dispose();
-    void sendTurnsUpdate(panel.webview, agent);
+    queuePanelUpdate(agent.sessionId, panel.webview, agent);
   });
+}
+
+/** Enqueues an update for a panel, starting the drain loop if not already running. */
+function queuePanelUpdate(sessionId: string, webview: vscode.Webview, agent: Agent): void {
+  panelLatestAgent.set(sessionId, { webview, agent });
+  if (!panelInflight.has(sessionId)) {
+    void drainPanelUpdate(sessionId);
+  }
 }
 
 /**
  * Called by the sidebar provider whenever the agent list changes.
- * Refreshes any open transcript panels whose underlying file has a new mtime.
+ * Refreshes any open transcript panels; guards on file size (not mtime) to skip no-op parses.
+ * Uses per-panel coalescing: if an update is already running for a panel, the latest
+ * agent is stored and rendered once the current update finishes.
  */
 export function updateTranscriptPanels(agents: Agent[]): void {
   for (const agent of agents) {
     const panel = openPanels.get(agent.sessionId);
     if (!panel || !panel.visible) continue;
-    const cached = parseCache.get(agent.sessionId);
-    if (cached && cached.mtimeMs === agent.mtimeMs) continue;
-    void sendTurnsUpdate(panel.webview, agent);
+    // Skip if the file hasn't grown since we last rendered this panel.
+    // agent.mtimeMs is updated by agentService on every processFile, so this
+    // guard is a zero-I/O way to avoid unnecessary stat+readFile calls.
+    if (agent.mtimeMs === lastRenderedMtime.get(agent.sessionId)) continue;
+    queuePanelUpdate(agent.sessionId, panel.webview, agent);
+  }
+}
+
+/**
+ * Drains the coalescing queue for a single panel: runs sendTurnsUpdate with the
+ * latest stored agent, then loops if another update arrived while it was running.
+ */
+async function drainPanelUpdate(sessionId: string): Promise<void> {
+  panelInflight.add(sessionId);
+  try {
+    while (panelLatestAgent.has(sessionId)) {
+      const { webview, agent } = panelLatestAgent.get(sessionId)!;
+      panelLatestAgent.delete(sessionId);
+      try {
+        await sendTurnsUpdate(webview, agent);
+        // Stamp mtime only on success — transient failures (I/O error, lock contention)
+        // should not lock the panel out of retrying on the next tick.
+        lastRenderedMtime.set(sessionId, agent.mtimeMs);
+      } catch (err) {
+        logError('sendTurnsUpdate', err);
+        // Show an error state so the panel doesn't stay on "Loading…" forever.
+        // mtime is intentionally NOT stamped here so the next file change retries.
+        postUpdate(webview, '<div class="empty-state">Error loading transcript.</div>', 'replace');
+      }
+    }
+  } finally {
+    panelInflight.delete(sessionId);
   }
 }
 
@@ -114,7 +169,7 @@ export function updateTranscriptPanels(agents: Agent[]): void {
  * tail-first flush; on subsequent updates it appends only the new turns.
  */
 async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<void> {
-  const { turns, bytes } = await getTurns(agent);
+  const { turns, bytes, lastTurnUpdated } = await getTurns(agent);
   if (turns.length === 0) {
     postUpdate(webview, '<div class="empty-state">No turns found in this transcript.</div>', 'replace');
     renderedCount.set(agent.sessionId, 0);
@@ -133,6 +188,15 @@ async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<v
     // Initial or full re-render: pass diagHtml into flushInChunks so it can be
     // combined with the first chunk — keeps "Loading…" visible until real content arrives.
     await flushInChunks(webview, turns, 0, diagHtml);
+  } else if (lastTurnUpdated && prev > 0) {
+    // The previously-rendered last turn was extended by the delta (e.g. tool results
+    // arrived for an in-progress assistant turn). Replace it in the DOM, then append
+    // any turns that came after it.
+    postUpdate(webview, renderTurn(turns[prev - 1]), 'replace_last_turn');
+    if (turns.length > prev) {
+      await flushInChunks(webview, turns, prev);
+    }
+    postUpdate(webview, diagHtml, 'diag');
   } else if (turns.length > prev) {
     // Incremental: append only the new turns, update diag in place.
     await flushInChunks(webview, turns, prev);
@@ -144,7 +208,7 @@ async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<v
   renderedCount.set(agent.sessionId, turns.length);
 }
 
-const CHUNK_BYTE_LIMIT = 4_000_000; // 4 MB per chunk — fewer IPC round-trips.
+const CHUNK_BYTE_LIMIT = 512_000; // 512 KB per chunk — keeps extension host responsive between yields.
 const INITIAL_TAIL = 30;            // render last N turns first for fast initial display.
 
 /**
@@ -209,6 +273,15 @@ async function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: n
 /** Formats the agent's transcript as markdown and prompts the user to save it. */
 async function handleExportMarkdown(agent: Agent, panel: vscode.WebviewPanel): Promise<void> {
   try {
+    // Show the save dialog first so the user gets immediate feedback — reading and
+    // parsing the transcript (potentially megabytes of JSONL) happens afterward.
+    const saveUri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(`${agent.projectName}-transcript.md`),
+      filters: { Markdown: ['md'] },
+      title: 'Export transcript as Markdown',
+    });
+    if (!saveUri) return;
+
     const { turns } = await getTurns(agent);
     const d = agent.details;
     const title = d.customTitle || d.aiTitle || d.latestUserPrompt || agent.sessionId.slice(0, 8);
@@ -233,12 +306,6 @@ async function handleExportMarkdown(agent: Agent, panel: vscode.WebviewPanel): P
       }
     }
 
-    const saveUri = await vscode.window.showSaveDialog({
-      defaultUri: vscode.Uri.file(`${agent.projectName}-transcript.md`),
-      filters: { Markdown: ['md'] },
-      title: 'Export transcript as Markdown',
-    });
-    if (!saveUri) return;
     await fsp.writeFile(saveUri.fsPath, lines.join('\n'), 'utf-8');
     vscode.window.showInformationMessage(`Transcript exported to ${saveUri.fsPath}`);
   } catch (err) {
@@ -251,33 +318,67 @@ async function handleExportMarkdown(agent: Agent, panel: vscode.WebviewPanel): P
 export function evict(sessionId: string): void {
   parseCache.delete(sessionId);
   renderedCount.delete(sessionId);
+  panelInflight.delete(sessionId);
+  panelLatestAgent.delete(sessionId);
+  lastRenderedMtime.delete(sessionId);
   const panel = openPanels.get(sessionId);
   if (panel) { panel.dispose(); openPanels.delete(sessionId); }
 }
 
 /**
- * Returns parsed turns for the agent, using a mtime-keyed cache to avoid
- * re-parsing unchanged files. Stats the file directly to get the current mtime
- * since agent.mtimeMs may lag slightly behind chokidar events.
+ * Returns parsed turns for the agent. On the first call (or after a cache miss)
+ * it reads the whole file; on subsequent calls it reads only the bytes appended
+ * since the last parse, carrying parser state forward to handle in-progress turns.
+ *
+ * Returns `lastTurnUpdated: true` when the previously-cached final turn was an
+ * in-progress assistant turn that the delta extended — the caller should replace
+ * the last rendered turn in the webview rather than appending.
  */
-async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number }> {
-  // Stat the file directly to get the current mtime, since agent.mtimeMs may be
-  // stale between file writes and chokidar events.
-  let realMtime = agent.mtimeMs;
+async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number; lastTurnUpdated: boolean }> {
   let bytes = 0;
   try {
     const stat = await fsp.stat(agent.transcriptPath);
-    realMtime = stat.mtimeMs;
     bytes = stat.size;
   } catch (err) { logError(`getTurns stat(${agent.transcriptPath})`, err); }
+
   const cached = parseCache.get(agent.sessionId);
-  if (cached && cached.mtimeMs === realMtime) return { turns: cached.turns, bytes };
+  if (cached && cached.size === bytes) return { turns: cached.turns, bytes, lastTurnUpdated: false };
+
+  if (cached && bytes > cached.size) {
+    // Fast path: only read the bytes appended since the last parse.
+    try {
+      const rawDelta = await readFileSlice(agent.transcriptPath, cached.size, bytes - cached.size);
+      // Trim to the last newline so we never pass a partial JSONL line to the parser.
+      // The untrimmed tail will be included in the next delta read.
+      const lastNl = rawDelta.lastIndexOf('\n');
+      const deltaText = lastNl >= 0 ? rawDelta.slice(0, lastNl + 1) : '';
+      const safeBytes = cached.size + (lastNl >= 0 ? lastNl + 1 : 0);
+      if (!deltaText) return { turns: cached.turns, bytes: cached.size, lastTurnUpdated: false };
+      const hadInProgress = cached.state.currentAssistant !== null;
+      const { turns: deltaTurns, state } = parseTranscriptDelta(deltaText, cached.state);
+      // When the prior state had an in-progress turn, it is the last element of
+      // cached.turns; the delta returns it as deltaTurns[0] (possibly extended).
+      // Replace it rather than appending so the turn count stays consistent.
+      const mergedTurns = hadInProgress && deltaTurns.length > 0
+        ? [...cached.turns.slice(0, -1), ...deltaTurns]
+        : [...cached.turns, ...deltaTurns];
+      // Store safeBytes (last-newline boundary), not raw bytes, so the next delta
+      // starts from a known complete-line offset rather than possibly mid-write.
+      parseCache.set(agent.sessionId, { turns: mergedTurns, size: safeBytes, state });
+      return { turns: mergedTurns, bytes: safeBytes, lastTurnUpdated: hadInProgress && deltaTurns.length > 0 };
+    } catch (err) {
+      logError(`getTurns delta(${agent.transcriptPath})`, err);
+      // Fall through to full re-parse on error.
+    }
+  }
+
+  // Full parse: first load, cache miss, or delta error fallback.
   let text: string;
   try { text = await fsp.readFile(agent.transcriptPath, 'utf-8'); }
-  catch (err) { logError(`getTurns readFile(${agent.transcriptPath})`, err); return { turns: [], bytes: 0 }; }
-  const turns = parseTranscript(text);
-  parseCache.set(agent.sessionId, { turns, mtimeMs: realMtime });
-  return { turns, bytes };
+  catch (err) { logError(`getTurns readFile(${agent.transcriptPath})`, err); return { turns: [], bytes: 0, lastTurnUpdated: false }; }
+  const { turns, state } = await parseTranscriptWithState(text);
+  parseCache.set(agent.sessionId, { turns, size: bytes, state });
+  return { turns, bytes, lastTurnUpdated: false };
 }
 
 /** Escapes a string for safe embedding in HTML attribute values and text content. */
@@ -508,13 +609,17 @@ function renderAttachment(att: TurnAttachment): string {
 }
 
 /** Returns the full HTML shell for the transcript webview panel, including all CSS and JS. */
-function buildWebviewHtml(title: string): string {
+function buildWebviewHtml(agent: Agent): string {
+  const { projectName: title, transcriptPath, sessionId } = agent;
   const turnsHtml = '<div class="empty-state loading">Loading\u2026</div>';
   const toolbarHtml = `<div class="toolbar">
   <button class="tb-btn" id="tb-search-btn" title="Search (Ctrl+F)">\ud83d\udd0d Search</button>
   <input class="tb-search-input" id="tb-search-input" placeholder="Search\u2026" />
   <button class="tb-btn tb-jump" id="tb-jump-btn" title="Jump to latest">\u2193 Latest</button>
   <button class="tb-btn" id="tb-export-btn" title="Export as markdown">\ud83d\udcbe Export</button>
+  <button class="tb-btn tb-copy" data-copy="${esc(transcriptPath)}" title="Copy file path">\ud83d\udccb Path</button>
+  <button class="tb-btn tb-copy" data-copy="${esc(sessionId)}" title="Copy session ID">\ud83d\udd11 Session ID</button>
+  <button class="tb-btn" id="tb-open-jsonl-btn" title="Open JSONL in editor">\ud83d\udcc2 Open JSONL</button>
 </div>`;
 
   return `<!DOCTYPE html>
@@ -966,7 +1071,7 @@ ${turnsHtml}
   let openEidsAtReplace = new Set();
   window.addEventListener('message', e => {
     if (e.data?.command !== 'update') return;
-    if (!['replace', 'append', 'prepend', 'diag'].includes(e.data.mode)) return;
+    if (!['replace', 'append', 'prepend', 'diag', 'replace_last_turn'].includes(e.data.mode)) return;
     const wasAtBottom = !userScrolled;
     if (e.data.mode === 'diag') {
       // Replace just the diagnostic banner, leave content intact.
@@ -978,6 +1083,28 @@ ${turnsHtml}
         if (fresh) existing.replaceWith(fresh);
       }
       stampTimestamps();
+      return;
+    }
+    if (e.data.mode === 'replace_last_turn') {
+      const allTurns = scroll.querySelectorAll('.turn');
+      const lastTurn = allTurns[allTurns.length - 1];
+      if (lastTurn) {
+        const openEids = new Set([...lastTurn.querySelectorAll('.entry.open[data-eid]')].map(el => el.getAttribute('data-eid')));
+        const tmp = document.createElement('div');
+        tmp.innerHTML = e.data.html;
+        const newTurn = tmp.firstElementChild;
+        if (newTurn) {
+          if (openEids.size > 0) {
+            newTurn.querySelectorAll('.entry[data-eid]').forEach(el => {
+              if (openEids.has(el.getAttribute('data-eid'))) el.classList.add('open');
+            });
+          }
+          lastTurn.replaceWith(newTurn);
+        }
+      }
+      stampTimestamps();
+      if (wasAtBottom) scrollToBottom();
+      updateJumpVisibility();
       return;
     }
     if (e.data.mode === 'replace') {
@@ -1088,6 +1215,17 @@ ${turnsHtml}
   const vscode = acquireVsCodeApi();
   document.getElementById('tb-export-btn')?.addEventListener('click', () => {
     vscode.postMessage({ command: 'exportMarkdown' });
+  });
+  document.getElementById('tb-open-jsonl-btn')?.addEventListener('click', () => {
+    vscode.postMessage({ command: 'openJsonl' });
+  });
+  document.querySelectorAll('.tb-copy').forEach(btn => {
+    btn.addEventListener('click', () => {
+      navigator.clipboard.writeText(btn.dataset.copy || '').catch(() => {});
+      const orig = btn.textContent;
+      btn.textContent = '✓ Copied';
+      setTimeout(() => { btn.textContent = orig; }, 1400);
+    });
   });
   vscode.postMessage({ command: 'ready' });
 </script>

@@ -4,10 +4,9 @@
  * Parses Claude Code JSONL transcript files into a structured Turn[] array
  * suitable for rendering in the agent viewer webview.
  *
- * Each line of input is a JSON event emitted by the Claude Code CLI.
- * The parser handles assistant, user, and result event types, collapsing
- * tool_result user messages onto the preceding assistant turn rather than
- * creating spurious user turns.
+ * Supports both full-file parsing and incremental delta parsing so that
+ * subsequent updates only need to process the bytes appended since the last
+ * parse, rather than re-reading the whole (potentially large) file.
  */
 
 import * as path from 'path';
@@ -30,35 +29,37 @@ interface ParsedEvent {
 }
 
 /**
- * Parse a JSONL transcript string into an ordered array of conversation turns.
- *
- * Rules:
- * - Malformed lines are silently skipped.
- * - User messages whose content is exclusively tool_result blocks are merged
- *   into the preceding assistant turn rather than creating a new user turn.
- * - "result" / "summary" events are attached as system entries to the
- *   preceding assistant turn, or become a synthetic assistant turn if none exists.
+ * Mutable parser state that can be carried between incremental parse calls.
+ * Allows resuming exactly where a prior parse left off without re-reading
+ * already-processed content.
  */
-export function parseTranscript(jsonlText: string): Turn[] {
-  const events: ParsedEvent[] = [];
-  const rawLines: string[] = [];
-  for (const rawLine of jsonlText.split('\n')) {
-    if (!rawLine.trim()) continue;
-    try {
-      events.push(JSON.parse(rawLine));
-      rawLines.push(rawLine);
-    } catch {
-      // skip malformed lines
-    }
-  }
+export interface ParseState {
+  /** The assistant turn currently being assembled, or null if between turns. */
+  currentAssistant: Turn | null;
+  /** Tool_use entries awaiting a matching tool_result, keyed by tool_use id. */
+  pendingToolUse: Map<string, { entry: TurnEntry; toolName: string }>;
+  /** Running count of assistant turns seen so far. */
+  assistantIndex: number;
+}
 
+function emptyState(): ParseState {
+  return { currentAssistant: null, pendingToolUse: new Map(), assistantIndex: 0 };
+}
+
+/**
+ * Core line-by-line parser. Processes `jsonlText` starting from `initState`
+ * and returns the turns produced plus the final parser state.
+ *
+ * When `initState.currentAssistant` is non-null, the first events in
+ * `jsonlText` are treated as continuations of that in-progress turn (e.g.
+ * tool_result blocks for its pending tool_use entries).
+ */
+function parseLines(jsonlText: string, initState: ParseState): { turns: Turn[]; state: ParseState } {
   const turns: Turn[] = [];
-  let currentAssistant: Turn | null = null;
-  let assistantIndex = 0;
-
-  // Maps tool_use id -> { entry, toolName } so tool_result labels can reference
-  // the originating tool name and hook summaries can be attached.
-  const pendingToolUse = new Map<string, { entry: TurnEntry; toolName: string }>();
+  let currentAssistant: Turn | null = initState.currentAssistant;
+  // Shallow-copy so mutations don't affect the caller's state reference.
+  const pendingToolUse = new Map(initState.pendingToolUse);
+  let assistantIndex = initState.assistantIndex;
 
   const attachSystemEntry = (entry: TurnEntry): void => {
     if (currentAssistant) {
@@ -68,9 +69,10 @@ export function parseTranscript(jsonlText: string): Turn[] {
     }
   };
 
-  for (let i = 0; i < events.length; i++) {
-    const event = events[i];
-    const rawLine = rawLines[i];
+  for (const rawLine of jsonlText.split('\n')) {
+    if (!rawLine.trim()) continue;
+    let event: ParsedEvent;
+    try { event = JSON.parse(rawLine); } catch { continue; }
     const ts = typeof event.timestamp === 'string' ? event.timestamp : new Date().toISOString();
     const role = event.message?.role;
 
@@ -102,23 +104,10 @@ export function parseTranscript(jsonlText: string): Turn[] {
         attachSystemEntry({ kind: 'system', label: `${hookEvent} Hook · ${hookScriptName(command)}`, timestamp: ts, body, rawJson: rawLine });
       } else if (attType === 'hook_non_blocking_error') {
         const msg = String(att.error ?? att.message ?? att.stderr ?? JSON.stringify(att));
-        attachSystemEntry({
-          kind: 'system',
-          label: `Hook error · ${hookEvent || 'unknown'}`,
-          timestamp: ts,
-          body: msg,
-          isError: true,
-          rawJson: rawLine,
-        });
+        attachSystemEntry({ kind: 'system', label: `Hook error · ${hookEvent || 'unknown'}`, timestamp: ts, body: msg, isError: true, rawJson: rawLine });
       } else if (attType === 'hook_system_message') {
         const msg = String(att.message ?? att.content ?? JSON.stringify(att));
-        attachSystemEntry({
-          kind: 'system',
-          label: `Hook · ${hookEvent || 'system message'}`,
-          timestamp: ts,
-          body: msg,
-          rawJson: rawLine,
-        });
+        attachSystemEntry({ kind: 'system', label: `Hook · ${hookEvent || 'system message'}`, timestamp: ts, body: msg, rawJson: rawLine });
       }
       // Other attachment types (todo_reminder, auto_mode, file-history, etc.) are internal metadata — skip.
       continue;
@@ -127,61 +116,32 @@ export function parseTranscript(jsonlText: string): Turn[] {
     // ── System events with subtypes ────────────────────────────────────────────
     if (event.type === 'system') {
       const subtype = typeof event.subtype === 'string' ? event.subtype : '';
-      if (subtype === 'stop_hook_summary') continue;  // hook_success attachment carries the data
+      if (subtype === 'stop_hook_summary') continue;
       if (subtype === 'compact_boundary') {
         const meta = (event as { compactMetadata?: unknown }).compactMetadata;
-        attachSystemEntry({
-          kind: 'system',
-          label: 'Context compacted',
-          timestamp: ts,
-          body: typeof meta === 'object' && meta !== null ? JSON.stringify(meta, null, 2) : '',
-          rawJson: rawLine,
-        });
+        attachSystemEntry({ kind: 'system', label: 'Context compacted', timestamp: ts, body: typeof meta === 'object' && meta !== null ? JSON.stringify(meta, null, 2) : '', rawJson: rawLine });
         continue;
       }
       if (subtype === 'api_error') {
         const err = (event as { error?: unknown }).error;
         const content = (event as { content?: unknown }).content;
         let body: string;
-        if (typeof err === 'string') {
-          body = err;
-        } else if (typeof content === 'string') {
-          body = content;
-        } else {
-          body = JSON.stringify(err ?? content ?? event);
-        }
-        attachSystemEntry({
-          kind: 'system',
-          label: 'API error',
-          timestamp: ts,
-          body,
-          isError: true,
-          rawJson: rawLine,
-        });
+        if (typeof err === 'string') body = err;
+        else if (typeof content === 'string') body = content;
+        else body = JSON.stringify(err ?? content ?? event);
+        attachSystemEntry({ kind: 'system', label: 'API error', timestamp: ts, body, isError: true, rawJson: rawLine });
         continue;
       }
       if (subtype === 'informational' || subtype === 'local_command') {
-        attachSystemEntry({
-          kind: 'system',
-          label: subtype === 'informational' ? 'Info' : 'Local command',
-          timestamp: ts,
-          body: JSON.stringify(event),
-          rawJson: rawLine,
-        });
+        attachSystemEntry({ kind: 'system', label: subtype === 'informational' ? 'Info' : 'Local command', timestamp: ts, body: JSON.stringify(event), rawJson: rawLine });
         continue;
       }
-      continue;  // unknown subtypes ignored
+      continue; // unknown subtypes ignored
     }
 
     // ── Session-end events (type: "result" | "summary") ───────────────────────
     if (event.type === 'result' || event.type === 'summary') {
-      attachSystemEntry({
-        kind: 'system',
-        label: 'Session ended',
-        timestamp: ts,
-        body: JSON.stringify(event),
-        rawJson: rawLine,
-      });
+      attachSystemEntry({ kind: 'system', label: 'Session ended', timestamp: ts, body: JSON.stringify(event), rawJson: rawLine });
       continue;
     }
 
@@ -197,24 +157,12 @@ export function parseTranscript(jsonlText: string): Turn[] {
         if (block.type === 'text') {
           currentAssistant.text = ((currentAssistant.text ?? '') + (block.text as string)).trim();
         } else if (block.type === 'thinking') {
-          currentAssistant.entries.push({
-            kind: 'thinking',
-            label: 'Thinking',
-            timestamp: ts,
-            body: block.thinking as string,
-            rawJson: rawLine,
-          });
+          currentAssistant.entries.push({ kind: 'thinking', label: 'Thinking', timestamp: ts, body: block.thinking as string, rawJson: rawLine });
         } else if (block.type === 'tool_use') {
           const name = typeof block.name === 'string' ? block.name : 'Tool';
           const input = (block.input ?? {}) as Record<string, unknown>;
           const id = typeof block.id === 'string' ? block.id : '';
-          const entry: TurnEntry = {
-            kind: 'tool_use',
-            label: labelForToolUse(name, input),
-            timestamp: ts,
-            body: JSON.stringify(input),
-            rawJson: rawLine,
-          };
+          const entry: TurnEntry = { kind: 'tool_use', label: labelForToolUse(name, input), timestamp: ts, body: JSON.stringify(input), rawJson: rawLine };
           currentAssistant.entries.push(entry);
           if (id) pendingToolUse.set(id, { entry, toolName: name });
         }
@@ -245,7 +193,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
           }
         }
       } else {
-        // Real user turn - flush pending assistant turn first.
+        // Real user turn — flush pending assistant turn first.
         if (currentAssistant) {
           turns.push(currentAssistant);
           currentAssistant = null;
@@ -254,13 +202,7 @@ export function parseTranscript(jsonlText: string): Turn[] {
 
         const turn: Turn = { role: 'user', timestamp: ts, attachments: [], entries: [], rawJson: rawLine };
         if (isCompactSummary) {
-          // Mark as a compaction placeholder; visible in UI as "(compacted summary)".
-          turn.entries.push({
-            kind: 'system',
-            label: 'Compacted summary',
-            timestamp: ts,
-            body: 'Preceding conversation was auto-compacted; this turn is the summary placeholder.',
-          });
+          turn.entries.push({ kind: 'system', label: 'Compacted summary', timestamp: ts, body: 'Preceding conversation was auto-compacted; this turn is the summary placeholder.' });
         }
         for (const block of blocks) {
           if (block.type === 'text') {
@@ -272,13 +214,9 @@ export function parseTranscript(jsonlText: string): Turn[] {
             }
           } else if (block.type === 'document') {
             const src = block.source as { type?: string; data?: string } | undefined;
-            turn.attachments.push({
-              type: 'document',
-              name: block.title as string | undefined,
-              data: src?.data,
-            });
+            turn.attachments.push({ type: 'document', name: block.title as string | undefined, data: src?.data });
           }
-          // tool_result blocks in a mixed message are intentionally ignored here -
+          // tool_result blocks in a mixed message are intentionally ignored here —
           // the turn text is what matters for display purposes.
         }
         turns.push(turn);
@@ -287,8 +225,211 @@ export function parseTranscript(jsonlText: string): Turn[] {
   }
 
   if (currentAssistant) turns.push(currentAssistant);
-  return turns;
+  return { turns, state: { currentAssistant, pendingToolUse, assistantIndex } };
 }
+
+/**
+ * Parse a complete JSONL transcript into turns.
+ * Kept for backward compatibility — callers that don't need incremental updates
+ * can continue using this form.
+ */
+export function parseTranscript(jsonlText: string): Turn[] {
+  return parseLines(jsonlText, emptyState()).turns;
+}
+
+/**
+ * Async variant of parseLines that yields control to the event loop every
+ * YIELD_EVERY lines. Used by the full-file parse path in getTurns so that
+ * large transcripts (50MB+) don't block the VS Code extension host event loop
+ * and freeze toolbar button responses while loading.
+ */
+const YIELD_EVERY = 500;
+async function parseLinesAsync(jsonlText: string, initState: ParseState): Promise<{ turns: Turn[]; state: ParseState }> {
+  const yld = () => new Promise<void>(resolve => setImmediate(resolve));
+  const turns: Turn[] = [];
+  let currentAssistant: Turn | null = initState.currentAssistant;
+  const pendingToolUse = new Map(initState.pendingToolUse);
+  let assistantIndex = initState.assistantIndex;
+
+  const attachSystemEntry = (entry: TurnEntry): void => {
+    if (currentAssistant) {
+      currentAssistant.entries.push(entry);
+    } else {
+      turns.push({ role: 'assistant', timestamp: entry.timestamp, attachments: [], entries: [entry] });
+    }
+  };
+
+  const rawLines = jsonlText.split('\n');
+  for (let lineIdx = 0; lineIdx < rawLines.length; lineIdx++) {
+    if (lineIdx > 0 && lineIdx % YIELD_EVERY === 0) await yld();
+    const rawLine = rawLines[lineIdx];
+    if (!rawLine.trim()) continue;
+    let event: ParsedEvent;
+    try { event = JSON.parse(rawLine); } catch { continue; }
+    const ts = typeof event.timestamp === 'string' ? event.timestamp : new Date().toISOString();
+    const role = event.message?.role;
+
+    if (event.type === 'attachment') {
+      const att = event.attachment ?? {};
+      const attType = typeof att.type === 'string' ? att.type : '';
+      const hookEvent = typeof att.hookEvent === 'string' ? att.hookEvent : '';
+      if (attType === 'hook_success' && hookEvent) {
+        const command = typeof att.command === 'string' ? att.command : '';
+        const stdout = typeof att.stdout === 'string' ? att.stdout.trim() : '';
+        const stderr = typeof att.stderr === 'string' ? att.stderr.trim() : '';
+        const durationMs = typeof att.durationMs === 'number' ? att.durationMs : 0;
+        const exitCode = typeof att.exitCode === 'number' ? att.exitCode : 0;
+        const prevented = att.preventedContinuation === true;
+        const MAX = 8000;
+        const rawOutput = [stdout, stderr].filter(Boolean).join('\n');
+        const output = rawOutput.length > MAX
+          ? rawOutput.slice(0, MAX) + `\n… (${rawOutput.length - MAX} more chars truncated)`
+          : rawOutput;
+        const body = [
+          `**Event:** ${hookEvent}`,
+          command ? `**Command:** \`${command}\`` : '',
+          `**Duration:** ${durationMs}ms · **Exit:** ${exitCode}`,
+          output ? `**Output:**\n\`\`\`\n${output}\n\`\`\`` : '',
+          prevented ? '⚠ **Prevented continuation**' : '',
+        ].filter(Boolean).join('\n');
+        attachSystemEntry({ kind: 'system', label: `${hookEvent} Hook · ${hookScriptName(command)}`, timestamp: ts, body, rawJson: rawLine });
+      } else if (attType === 'hook_non_blocking_error') {
+        const msg = String(att.error ?? att.message ?? att.stderr ?? JSON.stringify(att));
+        attachSystemEntry({ kind: 'system', label: `Hook error · ${hookEvent || 'unknown'}`, timestamp: ts, body: msg, isError: true, rawJson: rawLine });
+      } else if (attType === 'hook_system_message') {
+        const msg = String(att.message ?? att.content ?? JSON.stringify(att));
+        attachSystemEntry({ kind: 'system', label: `Hook · ${hookEvent || 'system message'}`, timestamp: ts, body: msg, rawJson: rawLine });
+      }
+      continue;
+    }
+
+    if (event.type === 'system') {
+      const subtype = typeof event.subtype === 'string' ? event.subtype : '';
+      if (subtype === 'stop_hook_summary') continue;
+      if (subtype === 'compact_boundary') {
+        const meta = (event as { compactMetadata?: unknown }).compactMetadata;
+        attachSystemEntry({ kind: 'system', label: 'Context compacted', timestamp: ts, body: typeof meta === 'object' && meta !== null ? JSON.stringify(meta, null, 2) : '', rawJson: rawLine });
+        continue;
+      }
+      if (subtype === 'api_error') {
+        const err = (event as { error?: unknown }).error;
+        const content = (event as { content?: unknown }).content;
+        let body: string;
+        if (typeof err === 'string') body = err;
+        else if (typeof content === 'string') body = content;
+        else body = JSON.stringify(err ?? content ?? event);
+        attachSystemEntry({ kind: 'system', label: 'API error', timestamp: ts, body, isError: true, rawJson: rawLine });
+        continue;
+      }
+      if (subtype === 'informational' || subtype === 'local_command') {
+        attachSystemEntry({ kind: 'system', label: subtype === 'informational' ? 'Info' : 'Local command', timestamp: ts, body: JSON.stringify(event), rawJson: rawLine });
+        continue;
+      }
+      continue;
+    }
+
+    if (event.type === 'result' || event.type === 'summary') {
+      attachSystemEntry({ kind: 'system', label: 'Session ended', timestamp: ts, body: JSON.stringify(event), rawJson: rawLine });
+      continue;
+    }
+
+    if (role === 'assistant') {
+      if (currentAssistant) turns.push(currentAssistant);
+      assistantIndex++;
+      const model = typeof event.message?.model === 'string' ? event.message.model : undefined;
+      currentAssistant = { role: 'assistant', timestamp: ts, attachments: [], entries: [], model, index: assistantIndex, rawJson: rawLine };
+      pendingToolUse.clear();
+      for (const block of normalizeContent(event.message?.content)) {
+        if (block.type === 'text') {
+          currentAssistant.text = ((currentAssistant.text ?? '') + (block.text as string)).trim();
+        } else if (block.type === 'thinking') {
+          currentAssistant.entries.push({ kind: 'thinking', label: 'Thinking', timestamp: ts, body: block.thinking as string, rawJson: rawLine });
+        } else if (block.type === 'tool_use') {
+          const name = typeof block.name === 'string' ? block.name : 'Tool';
+          const input = (block.input ?? {}) as Record<string, unknown>;
+          const id = typeof block.id === 'string' ? block.id : '';
+          const entry: TurnEntry = { kind: 'tool_use', label: labelForToolUse(name, input), timestamp: ts, body: JSON.stringify(input), rawJson: rawLine };
+          currentAssistant.entries.push(entry);
+          if (id) pendingToolUse.set(id, { entry, toolName: name });
+        }
+      }
+      continue;
+    }
+
+    if (role === 'user') {
+      const blocks = normalizeContent(event.message?.content);
+      const allToolResults = blocks.length > 0 && blocks.every(b => b.type === 'tool_result');
+      const isCompactSummary = (event as { isCompactSummary?: boolean }).isCompactSummary === true;
+      if (allToolResults) {
+        for (const block of blocks) {
+          const toolUseId = typeof block.tool_use_id === 'string' ? block.tool_use_id : '';
+          const pending = pendingToolUse.get(toolUseId);
+          const label = pending ? `Result · ${pending.toolName}` : 'Result';
+          const body = extractResultBody(block);
+          const isError = block.is_error === true;
+          const resultEntry: TurnEntry = { kind: 'tool_result', label, timestamp: ts, body, isError };
+          if (pending) {
+            pending.entry.result = resultEntry;
+          } else if (currentAssistant) {
+            currentAssistant.entries.push(resultEntry);
+          }
+        }
+      } else {
+        if (currentAssistant) {
+          turns.push(currentAssistant);
+          currentAssistant = null;
+        }
+        pendingToolUse.clear();
+        const turn: Turn = { role: 'user', timestamp: ts, attachments: [], entries: [], rawJson: rawLine };
+        if (isCompactSummary) {
+          turn.entries.push({ kind: 'system', label: 'Compacted summary', timestamp: ts, body: 'Preceding conversation was auto-compacted; this turn is the summary placeholder.' });
+        }
+        for (const block of blocks) {
+          if (block.type === 'text') {
+            turn.text = ((turn.text ?? '') + (block.text as string)).trim();
+          } else if (block.type === 'image') {
+            const src = block.source as { type?: string; media_type?: string; data?: string } | undefined;
+            if (src?.type === 'base64') {
+              turn.attachments.push({ type: 'image', mediaType: src.media_type, data: src.data });
+            }
+          } else if (block.type === 'document') {
+            const src = block.source as { type?: string; data?: string } | undefined;
+            turn.attachments.push({ type: 'document', name: block.title as string | undefined, data: src?.data });
+          }
+        }
+        turns.push(turn);
+      }
+    }
+  }
+
+  if (currentAssistant) turns.push(currentAssistant);
+  return { turns, state: { currentAssistant, pendingToolUse, assistantIndex } };
+}
+
+/**
+ * Parse a complete JSONL transcript, returning both turns and the parser state
+ * at end-of-file. Yields to the event loop every YIELD_EVERY lines so large
+ * transcripts don't block the VS Code extension host during cold-cache loads.
+ * Pass the state to parseTranscriptDelta for subsequent incremental updates.
+ */
+export async function parseTranscriptWithState(jsonlText: string): Promise<{ turns: Turn[]; state: ParseState }> {
+  return parseLinesAsync(jsonlText, emptyState());
+}
+
+/**
+ * Parse only the bytes appended to a transcript since the last full (or delta)
+ * parse. `priorState` must come from a previous parseTranscriptWithState or
+ * parseTranscriptDelta call on the same session.
+ *
+ * If `priorState.currentAssistant` was non-null, the first element of the
+ * returned turns array is that same turn (now possibly updated with new
+ * tool_results or fully completed by a subsequent user event).
+ */
+export function parseTranscriptDelta(deltaText: string, priorState: ParseState): { turns: Turn[]; state: ParseState } {
+  return parseLines(deltaText, priorState);
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Normalize message content to a ContentBlock array regardless of raw format. */
 function normalizeContent(content: unknown): ContentBlock[] {

@@ -17,16 +17,21 @@ import chokidar from 'chokidar';
 import { Agent, AgentDetails, AgentState, RawEvent, ToolCallSummary } from './types';
 import { buildTree, parentSessionIdFromPath } from './agentTree';
 import { logError, logInfo } from './logger';
+import { readFileSlice } from './fileUtils';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
-const RUNNING_WINDOW_MS = 5 * 60 * 1000;
-const DONE_AGE_MS = 6 * 60 * 60 * 1000;
+const TITLE_HEAD_BYTES = 32 * 1024; // first 32 KB contains titles for virtually all sessions
+const DEFAULT_RUNNING_WINDOW_MS = 5 * 60 * 1000;  // configurable via agentViewer.runningWindowMinutes
+const DEFAULT_DONE_AGE_MS       = 1 * 60 * 60 * 1000; // configurable via agentViewer.doneAgeHours
 const DEBOUNCE_MS = 200;
-const STATE_TICK_MS         =  5_000;   // tick rate while panel is visible
-const STATE_TICK_MS_HIDDEN  = 60_000;   // tick rate while panel is hidden
-const DISCOVERY_TICK_MS         = 30_000;
-const DISCOVERY_TICK_MS_HIDDEN  = 120_000;
+const STATE_TICK_MS         =  5_000;
+const STATE_TICK_MS_HIDDEN  = 60_000;
+// Discovery runs infrequently — it's only a backstop for chokidar misses.
+// The targeted watchAndDiscoverSubagents handles the common case immediately.
+const DISCOVERY_TICK_MS         =  5 * 60 * 1000;  // 5 min visible
+const DISCOVERY_TICK_MS_HIDDEN  = 30 * 60 * 1000;  // 30 min hidden
+const INIT_BATCH_SIZE = 20; // max concurrent processFile calls per batch in initialize()
 
 /** Cached session name fields scanned from the full transcript file. */
 interface TitleCache {
@@ -54,7 +59,41 @@ export class AgentService {
   // Per-file debounce timers for 'change' events — avoids processing the same
   // file on every individual write when Claude Code is actively running.
   private changeDebounce = new Map<string, NodeJS.Timeout>();
+  // Session IDs that have EVER had Agent tool_use calls in their tail. Sticky — never
+  // reset on content updates — so watchAndDiscoverSubagents keeps firing even after the
+  // original Agent tool_use events scroll past the TAIL_BYTES window on long sessions.
+  private _agentsWithSubagents = new Set<string>();
+  // Tracks subagent dirs whose existence has been confirmed via a successful readdir.
+  // watcher.add() is retried on every call until readdir succeeds — prevents the bug
+  // where the dir didn't exist yet when we first called watcher.add() and chokidar
+  // silently missed all subsequent file creations in that dir.
+  private watchedSubagentDirs = new Set<string>();
+  // Throttle readdir per subagent dir — on Windows with 500+ sessions, an
+  // uncapped readdir every 500ms (the change-debounce interval) saturates the
+  // libuv I/O thread pool and locks up the extension host event loop.
+  private watchedSubagentDirLastRead = new Map<string, number>();
+  private static readonly SUBAGENT_READDIR_THROTTLE_MS = 10_000;
+  // Concurrency gate for processFile: prevents more than MAX_CONCURRENT_PROCESS
+  // simultaneous reads from saturating the libuv I/O thread pool (default 4 threads).
+  // With many active agents all debouncing at the same time, uncapped concurrency
+  // causes all reads to queue up, making even simple stat() calls take seconds.
+  private processFileActive = 0;
+  private readonly processFileWaiters: Array<() => void> = [];
+  private static readonly MAX_CONCURRENT_PROCESS = 4;
+  // Throttle change-triggered emits: after firing, hold off for this long before
+  // firing again. Prevents rapid file writes from rebuilding the agent tree on
+  // every individual write when multiple sessions are active simultaneously.
+  private _lastChangeEmitMs = 0;
+  private static readonly MIN_CHANGE_EMIT_MS = 2_000;
+  private _discoveryVisible = true;
+  private _discoveryGen = 0;
   private _ready = false;
+  private _initializing = false;
+  private _tickCount = 0;
+  // Set when agents are added or removed (structural change). buildTree only
+  // needs to run on structural changes — content-only updates (file writes on
+  // existing sessions) are handled by in-place field mutation in processFileImpl.
+  private _structureChanged = false;
   private _onDidChange = new vscode.EventEmitter<Agent[]>();
   readonly onDidChange = this._onDidChange.event;
   private _onDidDrop = new vscode.EventEmitter<string>();
@@ -70,17 +109,32 @@ export class AgentService {
    * emits the current state when the panel becomes visible again.
    */
   setVisible(visible: boolean): void {
+    this._discoveryVisible = visible;
     if (this.tickTimer) clearInterval(this.tickTimer);
-    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
     this.tickTimer = setInterval(
       () => this.scheduleEmit('tick'),
       visible ? STATE_TICK_MS : STATE_TICK_MS_HIDDEN,
     );
-    this.discoveryTimer = setInterval(
-      () => void this.discoverNewFiles(),
-      visible ? DISCOVERY_TICK_MS : DISCOVERY_TICK_MS_HIDDEN,
-    );
+    // Restart the self-rearming discovery loop at the new cadence.
+    this.cancelDiscovery();
+    this.armDiscovery();
     if (visible) this.scheduleEmit();
+  }
+
+  private getConfig() {
+    return vscode.workspace.getConfiguration('agentViewer');
+  }
+
+  /** Returns the configured running-window threshold in milliseconds. */
+  private getRunningWindowMs(): number {
+    const minutes = this.getConfig().get<number>('runningWindowMinutes', 5);
+    return Math.max(0.5, minutes) * 60 * 1000;
+  }
+
+  /** Returns the configured done-age threshold in milliseconds. */
+  private getDoneAgeMs(): number {
+    const hours = this.getConfig().get<number>('doneAgeHours', 1);
+    return Math.max(0.1, hours) * 60 * 60 * 1000;
   }
 
   /** Begins the initial directory scan and starts the file watcher. */
@@ -89,13 +143,41 @@ export class AgentService {
     // fire even with no file changes. Routes through scheduleEmit so reclassification
     // always runs on a consistent snapshot, never interleaved with async file reads.
     this.tickTimer = setInterval(() => this.scheduleEmit('tick'), STATE_TICK_MS);
-    // Periodic discovery pass: pick up any files the chokidar watcher missed
-    // (e.g. new subagent directories created after the watcher started on Windows).
-    this.discoveryTimer = setInterval(() => void this.discoverNewFiles(), DISCOVERY_TICK_MS);
+    this.armDiscovery();
+    // Re-classify when the user changes the done-age threshold.
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('agentViewer.doneAgeHours') ||
+          e.affectsConfiguration('agentViewer.runningWindowMinutes')) this.scheduleEmit();
+    });
     void this.initialize();
   }
 
+  /**
+   * Arms a self-rearming discovery timer using setTimeout instead of setInterval
+   * so that concurrent scans can never pile up — the next run only schedules
+   * after the previous one completes.
+   */
+  private armDiscovery(): void {
+    const gen = ++this._discoveryGen;
+    const delay = this._discoveryVisible ? DISCOVERY_TICK_MS : DISCOVERY_TICK_MS_HIDDEN;
+    this.discoveryTimer = setTimeout(() => {
+      void this.discoverNewFiles().finally(() => {
+        // Only re-arm if this generation is still current — prevents a stale
+        // in-flight .finally() from creating a second parallel discovery chain
+        // when cancelDiscovery + armDiscovery fires before the old one completes.
+        if (gen === this._discoveryGen) this.armDiscovery();
+      });
+    }, delay);
+  }
+
+  /** Cancels any pending discovery timer, invalidating any in-flight chain. */
+  private cancelDiscovery(): void {
+    this._discoveryGen++;
+    if (this.discoveryTimer) { clearTimeout(this.discoveryTimer); this.discoveryTimer = undefined; }
+  }
+
   private async initialize(): Promise<void> {
+    this._initializing = true;
     const now = Date.now();
     try {
       const allFiles = await findJsonlFiles(PROJECTS_ROOT);
@@ -113,46 +195,64 @@ export class AgentService {
       const archiveFiles: Array<{ path: string; stat: fs.Stats }> = [];
       for (const r of statResults) {
         if (!r) continue;
-        (now - r.stat.mtimeMs > DONE_AGE_MS ? archiveFiles : recentFiles).push(r);
+        (now - r.stat.mtimeMs > DEFAULT_DONE_AGE_MS ? archiveFiles : recentFiles).push(r);
       }
 
-      await Promise.all(recentFiles.map(({ path: p, stat }) => this.processFile(p, stat)));
-      this._ready = true;
-      this.scheduleEmit();
+      // Sort newest-first so actively-running sessions render in the first batch.
+      recentFiles.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
 
-      // Archives: process in batches to avoid exhausting file descriptors.
-      const BATCH = 20;
-      for (let i = 0; i < archiveFiles.length; i += BATCH) {
-        await Promise.all(archiveFiles.slice(i, i + BATCH).map(({ path: p, stat }) => this.processFile(p, stat)));
+      // Process recent files in bounded batches. Mark _ready after the first
+      // batch so the sidebar renders immediately with whatever is available
+      // rather than blocking until the entire scan is complete.
+      for (let i = 0; i < recentFiles.length; i += INIT_BATCH_SIZE) {
+        await Promise.all(recentFiles.slice(i, i + INIT_BATCH_SIZE).map(({ path: p, stat }) => this.processFile(p, stat)));
+        if (!this._ready) { this._ready = true; }
+        this.scheduleEmit();
+      }
+
+      for (let i = 0; i < archiveFiles.length; i += INIT_BATCH_SIZE) {
+        await Promise.all(archiveFiles.slice(i, i + INIT_BATCH_SIZE).map(({ path: p, stat }) => this.processFile(p, stat)));
         this.scheduleEmit();
       }
     } catch (err) { logError('initialize', err); }
+
+    this._initializing = false;
 
     if (!this._ready) {
       this._ready = true;
       this.scheduleEmit();
     }
 
-    logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded (${Array.from(this.agents.values()).filter(a => a.parentSessionId).length} subagents)`);
+    let initSubCount = 0, initActiveCount = 0, initDoneCount = 0;
+    for (const a of this.agents.values()) {
+      if (a.parentSessionId) { initSubCount++; continue; }
+      if (a.state === 'done') initDoneCount++; else initActiveCount++;
+    }
+    logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded (${initSubCount} subagents | ${initActiveCount} active, ${initDoneCount} done/hidden)`);
+    void this.backgroundScanTitles();
     // Watch for ongoing changes. ignoreInitial: true since we already scanned above.
-    // Forward slashes required for the glob portion; chokidar normalizes the base path.
-    const watchGlob = PROJECTS_ROOT.replace(/\\/g, '/') + '/**/*.jsonl';
-    this.watcher = chokidar.watch(watchGlob, {
+    // Use a SHALLOW glob (*/*.jsonl, not **/*.jsonl) so chokidar's internal readdirp
+    // only scans one level deep — the top-level session directories. With 159+ archived
+    // sessions each potentially containing subagent subdirectories, the recursive glob
+    // causes readdirp to build directory-entry objects for thousands of paths, which OOMs
+    // the extension host. Subagent directories are added explicitly by watchAndDiscoverSubagents
+    // as parent sessions are processed, so the recursive glob is not needed.
+    const projectsRoot = PROJECTS_ROOT.replace(/\\/g, '/');
+    this.watcher = chokidar.watch(projectsRoot + '/*/*.jsonl', {
       ignoreInitial: true,
       persistent: true,
-      alwaysStat: true,
-      // No awaitWriteFinish — its internal polling (50ms intervals) is too
-      // aggressive when Claude Code is actively writing. Our parser already
-      // skips malformed partial lines, so we don't need write-stability checks.
+      // alwaysStat removed: it causes chokidar to issue an fs.stat for every
+      // raw filesystem notification — one per line write during active sessions.
+      // processFile does its own stat only after the debounce settles.
     });
     this.watcher
-      .on('add',    (p, stats) => {
+      .on('add',    (p) => {
         // Cancel any pending drop for this path (atomic-write rename sequence).
         const t = this.pendingDrops.get(p);
         if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
-        void this.processFile(p, stats);
+        void this.processFile(p);
       })
-      .on('change', (p, stats) => {
+      .on('change', (p) => {
         // Debounce per-file: Claude Code writes many lines per second during
         // active sessions. Process once after writes settle rather than on
         // every individual write event.
@@ -160,7 +260,7 @@ export class AgentService {
         if (existing) clearTimeout(existing);
         this.changeDebounce.set(p, setTimeout(() => {
           this.changeDebounce.delete(p);
-          void this.processFile(p, stats);
+          void this.processFile(p);
         }, 500));
       })
       .on('unlink', (p)        => {
@@ -182,13 +282,18 @@ export class AgentService {
   async refresh(): Promise<void> {
     try {
       if (this.debounceTimer) { clearTimeout(this.debounceTimer); this.debounceTimer = undefined; }
+      this.cancelDiscovery();
       for (const t of this.changeDebounce.values()) clearTimeout(t);
       this.changeDebounce.clear();
       this.agents.clear();
       this.titleCache.clear();
+      this._agentsWithSubagents.clear();
+      this.watchedSubagentDirs.clear();
+      this.watchedSubagentDirLastRead.clear();
       this._ready = false;
       if (this.watcher) { await this.watcher.close(); this.watcher = undefined; }
       await this.initialize();
+      this.armDiscovery();
     } catch (err) { logError('refresh', err); }
   }
 
@@ -211,35 +316,154 @@ export class AgentService {
     );
   }
 
+  /** O(1) lookup for a single agent by session ID. */
+  getAgent(sessionId: string): Agent | undefined {
+    return this.agents.get(sessionId);
+  }
+
   /**
    * Parses (or re-parses) a single transcript file and upserts the resulting
    * Agent into the in-memory map. Title scan runs once per session and is cached.
+   * Runs through a concurrency gate to prevent I/O pool saturation.
    */
   private async processFile(filePath: string, stats?: fs.Stats): Promise<void> {
+    if (this.processFileActive >= AgentService.MAX_CONCURRENT_PROCESS) {
+      // Only log post-init — during the startup batch scan, queuing is expected and not useful signal.
+      if (!this._initializing) logInfo('processFile', `queued (active=${this.processFileActive} waiting=${this.processFileWaiters.length}): ${path.basename(filePath)}`);
+      await new Promise<void>(resolve => this.processFileWaiters.push(resolve));
+    }
+    this.processFileActive++;
+    try {
+      await this.processFileImpl(filePath, stats);
+    } finally {
+      this.processFileActive--;
+      this.processFileWaiters.shift()?.();
+    }
+  }
+
+  private async processFileImpl(filePath: string, stats?: fs.Stats): Promise<void> {
     try {
       const stat = stats ?? await fsp.stat(filePath);
       const sessionId = sessionIdFromPath(filePath);
-      // Capture in a local var before the tailEvents await so a concurrent
+      const doneAgeMs = this.getDoneAgeMs();
+      const isArchive = Date.now() - stat.mtimeMs > doneAgeMs;
+      // Capture in a local var before the scanFullFileForTitles await so a concurrent
       // refresh() clearing titleCache can't make the get() return undefined.
       let cached = this.titleCache.get(sessionId);
       if (!cached) {
-        cached = await scanFullFileForTitles(filePath);
-        this.titleCache.set(sessionId, cached);
+        if (this._initializing && isArchive) {
+          // During init, skip title scans for archive sessions — reading 32 KB from
+          // thousands of old files is the dominant startup cost. backgroundScanTitles()
+          // fills them in progressively after the sidebar first renders.
+          cached = { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null };
+          // Intentionally NOT stored in titleCache so backgroundScanTitles knows to scan it.
+        } else {
+          cached = await scanFullFileForTitles(filePath);
+          this.titleCache.set(sessionId, cached);
+        }
       }
-      const events = await this.tailEvents(filePath, stat.size);
-      const agent = buildAgent(filePath, stat.mtimeMs, events, cached);
-      this.agents.set(agent.sessionId, agent);
+      // Skip re-processing if the file hasn't changed since we last read it.
+      // State transitions (running → idle → done) happen in scheduleEmit via
+      // classifyState(), so they still fire on the tick timer regardless.
+      // mtime changes the instant the file is written, so this check is safe.
+      const known = this.agents.get(sessionId);
+      if (known && known.mtimeMs === stat.mtimeMs) {
+        // Even on a no-op file read, still arm subagent watching. The parent file's
+        // mtime doesn't change while a subagent is running (only on Agent tool_use /
+        // tool_result events), so without this the watcher would never be registered
+        // for subagent dirs that appear between those events.
+        // Use the sticky set — agentCallDescs may be empty if the Agent tool_use has
+        // scrolled past the TAIL_BYTES window, but we still need to watch.
+        if (this._agentsWithSubagents.has(sessionId)) {
+          void this.watchAndDiscoverSubagents(filePath, sessionId);
+        }
+        return;
+      }
+      const events = isArchive ? [] : await this.tailEvents(filePath, stat.size);
+      const agent = buildAgent(filePath, stat.mtimeMs, events, cached, doneAgeMs, this.getRunningWindowMs());
+      // Sticky: once a session has ever had Agent tool_use calls, remember it permanently
+      // so watchAndDiscoverSubagents keeps firing even after those events age out of the tail.
+      if (agent.agentCallDescs.length > 0) {
+        this._agentsWithSubagents.add(sessionId);
+      }
+      if (known) {
+        // In-place update: preserve the existing object reference so that parent
+        // agents' subagents[] arrays keep pointing to the correct child objects
+        // without needing a full buildTree rebuild on every file-content change.
+        known.mtimeMs = agent.mtimeMs;
+        known.state = agent.state;
+        known.activityHistory = agent.activityHistory;
+        known.model = agent.model;
+        known.turnCount = agent.turnCount;
+        known.contextPct = agent.contextPct;
+        known.details = agent.details;
+        known.agentCallDescs = agent.agentCallDescs;
+      } else {
+        this.agents.set(agent.sessionId, agent);
+        this._structureChanged = true;
+      }
       if (this._ready) this.scheduleEmit();
+      if (this._agentsWithSubagents.has(sessionId)) {
+        void this.watchAndDiscoverSubagents(filePath, sessionId);
+      }
     } catch (err) {
       logError(`processFile(${filePath})`, err);
     }
   }
 
+  /**
+   * Proactively watches a parent agent's subagent directory and processes any
+   * subagent files not yet tracked. Called on every parent file update that
+   * contains Agent tool calls.
+   *
+   * watcher.add() is deduplicated via watchedSubagentDirs. The readdir is
+   * throttled to once per SUBAGENT_READDIR_THROTTLE_MS per directory — chokidar
+   * 'add' events handle real-time discovery, and readdir is only a backstop for
+   * Windows unreliability with dynamically-added globs.
+   */
+  private async watchAndDiscoverSubagents(parentFilePath: string, sessionId: string): Promise<void> {
+    const subagentDir = path.join(path.dirname(parentFilePath), sessionId, 'subagents').replace(/\\/g, '/');
+
+    // Throttle readdir — with 500+ active sessions each firing a change-debounce every
+    // 500ms, running readdir on every call saturates the libuv I/O thread pool.
+    // chokidar 'add' events handle new files in real-time; readdir is only a backstop
+    // for Windows reliability, so running it every 10s per directory is sufficient.
+    const lastRead = this.watchedSubagentDirLastRead.get(subagentDir) ?? 0;
+    if (Date.now() - lastRead < AgentService.SUBAGENT_READDIR_THROTTLE_MS) return;
+    this.watchedSubagentDirLastRead.set(subagentDir, Date.now());
+
+    try {
+      const files = await fsp.readdir(subagentDir);
+      // Dir confirmed to exist — register with chokidar once so new files fire 'add' events.
+      // watcher.add is deferred until here rather than called speculatively on every invoke:
+      // chokidar does not reliably watch a glob pointing at a non-existent directory, so
+      // calling it before the dir exists would silently miss all subsequent file creations.
+      if (!this.watchedSubagentDirs.has(subagentDir)) {
+        this.watchedSubagentDirs.add(subagentDir);
+        if (this.watcher) this.watcher.add(subagentDir + '/*.jsonl');
+      }
+      const newFiles = files
+        .filter(f => f.endsWith('.jsonl'))
+        .map(f => path.join(subagentDir, f))
+        .filter(f => !this.agents.has(sessionIdFromPath(f)));
+      if (newFiles.length > 0) {
+        await Promise.all(newFiles.map(f => this.processFile(f)));
+        this.scheduleEmit();
+      }
+    } catch {
+      // Directory doesn't exist yet — normal if subagents haven't been spawned yet.
+    }
+  }
+
   /** Removes a deleted transcript file's agent and title cache entries, then fires onDidDrop. */
   private dropFile(filePath: string): void {
+    // Cancel any pending change-debounce so processFile doesn't run on a deleted file.
+    const pending = this.changeDebounce.get(filePath);
+    if (pending) { clearTimeout(pending); this.changeDebounce.delete(filePath); }
     const sessionId = sessionIdFromPath(filePath);
     this.titleCache.delete(sessionId);
     if (this.agents.delete(sessionId)) {
+      this._structureChanged = true;
       this._onDidDrop.fire(sessionId);
       this.scheduleEmit();
     }
@@ -251,62 +475,119 @@ export class AgentService {
    */
   private async tailEvents(filePath: string, size: number): Promise<RawEvent[]> {
     const tailStart = Math.max(0, size - TAIL_BYTES);
-    const handle = await fsp.open(filePath, 'r');
-    try {
-      const tailLen = size - tailStart;
-      const tailBuf = Buffer.alloc(tailLen);
-      await handle.read(tailBuf, 0, tailLen, tailStart);
-      const tailText = tailBuf.toString('utf8');
-      const tailLines = tailText.split('\n');
-      if (tailStart > 0) tailLines.shift(); // drop partial first line
-      const tailEvents: RawEvent[] = [];
-      for (const line of tailLines) {
-        if (!line) continue;
-        try { tailEvents.push(JSON.parse(line) as RawEvent); } catch { /* skip */ }
-      }
-
-      return tailEvents;
-    } finally {
-      await handle.close();
+    const text = await readFileSlice(filePath, tailStart, size - tailStart);
+    const lines = text.split('\n');
+    if (tailStart > 0) lines.shift(); // drop partial first line
+    const events: RawEvent[] = [];
+    for (const line of lines) {
+      if (!line) continue;
+      try { events.push(JSON.parse(line) as RawEvent); } catch { /* skip */ }
     }
+    return events;
   }
 
   /**
-   * Debounces tree-building and change notification to avoid rapid-fire updates during bulk file scans.
-   * State reclassification runs synchronously inside the callback so it always sees a consistent
-   * agent snapshot — never interleaved with ongoing async file reads.
+   * Schedules a state-reclassification pass and, if anything changed, fires onDidChange.
    *
-   * `reason='tick'` suppresses the change event when no state transitions occurred, preventing
-   * no-op re-renders every STATE_TICK_MS when all agents are idle or done.
+   * Three reasons:
+   *   'change'     — a file was processed; buildTree + assignTaskDescriptions run.
+   *                  Throttled to MIN_CHANGE_EMIT_MS and resets the cooldown clock.
+   *   'tick'       — only time-based state transitions are possible; suppressed when none occur.
+   *   'background' — archive title updates applied in-place; fires onDidChange without
+   *                  touching _lastChangeEmitMs so live-change cooldown is not disrupted.
    */
-  private scheduleEmit(reason: 'tick' | 'change' = 'change'): void {
+  private scheduleEmit(reason: 'tick' | 'change' | 'background' = 'change'): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    // Throttle change emits: delay until MIN_CHANGE_EMIT_MS has elapsed since the last one.
+    const cooldown = this._lastChangeEmitMs + AgentService.MIN_CHANGE_EMIT_MS - Date.now();
+    const delay = reason === 'change' && cooldown > DEBOUNCE_MS ? cooldown : DEBOUNCE_MS;
     this.debounceTimer = setTimeout(() => {
       const now = Date.now();
+      const doneAgeMs = this.getDoneAgeMs();
+      const runningWindowMs = this.getRunningWindowMs();
       let anyChanged = false;
-      for (const [id, agent] of this.agents) {
+      const transitions: string[] = [];
+      for (const agent of this.agents.values()) {
         const hasActiveSubagent = agent.subagents.some(s => s.state === 'running');
-        const nextState = classifyState(agent.mtimeMs, now, agent.state === 'done', hasActiveSubagent);
+        const nextState = classifyState(agent.mtimeMs, now, agent.state === 'done', hasActiveSubagent, doneAgeMs, runningWindowMs);
         if (nextState !== agent.state) {
-          this.agents.set(id, { ...agent, state: nextState });
+          transitions.push(`${agent.sessionId.slice(0, 8)}: ${agent.state}→${nextState}`);
+          agent.state = nextState; // mutate in place — subagents[] refs stay valid, no tree rebuild needed
           anyChanged = true;
         }
       }
-      if (reason === 'change' || anyChanged) {
-        buildTree(this.agents);
-        assignTaskDescriptions(this.agents);
-        const subCount = Array.from(this.agents.values()).filter(a => a.parentSessionId).length;
-        logInfo('emit', `agents=${this.agents.size} subagents=${subCount}`);
+      if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
+      // Heartbeat every ~5 min so we can distinguish "quiet (all done)" from a true hang.
+      if (reason === 'tick' && ++this._tickCount % 60 === 0) {
+        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileActive} waiters=${this.processFileWaiters.length}`);
+      }
+      if (reason === 'change' || reason === 'background' || anyChanged) {
+        let treeMs = 0;
+        if (reason === 'change') {
+          const t0 = Date.now();
+          // buildTree only needed when agents were added/removed (new subagent file, deletion).
+          // Content-only updates use in-place field mutation in processFileImpl, so subagents[]
+          // refs stay valid without a full two-pass rebuild over all 3800+ agents.
+          if (this._structureChanged) {
+            buildTree(this.agents);
+            this._structureChanged = false;
+          }
+          assignTaskDescriptions(this.agents);
+          treeMs = Date.now() - t0;
+          this._lastChangeEmitMs = Date.now();
+        }
+        let subCount = 0;
+        for (const a of this.agents.values()) { if (a.parentSessionId) subCount++; }
+        logInfo('emit', `agents=${this.agents.size} subagents=${subCount} treeMs=${treeMs}ms reason=${reason}`);
         this._onDidChange.fire(this.getAgents());
       }
-    }, DEBOUNCE_MS);
+    }, delay);
+  }
+
+  /**
+   * Progressively scans title fields for archive sessions whose title reads were
+   * deferred during initialize() to keep startup fast. Runs 4 concurrent readers
+   * and yields to the event loop after each file so live file-change events
+   * are never starved. Uses 'background' emit reason to avoid resetting the
+   * live-change cooldown clock.
+   */
+  private async backgroundScanTitles(): Promise<void> {
+    const agents = [...this.agents.values()].filter(a => !this.titleCache.has(a.sessionId));
+    if (agents.length === 0) return;
+    logInfo('backgroundScanTitles', `scanning ${agents.length} deferred archive titles`);
+
+    const CONCURRENT = 4;
+    let idx = 0;
+    let scanned = 0;
+    let updated = 0;
+
+    const worker = async (): Promise<void> => {
+      while (idx < agents.length) {
+        const agent = agents[idx++];
+        if (this.titleCache.has(agent.sessionId)) continue;
+        const cached = await scanFullFileForTitles(agent.transcriptPath);
+        this.titleCache.set(agent.sessionId, cached);
+        agent.details.customTitle = cached.customTitle ?? agent.details.customTitle;
+        agent.details.aiTitle = cached.aiTitle ?? agent.details.aiTitle;
+        agent.details.lastPrompt = cached.lastPrompt ?? agent.details.lastPrompt;
+        agent.details.latestUserPrompt = agent.details.latestUserPrompt ?? cached.firstUserPrompt;
+        scanned++;
+        updated++;
+        if (updated % 200 === 0) this.scheduleEmit('background');
+        await new Promise<void>(r => setImmediate(r));
+      }
+    };
+
+    await Promise.all(Array.from({ length: CONCURRENT }, () => worker()));
+    if (updated > 0) this.scheduleEmit('background');
+    logInfo('backgroundScanTitles', `scanned ${scanned} archive titles`);
   }
 
   /** Stops all timers and the file watcher. Call on extension deactivation. */
   dispose(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
-    if (this.discoveryTimer) clearInterval(this.discoveryTimer);
+    this.cancelDiscovery();
     for (const t of this.pendingDrops.values()) clearTimeout(t);
     this.pendingDrops.clear();
     for (const t of this.changeDebounce.values()) clearTimeout(t);
@@ -317,11 +598,6 @@ export class AgentService {
   }
 }
 
-/**
- * Constructs an Agent from a file path, its mtime, the tail events, and the
- * cached title fields. Title cache values win over tail-derived values since
- * they came from the complete file.
- */
 /** Returns all .jsonl file paths under rootDir at any depth. Throws if rootDir is unreadable. */
 async function findJsonlFiles(rootDir: string): Promise<string[]> {
   const entries = await fsp.readdir(rootDir, { recursive: true, withFileTypes: true });
@@ -334,15 +610,14 @@ async function findJsonlFiles(rootDir: string): Promise<string[]> {
     });
 }
 
-function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], titles: TitleCache): Agent {
+function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], titles: TitleCache, doneAgeMs = DEFAULT_DONE_AGE_MS, runningWindowMs = DEFAULT_RUNNING_WINDOW_MS): Agent {
   const sessionId = sessionIdFromPath(filePath);
   const cwd = resolveCwd(filePath, events);
   const projectName = path.basename(cwd);
   const terminated = events.some(isTerminator);
-  const state = classifyState(mtimeMs, Date.now(), terminated);
+  const state = classifyState(mtimeMs, Date.now(), terminated, false, doneAgeMs, runningWindowMs);
   const activityHistory = buildActivityHistory(events, state);
-  const { details, agentCallDescs } = extractDetails(events);
-  const meta = extractSessionMeta(events);
+  const { details, agentCallDescs, meta } = extractDetails(events);
   // Merge cached title/prompt values (scanned once from whole file) with tail-derived details.
   // Cached values win for titles since they were collected from the complete file.
   details.customTitle = titles.customTitle ?? details.customTitle;
@@ -370,18 +645,18 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
 }
 
 /**
- * Scans the entire transcript file for session name fields (custom-title,
- * ai-title, last-prompt, first user message). Called once per session on first
- * discovery; result is cached in titleCache for the session's lifetime.
+ * Scans the first TITLE_HEAD_BYTES of a transcript file for session name fields.
+ * Custom/AI titles and the first user prompt all appear within the opening
+ * events of a session, so reading the full file was wasteful — the head is enough
+ * for virtually all sessions, keeping first-discovery cost to a single small read.
+ * Called once per session; result is cached for the session's lifetime.
  */
 async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
   const out: TitleCache = { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null };
   try {
-    const content = await fsp.readFile(filePath, 'utf8');
-    const lines = content.split('\n');
-    for (const line of lines) {
+    const text = await readFileSlice(filePath, 0, TITLE_HEAD_BYTES);
+    for (const line of text.split('\n')) {
       if (!line) continue;
-      // Cheap check before JSON.parse — skip lines that don't contain any title/prompt key.
       if (!/"(custom-title|ai-title|last-prompt|user)"/.test(line)) continue;
       try {
         const evt = JSON.parse(line) as RawEvent;
@@ -393,11 +668,10 @@ async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
         } else if (t === 'last-prompt' && typeof evt.lastPrompt === 'string' && evt.lastPrompt) {
           out.lastPrompt = truncate(evt.lastPrompt as string, 200);
         } else if (t === 'user' && out.firstUserPrompt == null) {
-          const text = extractUserText(evt.message?.content);
-          if (text) out.firstUserPrompt = truncate(text, 200);
+          const userText = extractUserText(evt.message?.content);
+          if (userText) out.firstUserPrompt = truncate(userText, 200);
         }
       } catch { /* skip malformed line */ }
-      // Stop scanning once all four fields are populated — no need to read further.
       if (out.customTitle && out.aiTitle && out.lastPrompt && out.firstUserPrompt) break;
     }
   } catch (err) { logError(`scanFullFileForTitles(${filePath})`, err); }
@@ -453,11 +727,11 @@ function normalizeCwd(p: string): string {
 }
 
 /** Determines an agent's state from its mtime age, termination flag, and subagent activity. */
-function classifyState(mtimeMs: number, now: number, terminated: boolean, hasActiveSubagent = false): AgentState {
+function classifyState(mtimeMs: number, now: number, terminated: boolean, hasActiveSubagent = false, doneAgeMs = DEFAULT_DONE_AGE_MS, runningWindowMs = DEFAULT_RUNNING_WINDOW_MS): AgentState {
   if (terminated) return 'done';
   const age = now - mtimeMs;
-  if (age < RUNNING_WINDOW_MS || hasActiveSubagent) return 'running';
-  if (age > DONE_AGE_MS) return 'done';
+  if (age < runningWindowMs || hasActiveSubagent) return 'running';
+  if (age > doneAgeMs) return 'done';
   return 'idle';
 }
 
@@ -507,40 +781,6 @@ interface SessionMeta {
   turnCount: number;
   contextPct: number;
 }
-
-/**
- * Extracts model name, turn count, and context window usage from tail events.
- * All three values are approximations for long sessions where the tail doesn't
- * include all turns.
- */
-function extractSessionMeta(events: RawEvent[]): SessionMeta {
-  let model = '';
-  let turnCount = 0;
-  let lastInputTokens = 0;
-
-  for (const evt of events) {
-    if (evt.type !== 'assistant') continue;
-    turnCount++;
-    const msg = evt.message;
-    if (!msg) continue;
-    if (typeof msg.model === 'string' && msg.model) {
-      // Strip "claude-" prefix for compact display, e.g. "claude-sonnet-4-6" → "sonnet-4-6"
-      model = msg.model.replace(/^claude-/, '');
-    }
-    if (typeof msg.usage?.input_tokens === 'number') {
-      lastInputTokens = msg.usage.input_tokens;
-    }
-  }
-
-  const contextPct = lastInputTokens > 0
-    ? Math.round((lastInputTokens / CONTEXT_WINDOW) * 100)
-    : 0;
-
-  return { model, turnCount, contextPct };
-}
-
-/** Exported only for unit testing. */
-export const extractSessionMetaForTesting = extractSessionMeta;
 
 function isNoise(evt: RawEvent): boolean {
   const t = typeof evt.type === 'string' ? evt.type : '';
@@ -604,10 +844,11 @@ const MAX_TRAIL = 5;
 const MAX_FILES = 5;
 
 /**
- * Scans tail events to extract sidebar-displayable details: recent tool calls,
- * recently touched files, user prompts, titles, and subagent descriptions.
+ * Single-pass extraction of sidebar details and session metadata from tail events.
+ * Merges what were previously two separate iterations (extractDetails + extractSessionMeta)
+ * since both iterate the same events array in forward order.
  */
-function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallDescs: string[] } {
+function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallDescs: string[]; meta: SessionMeta } {
   const trail: ToolCallSummary[] = [];
   const files: string[] = [];
   let latestUserPrompt: string | null = null;
@@ -616,23 +857,35 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
   let aiTitle: string | null = null;
   let subagentCount = 0;
   const agentCallDescs: string[] = [];
+  let model = '';
+  let turnCount = 0;
+  let lastInputTokens = 0;
 
   for (const evt of events) {
     const type = typeof evt.type === 'string' ? evt.type : '';
     const content = evt.message?.content;
 
-    if (type === 'assistant' && Array.isArray(content)) {
-      const ts = typeof evt.timestamp === 'string' ? Date.parse(evt.timestamp) || 0 : 0;
-      for (const part of content) {
-        if (!isToolUse(part)) continue;
-        const name = typeof part.name === 'string' ? part.name : 'Tool';
-        trail.push({ summary: labelForToolUse(name, part.input), at: ts });
-        const filePath = part.input?.file_path;
-        if (typeof filePath === 'string') files.push(filePath);
-        if (name === 'Agent') {
-          subagentCount += 1;
-          if (typeof part.input?.description === 'string' && part.input.description) {
-            agentCallDescs.push(part.input.description);
+    if (type === 'assistant') {
+      turnCount++;
+      const msg = evt.message;
+      if (msg) {
+        // Strip "claude-" prefix for compact display, e.g. "claude-sonnet-4-6" → "sonnet-4-6"
+        if (typeof msg.model === 'string' && msg.model) model = msg.model.replace(/^claude-/, '');
+        if (typeof msg.usage?.input_tokens === 'number') lastInputTokens = msg.usage.input_tokens;
+      }
+      if (Array.isArray(content)) {
+        const ts = typeof evt.timestamp === 'string' ? Date.parse(evt.timestamp) || 0 : 0;
+        for (const part of content) {
+          if (!isToolUse(part)) continue;
+          const name = typeof part.name === 'string' ? part.name : 'Tool';
+          trail.push({ summary: labelForToolUse(name, part.input), at: ts });
+          const filePath = part.input?.file_path;
+          if (typeof filePath === 'string') files.push(filePath);
+          if (name === 'Agent') {
+            subagentCount += 1;
+            if (typeof part.input?.description === 'string' && part.input.description) {
+              agentCallDescs.push(part.input.description);
+            }
           }
         }
       }
@@ -654,6 +907,10 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
     }
   }
 
+  const contextPct = lastInputTokens > 0
+    ? Math.round((lastInputTokens / CONTEXT_WINDOW) * 100)
+    : 0;
+
   return {
     details: {
       recentToolCalls: trail.slice(-MAX_TRAIL).reverse(),
@@ -665,7 +922,13 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
       subagentCount,
     },
     agentCallDescs,
+    meta: { model, turnCount, contextPct },
   };
+}
+
+/** Exported only for unit testing. */
+export function extractSessionMetaForTesting(events: RawEvent[]): SessionMeta {
+  return extractDetails(events).meta;
 }
 
 function isToolUse(

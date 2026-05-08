@@ -13,7 +13,7 @@ import { AgentService } from './agentService';
 import { Agent } from './types';
 import { findAgentPids, killAgent } from './processService';
 import { openTranscriptPreview, evict, updateTranscriptPanels } from './transcriptPanel';
-import { logError } from './logger';
+import { logError, logInfo } from './logger';
 
 
 /**
@@ -24,8 +24,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'agentViewer.panel';
   private _view?: vscode.WebviewView;
   private _subscription?: vscode.Disposable;
+  // When true, done parent agents and their subagents are excluded from postAgents()
+  // so we never serialize/transfer thousands of stale sessions on every tick.
+  private _hideDone = true;
+  // How many done parents to include when _hideDone is false. Incremented by
+  // DONE_PAGE_SIZE each time the user clicks "Load more". Reset to 0 when hideDone
+  // is re-enabled so the next reveal starts from the top again.
+  private _doneLoaded = 0;
+  private static readonly DONE_PAGE_SIZE = 100;
 
-  constructor(private readonly agentService: AgentService) {}
+  constructor(private readonly agentService: AgentService) { }
 
   /** Called by VS Code when the sidebar panel first becomes visible. Sets up the webview HTML, message handlers, and auto-refresh timer. */
   resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -60,7 +68,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     void this.agentService.refresh();
   }
 
-  /** Serializes the agent tree and posts a `render` message to the webview. */
+  /** Serializes the agent tree and posts a `render` message to the webview.
+   *
+   * When _hideDone is true, done parent sessions and all their subagents are
+   * excluded before serialization. This is the critical perf guard: with 3000+
+   * tracked sessions, serializing and postMessage-ing all of them on every tick
+   * costs ~2MB of JSON transfer + parse even though the webview discards almost
+   * all of it. Filtering here keeps the payload to the handful of live sessions.
+   */
   private postAgents(): void {
     if (!this._view) return;
     const serialize = (a: Agent): object => ({
@@ -78,23 +93,85 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       taskDescription: a.taskDescription,
       subagents: a.subagents.map(serialize),
     });
-    const agents = this.agentService.getAgents().map(serialize);
+
+    const allAgents = this.agentService.getAgents();
+    let agentsToSend = allAgents;
+    let doneParentCount = 0;
+
+    // Sort done parents newest-first and either exclude them all (hideDone) or
+    // include only the first _doneLoaded (paged reveal).
+    const allDoneParents = allAgents
+      .filter(a => !a.parentSessionId && a.state === 'done');
+    doneParentCount = allDoneParents.length;
+
+    const excludedDoneIds = new Set<string>();
+    let remainingDone = 0;
+
+    if (this._hideDone) {
+      // Exclude all done parents.
+      for (const a of allDoneParents) excludedDoneIds.add(a.sessionId);
+    } else {
+      // Include the paged slice; exclude the rest.
+      const visible = allDoneParents.slice(0, this._doneLoaded);
+      const hidden = allDoneParents.slice(this._doneLoaded);
+      remainingDone = hidden.length;
+      for (const a of hidden) excludedDoneIds.add(a.sessionId);
+    }
+
+    if (excludedDoneIds.size > 0) {
+      agentsToSend = allAgents.filter(a =>
+        !excludedDoneIds.has(a.sessionId) &&
+        !(a.parentSessionId && excludedDoneIds.has(a.parentSessionId))
+      );
+    }
+
     const ready = this.agentService.isReady();
-    this._view.webview.postMessage({ command: 'render', agents, ready, now: Date.now() });
+    const t0 = Date.now();
+    const payload = agentsToSend.map(serialize);
+    const serializeMs = Date.now() - t0;
+    logInfo('postAgents', `sending=${payload.length}/${allAgents.length} doneHidden=${excludedDoneIds.size} serializeMs=${serializeMs}ms`);
+    this._view.webview.postMessage({ command: 'render', agents: payload, ready, now: Date.now(), doneParentCount, remainingDone });
   }
 
   /** Dispatches messages from the webview to the appropriate action handler. */
-  private async handleMessage(message: { command: string; sessionId?: string }): Promise<void> {
+  private async handleMessage(message: { command: string; sessionId?: string; hideDone?: boolean; value?: boolean }): Promise<void> {
     const { command, sessionId } = message;
+    logInfo('handleMessage', sessionId ? `${command} sid=${sessionId.slice(0, 8)}` : command);
 
     if (command === 'refresh') {
+      // Explicit user-initiated refresh (toolbar button). Does NOT come from the
+      // webview script-load path — that sends 'syncPrefs' instead.
       this._view?.webview.postMessage({ command: 'reset' });
       this.refresh();
       return;
     }
 
+    if (command === 'syncPrefs') {
+      // Sent by the webview on script load to sync persisted preferences without
+      // triggering a full agent re-scan. Previously this was 'refresh', which
+      // caused agentService.refresh() (clear all + re-scan 3500 files) on every
+      // sidebar open — the likely root cause of "buttons stop working" freezes.
+      if (typeof message.hideDone === 'boolean') this._hideDone = message.hideDone;
+      this.postAgents();
+      return;
+    }
+
+    if (command === 'setHideDone') {
+      this._hideDone = message.value !== false;
+      // Reset pagination so toggling back on → off always starts from the top.
+      this._doneLoaded = this._hideDone ? 0 : AgentWebviewProvider.DONE_PAGE_SIZE;
+      this.postAgents();
+      return;
+    }
+
+    if (command === 'loadMoreDone') {
+      this._doneLoaded += AgentWebviewProvider.DONE_PAGE_SIZE;
+      this.postAgents();
+      return;
+    }
+
     if (!sessionId) return;
-    const agent = this.agentService.getAgents().find((a) => a.sessionId === sessionId);
+    const agent = this.agentService.getAgent(sessionId);
     if (!agent) return;
 
     switch (command) {
@@ -430,13 +507,21 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .archived-section.open .archived-body { display: block; }
 
     /* ── filter bar ── */
-    .filter-bar { padding: 5px 8px 4px; }
+    .filter-bar { display: flex; align-items: center; gap: 4px; padding: 5px 8px 4px; }
     .filter-input {
-      width: 100%; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border);
+      flex: 1; min-width: 0;
+      background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border);
       color: var(--vscode-input-foreground); border-radius: 4px; padding: 3px 8px;
       font-size: 11px; font-family: var(--vscode-font-family); outline: none;
     }
     .filter-input:focus { border-color: var(--vscode-focusBorder); }
+    .hide-done-btn {
+      flex-shrink: 0; background: none; border: 1px solid var(--vscode-input-border);
+      color: var(--vscode-descriptionForeground); border-radius: 3px; padding: 2px 6px;
+      font-size: 10px; cursor: pointer; white-space: nowrap; line-height: 1.4;
+    }
+    .hide-done-btn:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+    .hide-done-btn.active { border-color: rgba(110,118,129,.4); color: #6e7681; background: rgba(110,118,129,.08); }
 
     /* ── activity timeline ── */
     .activity-timeline { padding: 0 8px 6px 20px; display: flex; flex-direction: column; gap: 3px; }
@@ -483,21 +568,55 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       cursor: pointer; user-select: none; border-radius: 3px;
     }
     .ended-toggle:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
+
+    .load-more-done {
+      display: block; width: calc(100% - 16px); margin: 6px 8px 2px;
+      padding: 5px 0; background: none;
+      border: 1px dashed var(--vscode-input-border); border-radius: 4px;
+      color: var(--vscode-descriptionForeground); font-size: 11px;
+      cursor: pointer; text-align: center;
+    }
+    .load-more-done:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); background: var(--vscode-list-hoverBackground); }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .scanning-label {
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+      color: var(--vscode-descriptionForeground); padding: 8px 12px;
+    }
+    .spinner {
+      flex-shrink: 0; width: 11px; height: 11px; border-radius: 50%;
+      border: 1.5px solid var(--vscode-disabledForeground);
+      border-top-color: var(--vscode-descriptionForeground);
+      animation: spin 0.75s linear infinite;
+    }
   </style>
 </head>
 <body>
-  <div class="filter-bar"><input class="filter-input" id="filter-input" placeholder="Filter agents…" /></div>
+  <div class="filter-bar">
+    <input class="filter-input" id="filter-input" placeholder="Filter agents…" />
+    <button class="hide-done-btn" id="hide-done-btn" title="Show or hide completed sessions"></button>
+  </div>
   <div id="root" class="empty-global">Loading agents…</div>
+  <button class="load-more-done" id="load-more-done" style="display:none"></button>
 
   <script>
     const vscode = acquireVsCodeApi();
     const root = document.getElementById('root');
     const filterInput = document.getElementById('filter-input');
+    const hideDoneBtn = document.getElementById('hide-done-btn');
+
+    const savedState = vscode.getState() || {};
+    let hideDone = savedState.hideDone !== false; // default: hide done — mirrored in extension host
+    let lastDoneParentCount = 0;
+    const loadMoreBtn = document.getElementById('load-more-done');
 
     const openSections = {};
     const projGroupEls = new Map();
     const cardEls = new Map();
     let archivedEl = null;
+    let lastAgents = null;
+    let lastNow = Date.now();
+    let lastReady = false;
 
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -736,7 +855,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     function reconcile(groups, now) {
       for (const [key, el] of projGroupEls) {
-        if (!groups.has(key)) { el.remove(); projGroupEls.delete(key); }
+        if (!groups.has(key)) {
+          for (const [sid, cardEl] of cardEls) {
+            if (el.contains(cardEl)) cardEls.delete(sid);
+          }
+          el.remove();
+          projGroupEls.delete(key);
+        }
       }
 
       const sorted = [...groups.values()].sort((a, b) => {
@@ -885,17 +1010,35 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     let lastGroups = null;
     let rootIsEmpty = true;
 
-    function render(agents, now, ready) {
+    function updateHideDoneBtn(doneCount) {
+      if (!hideDoneBtn) return;
+      if (hideDone) {
+        hideDoneBtn.textContent = doneCount > 0 ? 'Show ' + doneCount + ' hidden' : 'None hidden';
+        hideDoneBtn.classList.add('active');
+      } else {
+        hideDoneBtn.textContent = doneCount > 0 ? 'Hide ' + doneCount + ' done' : 'None done';
+        hideDoneBtn.classList.remove('active');
+      }
+    }
+
+    function render(agents, now, ready, doneParentCount, remainingDone) {
+      lastAgents = agents; lastNow = now; lastReady = ready;
+      lastDoneParentCount = doneParentCount || 0;
       if (!ready) {
         root.className = 'empty-global';
-        root.innerHTML = 'Scanning…';
+        root.innerHTML = '<div class="scanning-label"><span class="spinner"></span>Scanning…</div>';
         rootIsEmpty = true;
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
         return;
       }
       if (!agents || agents.length === 0) {
         root.className = 'empty-global';
-        root.innerHTML = 'No agents yet — run <code>claude</code> in any project';
+        root.innerHTML = lastDoneParentCount > 0
+          ? lastDoneParentCount + ' ended sessions hidden'
+          : 'No agents yet — run <code>claude</code> in any project';
         rootIsEmpty = true;
+        updateHideDoneBtn(lastDoneParentCount);
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
         return;
       }
       if (rootIsEmpty) { root.innerHTML = ''; rootIsEmpty = false; }
@@ -904,6 +1047,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       lastGroups = groupByProject(parents);
       reconcile(lastGroups, now);
       applyFilter(filterInput ? filterInput.value : '');
+      updateHideDoneBtn(lastDoneParentCount);
+      if (loadMoreBtn) {
+        if (remainingDone > 0) {
+          loadMoreBtn.style.display = '';
+          loadMoreBtn.textContent = 'Load ' + Math.min(remainingDone, 100) + ' more ended sessions (' + remainingDone + ' remaining)';
+        } else {
+          loadMoreBtn.style.display = 'none';
+        }
+      }
     }
 
     root.addEventListener('click', (e) => {
@@ -977,21 +1129,40 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    if (hideDoneBtn) {
+      hideDoneBtn.addEventListener('click', () => {
+        hideDone = !hideDone;
+        vscode.setState({ ...vscode.getState(), hideDone });
+        // Tell the extension host — it will re-filter and send a new render message.
+        // This is the only place that can change what done agents are included,
+        // since the filtering now happens server-side.
+        vscode.postMessage({ command: 'setHideDone', value: hideDone });
+      });
+    }
+
+    if (loadMoreBtn) {
+      loadMoreBtn.addEventListener('click', () => vscode.postMessage({ command: 'loadMoreDone' }));
+    }
+
     window.addEventListener('message', (event) => {
-      const { command, agents, ready, now } = event.data;
+      const { command, agents, ready, now, doneParentCount, remainingDone } = event.data;
       if (command === 'reset') {
         root.className = 'empty-global';
-        root.innerHTML = 'Scanning…';
+        root.innerHTML = '<div class="scanning-label"><span class="spinner"></span>Scanning…</div>';
         rootIsEmpty = true;
         projGroupEls.clear();
         cardEls.clear();
         archivedEl = null;
+        if (loadMoreBtn) loadMoreBtn.style.display = 'none';
       } else if (command === 'render') {
-        render(agents, now, ready);
+        render(agents, now, ready, doneParentCount || 0, remainingDone || 0);
       }
     });
 
-    vscode.postMessage({ command: 'refresh' });
+    // Sync persisted preferences with the extension host. Uses 'syncPrefs' (not
+    // 'refresh') so the extension host only updates its filter state and re-sends
+    // agents — it does NOT trigger a full agentService.refresh() re-scan.
+    vscode.postMessage({ command: 'syncPrefs', hideDone });
   </script>
 
 </body>

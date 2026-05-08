@@ -51,6 +51,23 @@
           "group": "navigation"
         }
       ]
+    },
+    "configuration": {
+      "title": "Agent Viewer",
+      "properties": {
+        "agentViewer.runningWindowMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0.5,
+          "description": "A session is shown as 'running' for this many minutes after its last file write. Reduce if you want short-burst sessions to flip to idle sooner."
+        },
+        "agentViewer.doneAgeHours": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0.1,
+          "description": "Sessions with no activity for this many hours are archived. Lower values reduce memory usage; increase if you want older sessions visible without a manual refresh."
+        }
+      }
     }
   },
   "scripts": {
