@@ -112,7 +112,7 @@ export class AgentService {
     this._discoveryVisible = visible;
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.tickTimer = setInterval(
-      () => this.scheduleEmit('tick'),
+      () => this.onTick(),
       visible ? STATE_TICK_MS : STATE_TICK_MS_HIDDEN,
     );
     // Restart the self-rearming discovery loop at the new cadence.
@@ -137,12 +137,18 @@ export class AgentService {
     return Math.max(0.1, hours) * 60 * 60 * 1000;
   }
 
+  /** Combines the state-reclassification tick with a proactive subagent dir scan. */
+  private onTick(): void {
+    this.scheduleEmit('tick');
+    void this.scanPendingSubagentDirs();
+  }
+
   /** Begins the initial directory scan and starts the file watcher. */
   start(): void {
     // Periodic tick ensures time-based state transitions (running → idle → done)
     // fire even with no file changes. Routes through scheduleEmit so reclassification
     // always runs on a consistent snapshot, never interleaved with async file reads.
-    this.tickTimer = setInterval(() => this.scheduleEmit('tick'), STATE_TICK_MS);
+    this.tickTimer = setInterval(() => this.onTick(), STATE_TICK_MS);
     this.armDiscovery();
     // Re-classify when the user changes the done-age threshold.
     vscode.workspace.onDidChangeConfiguration(e => {
@@ -383,7 +389,7 @@ export class AgentService {
       const agent = buildAgent(filePath, stat.mtimeMs, events, cached, doneAgeMs, this.getRunningWindowMs());
       // Sticky: once a session has ever had Agent tool_use calls, remember it permanently
       // so watchAndDiscoverSubagents keeps firing even after those events age out of the tail.
-      if (agent.agentCallDescs.length > 0) {
+      if ((agent.agentCallDescs ?? []).length > 0) {
         this._agentsWithSubagents.add(sessionId);
       }
       if (known) {
@@ -412,9 +418,27 @@ export class AgentService {
   }
 
   /**
+   * On every state tick, checks subagent dirs for active sessions where the dir
+   * hasn't been confirmed yet. This handles the case where the parent file isn't
+   * written while it waits for the subagent (so no chokidar 'change' events fire
+   * for the parent during that window, and watchAndDiscoverSubagents is never
+   * retriggered from the change path).
+   */
+  private async scanPendingSubagentDirs(): Promise<void> {
+    for (const sessionId of this._agentsWithSubagents) {
+      const agent = this.agents.get(sessionId);
+      if (!agent || agent.state === 'done') continue;
+      const subagentDir = path.join(path.dirname(agent.transcriptPath), sessionId, 'subagents').replace(/\\/g, '/');
+      if (this.watchedSubagentDirs.has(subagentDir)) continue; // already confirmed
+      void this.watchAndDiscoverSubagents(agent.transcriptPath, sessionId);
+    }
+  }
+
+  /**
    * Proactively watches a parent agent's subagent directory and processes any
    * subagent files not yet tracked. Called on every parent file update that
-   * contains Agent tool calls.
+   * contains Agent tool calls, and also from the periodic tick for sessions
+   * whose subagent dir has not yet been confirmed.
    *
    * watcher.add() is deduplicated via watchedSubagentDirs. The readdir is
    * throttled to once per SUBAGENT_READDIR_THROTTLE_MS per directory — chokidar
@@ -444,9 +468,14 @@ export class AgentService {
       }
       const newFiles = files
         .filter(f => f.endsWith('.jsonl'))
-        .map(f => path.join(subagentDir, f))
+        .map(f => subagentDir + '/' + f)
         .filter(f => !this.agents.has(sessionIdFromPath(f)));
       if (newFiles.length > 0) {
+        // Watch each file individually — more reliable than the dir glob on Windows
+        // for detecting ongoing changes to an already-discovered subagent file.
+        if (this.watcher) {
+          for (const f of newFiles) this.watcher.add(f);
+        }
         await Promise.all(newFiles.map(f => this.processFile(f)));
         this.scheduleEmit();
       }

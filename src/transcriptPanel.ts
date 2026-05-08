@@ -8,6 +8,7 @@
  */
 
 import * as vscode from 'vscode';
+import * as fsp from 'fs/promises';
 import MarkdownIt from 'markdown-it';
 import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
 import { parseTranscriptWithState, parseTranscriptDelta, ParseState } from './transcriptParser';
