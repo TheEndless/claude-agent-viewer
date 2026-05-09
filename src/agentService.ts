@@ -61,10 +61,16 @@ export class AgentService {
   // that actively-streaming transcripts still get processed and panels stay live.
   private changeDebounce = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
   private static readonly CHANGE_FORCE_FLUSH_MS = 2_000;
-  // Session IDs that have EVER had Agent tool_use calls in their tail. Sticky — never
-  // reset on content updates — so watchAndDiscoverSubagents keeps firing even after the
-  // original Agent tool_use events scroll past the TAIL_BYTES window on long sessions.
+  // Session IDs that have EVER had Agent tool_use calls in their tail. Entries are
+  // removed when the session is deleted or transitions to 'done' — a done session
+  // will never spawn new subagents, so there is no value in continuing to poll its
+  // subagent dir. Without pruning, this set grows unboundedly and scanPendingSubagentDirs
+  // fires a readdir for every entry every 5 seconds, flooding the libuv I/O pool.
   private _agentsWithSubagents = new Set<string>();
+  // Consecutive empty-readdir count per subagent dir. After SUBAGENT_POLL_GIVEUP_COUNT
+  // failed polls the dir is dropped from _agentsWithSubagents to stop wasting I/O.
+  private _subagentPollFailures = new Map<string, number>();
+  private static readonly SUBAGENT_POLL_GIVEUP_COUNT = 12; // ~1 min at 5s tick
   // Tracks subagent dirs whose existence has been confirmed via a successful readdir.
   // watcher.add() is retried on every call until readdir succeeds — prevents the bug
   // where the dir didn't exist yet when we first called watcher.add() and chokidar
@@ -303,6 +309,7 @@ export class AgentService {
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
+      this._subagentPollFailures.clear();
       this.watchedSubagentDirs.clear();
       this.watchedSubagentDirLastRead.clear();
       this._ready = false;
@@ -312,13 +319,19 @@ export class AgentService {
     } catch (err) { logError('refresh', err); }
   }
 
-  /** Processes only files not yet tracked — called periodically to recover from missed watcher events. */
+  /**
+   * Processes only top-level session files not yet tracked. Intentionally shallow —
+   * only scans PROJECT_DIR/*.jsonl, not subagent subdirectories. Subagent files are
+   * discovered by scanPendingSubagentDirs (every tick) and watchAndDiscoverSubagents
+   * (on parent file change). A recursive scan of all 3000+ sessions plus subagent
+   * dirs on every 5-minute tick floods the libuv I/O pool on Windows.
+   */
   private async discoverNewFiles(): Promise<void> {
     try {
-      const allFiles = await findJsonlFiles(PROJECTS_ROOT);
-      const newFiles = allFiles.filter(f => !this.agents.has(sessionIdFromPath(f)));
-      if (newFiles.length > 0) {
-        await Promise.all(newFiles.map(f => this.processFile(f)));
+      const newFiles = await findTopLevelJsonlFiles(PROJECTS_ROOT);
+      const missing = newFiles.filter(f => !this.agents.has(sessionIdFromPath(f)));
+      if (missing.length > 0) {
+        await Promise.all(missing.map(f => this.processFile(f)));
         this.scheduleEmit();
       }
     } catch (err) { logError('discoverNewFiles', err); }
@@ -438,40 +451,55 @@ export class AgentService {
    * sessions), so there is no flooding risk.
    */
   private async scanPendingSubagentDirs(): Promise<void> {
-    const pending: Array<{ agent: Agent; subagentDir: string }> = [];
+    const pending: Array<{ sessionId: string; subagentDir: string }> = [];
     for (const sessionId of this._agentsWithSubagents) {
       const agent = this.agents.get(sessionId);
       if (!agent || agent.state === 'done') continue;
       const subagentDir = path.join(path.dirname(agent.transcriptPath), sessionId, 'subagents').replace(/\\/g, '/');
       if (this.watchedSubagentDirs.has(subagentDir)) continue;
-      pending.push({ agent, subagentDir });
+      pending.push({ sessionId, subagentDir });
     }
     if (pending.length === 0) return;
-    logInfo('scanPendingSubagentDirs', `checking ${pending.length} unconfirmed subagent dir(s)`);
-    await Promise.all(pending.map(async ({ subagentDir }) => {
-      try {
-        const files = await fsp.readdir(subagentDir);
-        const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
-        // Only mark as confirmed (and register the dir glob) once at least one
-        // jsonl file exists. An empty-dir readdir success still means no subagent
-        // has started writing yet — keep polling every tick until one appears.
-        // Marking confirmed too early permanently skips this dir, leaving discovery
-        // solely to chokidar's dynamic glob which is unreliable on Windows.
-        if (jsonlFiles.length === 0) return;
-        this.watchedSubagentDirs.add(subagentDir);
-        if (this.watcher) this.watcher.add(subagentDir + '/*.jsonl');
-        const newFiles = jsonlFiles
-          .map(f => subagentDir + '/' + f)
-          .filter(f => !this.agents.has(sessionIdFromPath(f)));
-        if (newFiles.length > 0) {
-          if (this.watcher) {
-            for (const f of newFiles) this.watcher.add(f);
+    // Process in batches of MAX_CONCURRENT_PROCESS to avoid flooding the libuv I/O pool.
+    for (let i = 0; i < pending.length; i += AgentService.MAX_CONCURRENT_PROCESS) {
+      await Promise.all(pending.slice(i, i + AgentService.MAX_CONCURRENT_PROCESS).map(async ({ sessionId, subagentDir }) => {
+        try {
+          const files = await fsp.readdir(subagentDir);
+          const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
+          // Only mark confirmed once a .jsonl file actually exists. An empty dir means
+          // the subagent process hasn't written yet — keep polling. Marking it confirmed
+          // on an empty readdir would permanently skip it (the has() guard above), leaving
+          // discovery solely to chokidar's unreliable dynamic glob on Windows.
+          if (jsonlFiles.length === 0) {
+            // Count consecutive empty polls. After giveup threshold, stop scanning this
+            // dir to avoid wasteful I/O for sessions where the subagent dir was created
+            // but no file ever appeared (crashed subagent, early exit, etc.).
+            const fails = (this._subagentPollFailures.get(subagentDir) ?? 0) + 1;
+            if (fails >= AgentService.SUBAGENT_POLL_GIVEUP_COUNT) {
+              logInfo('scanPendingSubagentDirs', `giving up on empty dir after ${fails} polls: ${subagentDir}`);
+              this._agentsWithSubagents.delete(sessionId);
+              this._subagentPollFailures.delete(subagentDir);
+            } else {
+              this._subagentPollFailures.set(subagentDir, fails);
+            }
+            return;
           }
-          await Promise.all(newFiles.map(f => this.processFile(f)));
-          this.scheduleEmit();
-        }
-      } catch { /* dir doesn't exist yet */ }
-    }));
+          this._subagentPollFailures.delete(subagentDir);
+          this.watchedSubagentDirs.add(subagentDir);
+          if (this.watcher) this.watcher.add(subagentDir + '/*.jsonl');
+          const newFiles = jsonlFiles
+            .map(f => subagentDir + '/' + f)
+            .filter(f => !this.agents.has(sessionIdFromPath(f)));
+          if (newFiles.length > 0) {
+            if (this.watcher) {
+              for (const f of newFiles) this.watcher.add(f);
+            }
+            await Promise.all(newFiles.map(f => this.processFile(f)));
+            this.scheduleEmit();
+          }
+        } catch { /* dir doesn't exist yet — normal */ }
+      }));
+    }
   }
 
   /**
@@ -531,11 +559,27 @@ export class AgentService {
     if (pending) { clearTimeout(pending.timer); this.changeDebounce.delete(filePath); }
     const sessionId = sessionIdFromPath(filePath);
     this.titleCache.delete(sessionId);
+    this.pruneSubagentState(filePath, sessionId);
     if (this.agents.delete(sessionId)) {
       this._structureChanged = true;
       this._onDidDrop.fire(sessionId);
       this.scheduleEmit();
     }
+  }
+
+  /**
+   * Removes subagent-related tracking state for a session that has been dropped
+   * or transitioned to 'done'. Releases OS-level file watches and prevents
+   * scanPendingSubagentDirs from repeatedly probing dead/done dirs.
+   */
+  private pruneSubagentState(filePath: string, sessionId: string): void {
+    this._agentsWithSubagents.delete(sessionId);
+    const subagentDir = path.join(path.dirname(filePath), sessionId, 'subagents').replace(/\\/g, '/');
+    this.watchedSubagentDirs.delete(subagentDir);
+    this.watchedSubagentDirLastRead.delete(subagentDir);
+    this._subagentPollFailures.delete(subagentDir);
+    if (this.watcher) this.watcher.unwatch(subagentDir + '/*.jsonl');
+    if (this.watcher) this.watcher.unwatch(filePath);
   }
 
   /**
@@ -583,12 +627,15 @@ export class AgentService {
           transitions.push(`${agent.sessionId.slice(0, 8)}: ${agent.state}→${nextState}`);
           agent.state = nextState; // mutate in place — subagents[] refs stay valid, no tree rebuild needed
           anyChanged = true;
+          // A done session will never spawn new subagents — release its tracking state
+          // so scanPendingSubagentDirs stops probing its dirs every 5 seconds.
+          if (nextState === 'done') this.pruneSubagentState(agent.transcriptPath, agent.sessionId);
         }
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
       // Heartbeat every ~5 min so we can distinguish "quiet (all done)" from a true hang.
       if (reason === 'tick' && ++this._tickCount % 60 === 0) {
-        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileActive} waiters=${this.processFileWaiters.length}`);
+        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileActive} waiters=${this.processFileWaiters.length} withSubagents=${this._agentsWithSubagents.size} watchedSubDirs=${this.watchedSubagentDirs.size}`);
       }
       if (reason === 'change' || reason === 'background' || anyChanged) {
         let treeMs = 0;
@@ -677,6 +724,27 @@ async function findJsonlFiles(rootDir: string): Promise<string[]> {
       const dirent = e as fs.Dirent & { parentPath?: string; path?: string };
       return path.join(dirent.parentPath ?? dirent.path ?? '', e.name);
     });
+}
+
+/**
+ * Shallow variant used by discoverNewFiles: only returns PROJECT_DIR/*.jsonl
+ * (top-level session files), not subagent files deeper in the tree. Two-level
+ * readdir instead of recursive — avoids reading tens of thousands of entries
+ * from the full session + subagent tree on every 5-minute discovery run.
+ */
+async function findTopLevelJsonlFiles(rootDir: string): Promise<string[]> {
+  const projectDirs = await fsp.readdir(rootDir, { withFileTypes: true });
+  const results: string[] = [];
+  await Promise.all(projectDirs.filter(d => d.isDirectory()).map(async d => {
+    const dirPath = path.join(rootDir, d.name);
+    try {
+      const files = await fsp.readdir(dirPath);
+      for (const f of files) {
+        if (f.endsWith('.jsonl')) results.push(path.join(dirPath, f));
+      }
+    } catch { /* skip unreadable dirs */ }
+  }));
+  return results;
 }
 
 function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], titles: TitleCache, doneAgeMs = DEFAULT_DONE_AGE_MS, runningWindowMs = DEFAULT_RUNNING_WINDOW_MS): Agent {

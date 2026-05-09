@@ -37,7 +37,28 @@ function postUpdate(webview: vscode.Webview, html: string, mode: IpcMode): void 
 // since JSONL files are append-only — size unchanged means no new content.
 // `state` carries the parser's mid-turn context so subsequent reads only need
 // to process new bytes rather than re-parsing the whole file.
+// Capped at PARSE_CACHE_MAX entries (LRU eviction) — long transcripts can be several MB
+// of parsed turns; unbounded growth causes memory pressure over extended sessions.
+const PARSE_CACHE_MAX = 20;
 const parseCache = new Map<string, { turns: Turn[]; size: number; state: ParseState }>();
+
+function parseCacheSet(sessionId: string, value: { turns: Turn[]; size: number; state: ParseState }): void {
+  parseCache.delete(sessionId); // move to end (most-recently-used)
+  parseCache.set(sessionId, value);
+  if (parseCache.size > PARSE_CACHE_MAX) {
+    // Evict the least-recently-used entry (first key in insertion order).
+    parseCache.delete(parseCache.keys().next().value!);
+  }
+}
+
+function parseCacheGet(sessionId: string): { turns: Turn[]; size: number; state: ParseState } | undefined {
+  const entry = parseCache.get(sessionId);
+  if (entry) {
+    parseCache.delete(sessionId); // move to end
+    parseCache.set(sessionId, entry);
+  }
+  return entry;
+}
 const openPanels = new Map<string, vscode.WebviewPanel>();
 // Number of turns we have already rendered into each panel's webview.
 // Used to append only newly-added turns on subsequent updates instead of
@@ -342,7 +363,7 @@ async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number; l
     bytes = stat.size;
   } catch (err) { logError(`getTurns stat(${agent.transcriptPath})`, err); }
 
-  const cached = parseCache.get(agent.sessionId);
+  const cached = parseCacheGet(agent.sessionId);
   if (cached && cached.size === bytes) return { turns: cached.turns, bytes, lastTurnUpdated: false };
 
   if (cached && bytes > cached.size) {
@@ -365,7 +386,7 @@ async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number; l
         : [...cached.turns, ...deltaTurns];
       // Store safeBytes (last-newline boundary), not raw bytes, so the next delta
       // starts from a known complete-line offset rather than possibly mid-write.
-      parseCache.set(agent.sessionId, { turns: mergedTurns, size: safeBytes, state });
+      parseCacheSet(agent.sessionId, { turns: mergedTurns, size: safeBytes, state });
       return { turns: mergedTurns, bytes: safeBytes, lastTurnUpdated: hadInProgress && deltaTurns.length > 0 };
     } catch (err) {
       logError(`getTurns delta(${agent.transcriptPath})`, err);
@@ -378,7 +399,7 @@ async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number; l
   try { text = await fsp.readFile(agent.transcriptPath, 'utf-8'); }
   catch (err) { logError(`getTurns readFile(${agent.transcriptPath})`, err); return { turns: [], bytes: 0, lastTurnUpdated: false }; }
   const { turns, state } = await parseTranscriptWithState(text);
-  parseCache.set(agent.sessionId, { turns, size: bytes, state });
+  parseCacheSet(agent.sessionId, { turns, size: bytes, state });
   return { turns, bytes, lastTurnUpdated: false };
 }
 
