@@ -56,9 +56,11 @@ export class AgentService {
   // Pending unlink timers keyed by file path. An 'add' event for the same path
   // cancels the timer before it fires, handling atomic-write rename sequences.
   private pendingDrops = new Map<string, NodeJS.Timeout>();
-  // Per-file debounce timers for 'change' events — avoids processing the same
-  // file on every individual write when Claude Code is actively running.
-  private changeDebounce = new Map<string, NodeJS.Timeout>();
+  // Per-file maxWait debounce for 'change' events. Trailing 500ms debounce, but
+  // forced to fire within CHANGE_FORCE_FLUSH_MS even under continuous writes so
+  // that actively-streaming transcripts still get processed and panels stay live.
+  private changeDebounce = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
+  private static readonly CHANGE_FORCE_FLUSH_MS = 2_000;
   // Session IDs that have EVER had Agent tool_use calls in their tail. Sticky — never
   // reset on content updates — so watchAndDiscoverSubagents keeps firing even after the
   // original Agent tool_use events scroll past the TAIL_BYTES window on long sessions.
@@ -259,15 +261,22 @@ export class AgentService {
         void this.processFile(p);
       })
       .on('change', (p) => {
-        // Debounce per-file: Claude Code writes many lines per second during
-        // active sessions. Process once after writes settle rather than on
-        // every individual write event.
+        // MaxWait debounce: trailing 500ms after writes settle, but forced to
+        // fire within CHANGE_FORCE_FLUSH_MS so continuously-streaming transcripts
+        // still get processed and transcript panels stay live.
         const existing = this.changeDebounce.get(p);
-        if (existing) clearTimeout(existing);
-        this.changeDebounce.set(p, setTimeout(() => {
+        if (existing) {
+          clearTimeout(existing.timer);
+        } else {
+          this.changeDebounce.set(p, { timer: undefined as unknown as NodeJS.Timeout, firstAt: Date.now() });
+        }
+        const entry = this.changeDebounce.get(p)!;
+        const elapsed = Date.now() - entry.firstAt;
+        const remaining = Math.max(0, AgentService.CHANGE_FORCE_FLUSH_MS - elapsed);
+        entry.timer = setTimeout(() => {
           this.changeDebounce.delete(p);
           void this.processFile(p);
-        }, 500));
+        }, Math.min(500, remaining));
       })
       .on('unlink', (p)        => {
         // Defer removal to absorb atomic rename (unlink → add within ~500ms).
@@ -289,7 +298,7 @@ export class AgentService {
     try {
       if (this.debounceTimer) { clearTimeout(this.debounceTimer); this.debounceTimer = undefined; }
       this.cancelDiscovery();
-      for (const t of this.changeDebounce.values()) clearTimeout(t);
+      for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
       this.changeDebounce.clear();
       this.agents.clear();
       this.titleCache.clear();
@@ -423,15 +432,46 @@ export class AgentService {
    * written while it waits for the subagent (so no chokidar 'change' events fire
    * for the parent during that window, and watchAndDiscoverSubagents is never
    * retriggered from the change path).
+   *
+   * Bypasses the readdir throttle in watchAndDiscoverSubagents — the filter to
+   * non-done, unconfirmed dirs keeps the scan set small (typically 1-3 active
+   * sessions), so there is no flooding risk.
    */
   private async scanPendingSubagentDirs(): Promise<void> {
+    const pending: Array<{ agent: Agent; subagentDir: string }> = [];
     for (const sessionId of this._agentsWithSubagents) {
       const agent = this.agents.get(sessionId);
       if (!agent || agent.state === 'done') continue;
       const subagentDir = path.join(path.dirname(agent.transcriptPath), sessionId, 'subagents').replace(/\\/g, '/');
-      if (this.watchedSubagentDirs.has(subagentDir)) continue; // already confirmed
-      void this.watchAndDiscoverSubagents(agent.transcriptPath, sessionId);
+      if (this.watchedSubagentDirs.has(subagentDir)) continue;
+      pending.push({ agent, subagentDir });
     }
+    if (pending.length === 0) return;
+    logInfo('scanPendingSubagentDirs', `checking ${pending.length} unconfirmed subagent dir(s)`);
+    await Promise.all(pending.map(async ({ subagentDir }) => {
+      try {
+        const files = await fsp.readdir(subagentDir);
+        const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
+        // Only mark as confirmed (and register the dir glob) once at least one
+        // jsonl file exists. An empty-dir readdir success still means no subagent
+        // has started writing yet — keep polling every tick until one appears.
+        // Marking confirmed too early permanently skips this dir, leaving discovery
+        // solely to chokidar's dynamic glob which is unreliable on Windows.
+        if (jsonlFiles.length === 0) return;
+        this.watchedSubagentDirs.add(subagentDir);
+        if (this.watcher) this.watcher.add(subagentDir + '/*.jsonl');
+        const newFiles = jsonlFiles
+          .map(f => subagentDir + '/' + f)
+          .filter(f => !this.agents.has(sessionIdFromPath(f)));
+        if (newFiles.length > 0) {
+          if (this.watcher) {
+            for (const f of newFiles) this.watcher.add(f);
+          }
+          await Promise.all(newFiles.map(f => this.processFile(f)));
+          this.scheduleEmit();
+        }
+      } catch { /* dir doesn't exist yet */ }
+    }));
   }
 
   /**
@@ -488,7 +528,7 @@ export class AgentService {
   private dropFile(filePath: string): void {
     // Cancel any pending change-debounce so processFile doesn't run on a deleted file.
     const pending = this.changeDebounce.get(filePath);
-    if (pending) { clearTimeout(pending); this.changeDebounce.delete(filePath); }
+    if (pending) { clearTimeout(pending.timer); this.changeDebounce.delete(filePath); }
     const sessionId = sessionIdFromPath(filePath);
     this.titleCache.delete(sessionId);
     if (this.agents.delete(sessionId)) {
@@ -619,7 +659,7 @@ export class AgentService {
     this.cancelDiscovery();
     for (const t of this.pendingDrops.values()) clearTimeout(t);
     this.pendingDrops.clear();
-    for (const t of this.changeDebounce.values()) clearTimeout(t);
+    for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
     this.changeDebounce.clear();
     this.watcher?.close();
     this._onDidChange.dispose();
