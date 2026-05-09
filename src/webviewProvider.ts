@@ -841,10 +841,20 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         if (tl) tl.insertAdjacentHTML('afterend', newBadge);
       }
 
-      const toggleEl = cardEl.querySelector('.sub-toggle');
-      const subListEl = cardEl.querySelector('.sub-list');
       const allSubs = agent.subagents||[];
-      if (toggleEl && allSubs.length > 0) {
+      let toggleEl = cardEl.querySelector('.sub-toggle');
+      let subListEl = cardEl.querySelector('.sub-list');
+      if (allSubs.length > 0 && !toggleEl) {
+        // Card was initially created before any subagents existed — insert the
+        // sub-section now that we have subagents for the first time.
+        const subKey = 'proj:'+projectKey(agent.cwd)+':subs:'+agent.sessionId;
+        cardEl.insertAdjacentHTML('beforeend',
+          '<div class="sub-toggle" data-sub-key="'+esc(subKey)+'"><span class="sub-caret">▶</span><span></span></div>'
+          + '<div class="sub-list"></div>');
+        toggleEl = cardEl.querySelector('.sub-toggle');
+        subListEl = cardEl.querySelector('.sub-list');
+      }
+      if (toggleEl) {
         toggleEl.innerHTML = '<span class="sub-caret">▶</span>'
           + '<span>'+allSubs.length+' subagent'+(allSubs.length!==1?'s':'')+'</span>'
           + rollupSubagentDots(allSubs);
