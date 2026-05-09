@@ -842,11 +842,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
 
       const toggleEl = cardEl.querySelector('.sub-toggle');
+      const subListEl = cardEl.querySelector('.sub-list');
       const allSubs = agent.subagents||[];
       if (toggleEl && allSubs.length > 0) {
         toggleEl.innerHTML = '<span class="sub-caret">▶</span>'
           + '<span>'+allSubs.length+' subagent'+(allSubs.length!==1?'s':'')+'</span>'
           + rollupSubagentDots(allSubs);
+      }
+      if (subListEl) {
+        subListEl.innerHTML = allSubs.slice().sort((a,b)=>b.mtimeMs-a.mtimeMs).map(s=>renderSubRow(s,now)).join('');
       }
 
       const stopBtn = cardEl.querySelector('.card-actions [data-act="stop"]');
