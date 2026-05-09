@@ -578,10 +578,11 @@ export class AgentService {
     this.watchedSubagentDirs.delete(subDir);
     this.watchedSubagentDirLastRead.delete(subDir);
     this._subagentPollFailures.delete(subDir);
-    if (this.watcher) {
-      this.watcher.unwatch(subDir + '/*.jsonl');
-      this.watcher.unwatch(agent.transcriptPath);
-    }
+    // Only unwatch the subagent dir glob (added explicitly). Do NOT unwatch
+    // agent.transcriptPath — top-level sessions are covered by the initial shallow
+    // glob and unwatching them stops change events for sessions that later become
+    // active again (e.g. a long-running parent that spawns more subagents later).
+    if (this.watcher) this.watcher.unwatch(subDir + '/*.jsonl');
   }
 
   /**

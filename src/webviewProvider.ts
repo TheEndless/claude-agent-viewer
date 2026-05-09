@@ -1159,6 +1159,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
     });
 
+    // Refresh relative timestamps (e.g. "now" → "5m") on a client-side clock so
+    // ages stay accurate even when the extension host sends no new render messages
+    // (which only happen on state changes — stable done/idle agents never trigger one).
+    setInterval(() => { if (lastGroups) reconcile(lastGroups, Date.now()); }, 10_000);
+
     // Sync persisted preferences with the extension host. Uses 'syncPrefs' (not
     // 'refresh') so the extension host only updates its filter state and re-sends
     // agents — it does NOT trigger a full agentService.refresh() re-scan.
