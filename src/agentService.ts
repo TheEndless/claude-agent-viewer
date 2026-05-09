@@ -61,24 +61,18 @@ export class AgentService {
   // that actively-streaming transcripts still get processed and panels stay live.
   private changeDebounce = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
   private static readonly CHANGE_FORCE_FLUSH_MS = 2_000;
-  // Session IDs that have EVER had Agent tool_use calls in their tail. Entries are
-  // removed when the session is deleted or transitions to 'done' — a done session
-  // will never spawn new subagents, so there is no value in continuing to poll its
-  // subagent dir. Without pruning, this set grows unboundedly and scanPendingSubagentDirs
-  // fires a readdir for every entry every 5 seconds, flooding the libuv I/O pool.
+  // Session IDs that have ever had Agent tool_use calls. Pruned when sessions go
+  // done/dropped so scanPendingSubagentDirs doesn't probe dead dirs indefinitely.
   private _agentsWithSubagents = new Set<string>();
-  // Consecutive empty-readdir count per subagent dir. After SUBAGENT_POLL_GIVEUP_COUNT
-  // failed polls the dir is dropped from _agentsWithSubagents to stop wasting I/O.
+  // Consecutive empty-readdir count per subagent dir — pruned from _agentsWithSubagents
+  // after SUBAGENT_POLL_GIVEUP_COUNT misses (subagent dir created but never written to).
   private _subagentPollFailures = new Map<string, number>();
   private static readonly SUBAGENT_POLL_GIVEUP_COUNT = 12; // ~1 min at 5s tick
-  // Tracks subagent dirs whose existence has been confirmed via a successful readdir.
-  // watcher.add() is retried on every call until readdir succeeds — prevents the bug
-  // where the dir didn't exist yet when we first called watcher.add() and chokidar
-  // silently missed all subsequent file creations in that dir.
+  // Subagent dirs confirmed to exist (at least one .jsonl found). Used to distinguish
+  // "polling until first file appears" from "watching an already-active dir".
   private watchedSubagentDirs = new Set<string>();
-  // Throttle readdir per subagent dir — on Windows with 500+ sessions, an
-  // uncapped readdir every 500ms (the change-debounce interval) saturates the
-  // libuv I/O thread pool and locks up the extension host event loop.
+  // Timestamp of last readdir per confirmed subagent dir. Throttles rescans so a
+  // busy parent session doesn't issue a readdir on every file-change event.
   private watchedSubagentDirLastRead = new Map<string, number>();
   private static readonly SUBAGENT_READDIR_THROTTLE_MS = 10_000;
   // Concurrency gate for processFile: prevents more than MAX_CONCURRENT_PROCESS
@@ -455,8 +449,16 @@ export class AgentService {
     for (const sessionId of this._agentsWithSubagents) {
       const agent = this.agents.get(sessionId);
       if (!agent || agent.state === 'done') continue;
-      const subagentDir = path.join(path.dirname(agent.transcriptPath), sessionId, 'subagents').replace(/\\/g, '/');
-      if (this.watchedSubagentDirs.has(subagentDir)) continue;
+      const subagentDir = subagentDirPath(agent.transcriptPath, sessionId);
+      if (this.watchedSubagentDirs.has(subagentDir)) {
+        // Dir confirmed — re-scan for new files added since initial discovery.
+        // chokidar's dynamically-added glob is unreliable on Windows, so new subagent
+        // files in an existing dir won't fire 'add' events. watchAndDiscoverSubagents
+        // rescans the dir but is throttled to SUBAGENT_READDIR_THROTTLE_MS so the
+        // per-tick call here is cheap when nothing has changed.
+        void this.watchAndDiscoverSubagents(agent.transcriptPath, sessionId);
+        continue;
+      }
       pending.push({ sessionId, subagentDir });
     }
     if (pending.length === 0) return;
@@ -514,7 +516,7 @@ export class AgentService {
    * Windows unreliability with dynamically-added globs.
    */
   private async watchAndDiscoverSubagents(parentFilePath: string, sessionId: string): Promise<void> {
-    const subagentDir = path.join(path.dirname(parentFilePath), sessionId, 'subagents').replace(/\\/g, '/');
+    const subagentDir = subagentDirPath(parentFilePath, sessionId);
 
     // Throttle readdir — with 500+ active sessions each firing a change-debounce every
     // 500ms, running readdir on every call saturates the libuv I/O thread pool.
@@ -559,7 +561,7 @@ export class AgentService {
     if (pending) { clearTimeout(pending.timer); this.changeDebounce.delete(filePath); }
     const sessionId = sessionIdFromPath(filePath);
     this.titleCache.delete(sessionId);
-    this.pruneSubagentState(filePath, sessionId);
+    this.pruneSubagentState(sessionId);
     if (this.agents.delete(sessionId)) {
       this._structureChanged = true;
       this._onDidDrop.fire(sessionId);
@@ -567,19 +569,19 @@ export class AgentService {
     }
   }
 
-  /**
-   * Removes subagent-related tracking state for a session that has been dropped
-   * or transitioned to 'done'. Releases OS-level file watches and prevents
-   * scanPendingSubagentDirs from repeatedly probing dead/done dirs.
-   */
-  private pruneSubagentState(filePath: string, sessionId: string): void {
+  /** Releases all subagent tracking state for a session going done/dropped. */
+  private pruneSubagentState(sessionId: string): void {
     this._agentsWithSubagents.delete(sessionId);
-    const subagentDir = path.join(path.dirname(filePath), sessionId, 'subagents').replace(/\\/g, '/');
-    this.watchedSubagentDirs.delete(subagentDir);
-    this.watchedSubagentDirLastRead.delete(subagentDir);
-    this._subagentPollFailures.delete(subagentDir);
-    if (this.watcher) this.watcher.unwatch(subagentDir + '/*.jsonl');
-    if (this.watcher) this.watcher.unwatch(filePath);
+    const agent = this.agents.get(sessionId);
+    if (!agent) return;
+    const subDir = subagentDirPath(agent.transcriptPath, sessionId);
+    this.watchedSubagentDirs.delete(subDir);
+    this.watchedSubagentDirLastRead.delete(subDir);
+    this._subagentPollFailures.delete(subDir);
+    if (this.watcher) {
+      this.watcher.unwatch(subDir + '/*.jsonl');
+      this.watcher.unwatch(agent.transcriptPath);
+    }
   }
 
   /**
@@ -629,7 +631,7 @@ export class AgentService {
           anyChanged = true;
           // A done session will never spawn new subagents — release its tracking state
           // so scanPendingSubagentDirs stops probing its dirs every 5 seconds.
-          if (nextState === 'done') this.pruneSubagentState(agent.transcriptPath, agent.sessionId);
+          if (nextState === 'done') this.pruneSubagentState(agent.sessionId);
         }
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
@@ -712,6 +714,11 @@ export class AgentService {
     this._onDidChange.dispose();
     this._onDidDrop.dispose();
   }
+}
+
+/** Builds the subagent directory path for a session from its transcript file path. */
+function subagentDirPath(transcriptPath: string, sessionId: string): string {
+  return path.join(path.dirname(transcriptPath), sessionId, 'subagents').replace(/\\/g, '/');
 }
 
 /** Returns all .jsonl file paths under rootDir at any depth. Throws if rootDir is unreadable. */
