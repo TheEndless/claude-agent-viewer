@@ -113,6 +113,10 @@ export class AgentService {
   // extension host process — per-event processing accumulates into a backlog
   // faster than libuv can drain. We batch events instead.
   private _windowFocused = true;
+  // Pending focus value during a debounce window. Compared against in setWindowFocused
+  // so a rapid false→true→false sequence within the debounce doesn't get a stale
+  // committed value (which would incorrectly let the second transition early-exit).
+  private _pendingFocused: boolean | undefined;
   // Coalesced change/add events while in batch mode (unfocused or throttled).
   // Drained every BATCH_DRAIN_MS or immediately on focus/throttle recovery.
   private readonly _pendingPaths = new Set<string>();
@@ -173,9 +177,15 @@ export class AgentService {
    * two inputs (the other being detected throttling).
    */
   setWindowFocused(focused: boolean): void {
-    if (focused === this._windowFocused) return;
+    // Compare against the latest known target — committed if no debounce in flight,
+    // otherwise the pending value. Prevents brief blur→focus sequences (e.g. screenshot
+    // tool overlay flashing) from leaving the state stuck on the wrong value.
+    const latest = this._pendingFocused !== undefined ? this._pendingFocused : this._windowFocused;
+    if (focused === latest) return;
+    this._pendingFocused = focused;
     if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
     this._focusDebounceTimer = setTimeout(() => {
+      this._pendingFocused = undefined;
       this._windowFocused = focused;
       logInfo('focus', focused ? 'window focused' : 'window unfocused');
       this.updateBatchTimerState();
@@ -630,13 +640,19 @@ export class AgentService {
   }
 
   /**
-   * Manual clean-slate for the queue without a full agent refresh.
-   * Reachable via the agentViewer.flushQueue command.
+   * Manual clean-slate. Clears queues AND reclaims all in-flight slots
+   * (the orphaned operations continue on libuv threads — we can't cancel them
+   * — but our concurrency gate is freed so new work can run). Reachable via
+   * the agentViewer.flushQueue command for when the user sees a hang.
    */
   flushQueue(): void {
     const counts = this.clearTransientQueues();
-    const stale = this.checkStaleOperations();
-    logInfo('flushQueue', `cleared debounced=${counts.debounced} drops=${counts.drops} waiters=${counts.waiters} stale=${stale} pending=${counts.pending}`);
+    const inflightCount = this.processFileInFlight.size;
+    this.processFileInFlight.clear();
+    this.processFileStartedAt.clear();
+    // Also clear cooldowns so the next chokidar event can immediately re-read.
+    this.processFileNextReadAt.clear();
+    logInfo('flushQueue', `cleared debounced=${counts.debounced} drops=${counts.drops} waiters=${counts.waiters} pending=${counts.pending} inflight=${inflightCount}`);
   }
 
   private async processFileImpl(filePath: string, stats?: fs.Stats): Promise<void> {
