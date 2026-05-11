@@ -86,6 +86,11 @@ export class AgentService {
   // file lock / antivirus) can cause thousands of closures to pile up indefinitely.
   // Dropped entries are retried on the next chokidar event or periodic scan.
   private static readonly MAX_WAITER_QUEUE = 200;
+  // Per-file in-flight guard. Prevents multiple concurrent reads of the same path
+  // when chokidar fires change events faster than a slow read can complete (e.g. an
+  // active session transcript taking 20s+ to read under Windows Defender). A new
+  // chokidar event will re-trigger after the file is next written to, so no data is lost.
+  private readonly processFileInFlight = new Set<string>();
   // Throttle change-triggered emits: after firing, hold off for this long before
   // firing again. Prevents rapid file writes from rebuilding the agent tree on
   // every individual write when multiple sessions are active simultaneously.
@@ -316,6 +321,7 @@ export class AgentService {
       this.changeDebounce.clear();
       for (const t of this.pendingDrops.values()) clearTimeout(t);
       this.pendingDrops.clear();
+      this.processFileInFlight.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
@@ -365,6 +371,13 @@ export class AgentService {
    * Runs through a concurrency gate to prevent I/O pool saturation.
    */
   private async processFile(filePath: string, stats?: fs.Stats): Promise<void> {
+    // Drop duplicate triggers for the same file while a read is already in-flight.
+    // Active sessions fire chokidar change events faster than a slow read can complete,
+    // causing up to MAX_CONCURRENT_PROCESS simultaneous reads of the same path, each
+    // blocking an I/O thread for 20+ seconds under Windows Defender. Chokidar will
+    // re-fire when the file is next written to, so no content is missed.
+    if (this.processFileInFlight.has(filePath)) return;
+
     if (this.processFileActive >= AgentService.MAX_CONCURRENT_PROCESS) {
       if (this.processFileWaiters.length >= AgentService.MAX_WAITER_QUEUE) {
         logInfo('processFile', `queue full (${AgentService.MAX_WAITER_QUEUE}) — dropping: ${path.basename(filePath)}`);
@@ -374,6 +387,7 @@ export class AgentService {
       if (!this._initializing) logInfo('processFile', `queued (active=${this.processFileActive} waiting=${this.processFileWaiters.length}): ${path.basename(filePath)}`);
       await new Promise<void>(resolve => this.processFileWaiters.push(resolve));
     }
+    this.processFileInFlight.add(filePath);
     this.processFileActive++;
     const _ioT0 = Date.now();
     try {
@@ -381,6 +395,7 @@ export class AgentService {
     } finally {
       const _ioMs = Date.now() - _ioT0;
       if (_ioMs > 1_000) logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+      this.processFileInFlight.delete(filePath);
       this.processFileActive--;
       this.processFileWaiters.shift()?.();
     }
