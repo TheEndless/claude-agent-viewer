@@ -41,6 +41,11 @@
         "command": "agentViewer.refresh",
         "title": "Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "agentViewer.flushQueue",
+        "title": "Flush Event Queue",
+        "category": "Agent Viewer"
       }
     ],
     "menus": {

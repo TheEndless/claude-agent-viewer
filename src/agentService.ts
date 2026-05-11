@@ -102,6 +102,11 @@ export class AgentService {
   // active session transcript taking 20s+ to read under Windows Defender). A new
   // chokidar event will re-trigger after the file is next written to, so no data is lost.
   private readonly processFileInFlight = new Set<string>();
+  // Tracks start time of each in-flight processFile so we can detect and abandon
+  // operations that have been stuck for too long (e.g. fsp.open hanging on a file
+  // locked by another process). Auto-flush periodically reclaims stuck slots.
+  private readonly processFileStartedAt = new Map<string, number>();
+  private static readonly STALE_OPERATION_MS = 60_000;
   // Per-file cooldown: timestamp of the last completed read. Prevents immediately
   // re-reading the same file after a slow Defender-blocked read completes. Without
   // this, completing a 21-second read clears the in-flight guard, and the next
@@ -115,6 +120,19 @@ export class AgentService {
   private static readonly MIN_CHANGE_EMIT_MS = 2_000;
   private _discoveryVisible = true;
   private _discoveryGen = 0;
+  // Window focus tracking: when VS Code's window loses focus (e.g. user has the
+  // sidebar on a second monitor but interacts with apps elsewhere), Windows
+  // throttles the extension host. Continuing to process every chokidar event
+  // builds up a backlog in the libuv I/O thread pool that takes minutes to drain
+  // when focus returns. We drop change events while unfocused and do a single
+  // catch-up stat pass on refocus instead.
+  private _windowFocused = true;
+  // Set by the chokidar change handler when we ignore an event due to unfocus.
+  // Tells setWindowFocused to do a catch-up rescan on refocus.
+  private _dirtyWhileUnfocused = false;
+  // Debounce for focus changes so a quick alt-tab doesn't trigger a rescan.
+  private _focusDebounceTimer?: NodeJS.Timeout;
+  private static readonly FOCUS_DEBOUNCE_MS = 1_000;
   // Used to measure event-loop lag: actual tick interval vs. scheduled interval.
   private _lastTickMs = 0;
   private _tickIntervalMs = STATE_TICK_MS;
@@ -153,6 +171,50 @@ export class AgentService {
     if (visible) this.scheduleEmit();
   }
 
+  /**
+   * Called when the VS Code window's focus changes. When the window loses focus,
+   * Windows throttles the extension host process and chokidar events accumulate
+   * faster than libuv can drain them — eventually saturating all 4 I/O threads
+   * and causing minute-long stalls when the user returns. We drop change events
+   * while unfocused and do a single catch-up pass on refocus.
+   * Debounced by FOCUS_DEBOUNCE_MS so a quick alt-tab doesn't trigger work.
+   */
+  setWindowFocused(focused: boolean): void {
+    if (focused === this._windowFocused) return;
+    if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
+    this._focusDebounceTimer = setTimeout(() => {
+      this._windowFocused = focused;
+      logInfo('focus', focused ? 'window focused — resuming normal processing' : 'window unfocused — suspending change events');
+      if (focused && this._dirtyWhileUnfocused) {
+        this._dirtyWhileUnfocused = false;
+        void this.catchUpAfterUnfocus();
+      }
+    }, AgentService.FOCUS_DEBOUNCE_MS);
+  }
+
+  /**
+   * Re-stats all currently-tracked non-done agents to pick up changes that
+   * happened while the window was unfocused. Much cheaper than a full rescan
+   * (only touches sessions we already know about, not all 3000+ on disk).
+   * New sessions discovered while unfocused are caught by the discovery tick.
+   */
+  private async catchUpAfterUnfocus(): Promise<void> {
+    const t0 = Date.now();
+    const candidates = [...this.agents.values()].filter(a => a.state !== 'done');
+    let changed = 0;
+    for (const agent of candidates) {
+      try {
+        const stat = await fsp.stat(agent.transcriptPath);
+        if (stat.mtimeMs !== agent.mtimeMs) {
+          changed++;
+          await this.processFile(agent.transcriptPath, stat);
+        }
+      } catch { /* file gone — drop handler will catch it later */ }
+    }
+    logInfo('focus', `catch-up: stat'd ${candidates.length} active sessions in ${Date.now() - t0}ms, ${changed} changed`);
+    if (changed > 0) this.scheduleEmit();
+  }
+
   private getConfig() {
     return vscode.workspace.getConfiguration('agentViewer');
   }
@@ -179,6 +241,10 @@ export class AgentService {
     this._lastTickMs = now;
     this.scheduleEmit('tick');
     void this.scanPendingSubagentDirs();
+    // Reclaim slots from any processFile operation stuck >60s. The OS operation
+    // continues on its libuv thread, but our concurrency slot is freed so new work
+    // can run. Without this, a few hung opens permanently consume our 2 slots.
+    this.checkStaleOperations();
     // Every 6th tick (~30s), time a small control read on this file itself. If THIS
     // gets slow, the libuv I/O thread pool is starved — the slowness is pool-wide,
     // not specific to the transcripts. If it stays fast, the issue is file-specific
@@ -320,12 +386,21 @@ export class AgentService {
     });
     this.watcher
       .on('add',    (p) => {
+        // Drop 'add' events while unfocused — catchUpAfterUnfocus stat's known sessions,
+        // and the periodic discovery tick will pick up genuinely new files. Avoiding
+        // processFile here is what keeps the libuv pool from backing up.
+        if (!this._windowFocused) { this._dirtyWhileUnfocused = true; return; }
         // Cancel any pending drop for this path (atomic-write rename sequence).
         const t = this.pendingDrops.get(p);
         if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
         void this.processFile(p);
       })
       .on('change', (p) => {
+        // While the window is unfocused, drop change events entirely. Windows throttles
+        // our process aggressively, and accumulated events saturate the libuv I/O pool —
+        // a 109-second open() was traced to this exact pattern. The catch-up pass on
+        // refocus stat's all active sessions and processes any that changed.
+        if (!this._windowFocused) { this._dirtyWhileUnfocused = true; return; }
         // MaxWait debounce: trailing 500ms after writes settle, but forced to
         // fire within CHANGE_FORCE_FLUSH_MS so continuously-streaming transcripts
         // still get processed and transcript panels stay live.
@@ -453,8 +528,12 @@ export class AgentService {
       await new Promise<void>(resolve => this.processFileWaiters.push(resolve));
     }
     this.processFileInFlight.add(filePath);
+    this.processFileStartedAt.set(filePath, Date.now());
     this.processFileActive++;
     const _ioT0 = Date.now();
+    // Capture so we can detect if our slot was already reclaimed by the stale-op sweep.
+    // If reclaimed, we mustn't double-decrement processFileActive or double-shift waiters.
+    const inflightAtStart = this.processFileInFlight.has(filePath);
     try {
       await this.processFileImpl(filePath, stats);
     } finally {
@@ -473,10 +552,60 @@ export class AgentService {
       } else {
         logInfo('processFile', `I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
       }
-      this.processFileInFlight.delete(filePath);
-      this.processFileActive--;
-      this.processFileWaiters.shift()?.();
+      // Only release the slot if it wasn't already reclaimed by a stale-op sweep.
+      // The sweep removes the path from processFileInFlight when it gives up waiting.
+      if (inflightAtStart && this.processFileInFlight.has(filePath)) {
+        this.processFileInFlight.delete(filePath);
+        this.processFileStartedAt.delete(filePath);
+        this.processFileActive--;
+        this.processFileWaiters.shift()?.();
+      }
     }
+  }
+
+  /**
+   * Scans in-flight processFile operations and reclaims slots for any stuck longer
+   * than STALE_OPERATION_MS. The actual fsp.open/read continues on the libuv thread
+   * (we can't cancel it), but we stop blocking our concurrency slot on it. When the
+   * orphaned operation eventually completes, its finally{} block detects the slot
+   * was reclaimed and exits without double-releasing.
+   */
+  private checkStaleOperations(): number {
+    const now = Date.now();
+    let reclaimed = 0;
+    for (const [filePath, startedAt] of this.processFileStartedAt) {
+      if (now - startedAt < AgentService.STALE_OPERATION_MS) continue;
+      const ageMs = now - startedAt;
+      logInfo('checkStaleOperations', `reclaiming slot for ${path.basename(filePath)} stuck ${Math.round(ageMs / 1000)}s`);
+      this.processFileInFlight.delete(filePath);
+      this.processFileStartedAt.delete(filePath);
+      this.processFileActive = Math.max(0, this.processFileActive - 1);
+      this.processFileWaiters.shift()?.();
+      reclaimed++;
+    }
+    return reclaimed;
+  }
+
+  /**
+   * Manually clears the change-event queue and resets in-flight tracking. Useful
+   * when the extension has accumulated a backlog (e.g. after a long unfocused
+   * period) and the user wants an immediate clean slate without a full refresh.
+   * Does NOT clear the agents Map or title cache — only the transient queues.
+   */
+  flushQueue(): void {
+    for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
+    const debouncedCount = this.changeDebounce.size;
+    this.changeDebounce.clear();
+    for (const t of this.pendingDrops.values()) clearTimeout(t);
+    const dropCount = this.pendingDrops.size;
+    this.pendingDrops.clear();
+    // Wake up any waiters so they exit their await and check the cooldown again
+    // (most will be skipped by the cooldown since their files were just touched).
+    const waiterCount = this.processFileWaiters.length;
+    while (this.processFileWaiters.length > 0) this.processFileWaiters.shift()?.();
+    const staleCount = this.checkStaleOperations();
+    this._dirtyWhileUnfocused = false;
+    logInfo('flushQueue', `cleared debounced=${debouncedCount} drops=${dropCount} waiters=${waiterCount} stale=${staleCount}`);
   }
 
   private async processFileImpl(filePath: string, stats?: fs.Stats): Promise<void> {
