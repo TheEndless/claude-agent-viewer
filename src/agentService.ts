@@ -127,10 +127,14 @@ export class AgentService {
   // when focus returns. We drop change events while unfocused and do a single
   // catch-up stat pass on refocus instead.
   private _windowFocused = true;
-  // Set by the chokidar change handler when we ignore an event due to unfocus.
-  // Tells setWindowFocused to do a catch-up rescan on refocus.
-  private _dirtyWhileUnfocused = false;
-  // Debounce for focus changes so a quick alt-tab doesn't trigger a rescan.
+  // While unfocused, change/add events go into this Set instead of firing
+  // processFile immediately. Drained every UNFOCUSED_DRAIN_MS by a batch timer
+  // and immediately on refocus. Dedup'd by path so a busy session that fires
+  // 1000 events in 10s only triggers one processFile per drain.
+  private readonly _pendingPaths = new Set<string>();
+  private _unfocusedBatchTimer?: NodeJS.Timeout;
+  private static readonly UNFOCUSED_DRAIN_MS = 10_000;
+  // Debounce for focus changes so a quick alt-tab doesn't trigger a drain.
   private _focusDebounceTimer?: NodeJS.Timeout;
   private static readonly FOCUS_DEBOUNCE_MS = 1_000;
   // Used to measure event-loop lag: actual tick interval vs. scheduled interval.
@@ -172,47 +176,45 @@ export class AgentService {
   }
 
   /**
-   * Called when the VS Code window's focus changes. When the window loses focus,
-   * Windows throttles the extension host process and chokidar events accumulate
-   * faster than libuv can drain them — eventually saturating all 4 I/O threads
-   * and causing minute-long stalls when the user returns. We drop change events
-   * while unfocused and do a single catch-up pass on refocus.
-   * Debounced by FOCUS_DEBOUNCE_MS so a quick alt-tab doesn't trigger work.
+   * Called when the VS Code window's focus changes. While unfocused, change
+   * events are coalesced into _pendingPaths (deduplicated by path) and drained
+   * in batches every UNFOCUSED_DRAIN_MS — keeps the second-monitor sidebar
+   * roughly fresh without flooding the libuv pool. On refocus, drain immediately
+   * and resume normal per-event processing. Debounced so quick alt-tabs don't
+   * thrash the drain timer.
    */
   setWindowFocused(focused: boolean): void {
     if (focused === this._windowFocused) return;
     if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
     this._focusDebounceTimer = setTimeout(() => {
       this._windowFocused = focused;
-      logInfo('focus', focused ? 'window focused — resuming normal processing' : 'window unfocused — suspending change events');
-      if (focused && this._dirtyWhileUnfocused) {
-        this._dirtyWhileUnfocused = false;
-        void this.catchUpAfterUnfocus();
+      logInfo('focus', focused ? 'window focused — resuming normal processing' : `window unfocused — switching to ${AgentService.UNFOCUSED_DRAIN_MS / 1000}s batch drains`);
+      if (focused) {
+        if (this._unfocusedBatchTimer) { clearInterval(this._unfocusedBatchTimer); this._unfocusedBatchTimer = undefined; }
+        void this.drainPendingPaths('refocus');
+      } else {
+        // Start the periodic batch drainer. Idempotent — only fires when there
+        // are pending paths, so an idle unfocused state does no work.
+        if (!this._unfocusedBatchTimer) {
+          this._unfocusedBatchTimer = setInterval(() => void this.drainPendingPaths('batch'), AgentService.UNFOCUSED_DRAIN_MS);
+        }
       }
     }, AgentService.FOCUS_DEBOUNCE_MS);
   }
 
   /**
-   * Re-stats all currently-tracked non-done agents to pick up changes that
-   * happened while the window was unfocused. Much cheaper than a full rescan
-   * (only touches sessions we already know about, not all 3000+ on disk).
-   * New sessions discovered while unfocused are caught by the discovery tick.
+   * Processes all paths that accumulated in _pendingPaths since the last drain.
+   * Serial (not Promise.all) so we don't fill our concurrency slots all at once
+   * — leaves headroom for the focused-state work to resume cleanly. Idempotent
+   * and no-op when the set is empty.
    */
-  private async catchUpAfterUnfocus(): Promise<void> {
+  private async drainPendingPaths(reason: 'batch' | 'refocus'): Promise<void> {
+    if (this._pendingPaths.size === 0) return;
     const t0 = Date.now();
-    const candidates = [...this.agents.values()].filter(a => a.state !== 'done');
-    let changed = 0;
-    for (const agent of candidates) {
-      try {
-        const stat = await fsp.stat(agent.transcriptPath);
-        if (stat.mtimeMs !== agent.mtimeMs) {
-          changed++;
-          await this.processFile(agent.transcriptPath, stat);
-        }
-      } catch { /* file gone — drop handler will catch it later */ }
-    }
-    logInfo('focus', `catch-up: stat'd ${candidates.length} active sessions in ${Date.now() - t0}ms, ${changed} changed`);
-    if (changed > 0) this.scheduleEmit();
+    const paths = [...this._pendingPaths];
+    this._pendingPaths.clear();
+    for (const p of paths) await this.processFile(p);
+    logInfo('drain', `${reason}: processed ${paths.length} pending paths in ${Date.now() - t0}ms`);
   }
 
   private getConfig() {
@@ -386,21 +388,21 @@ export class AgentService {
     });
     this.watcher
       .on('add',    (p) => {
-        // Drop 'add' events while unfocused — catchUpAfterUnfocus stat's known sessions,
-        // and the periodic discovery tick will pick up genuinely new files. Avoiding
-        // processFile here is what keeps the libuv pool from backing up.
-        if (!this._windowFocused) { this._dirtyWhileUnfocused = true; return; }
+        // While unfocused, coalesce 'add' events into _pendingPaths. The batch
+        // drainer processes them every 10s, keeping the second-monitor view roughly
+        // fresh without flooding the libuv pool with per-event processFile calls.
+        if (!this._windowFocused) { this._pendingPaths.add(p); return; }
         // Cancel any pending drop for this path (atomic-write rename sequence).
         const t = this.pendingDrops.get(p);
         if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
         void this.processFile(p);
       })
       .on('change', (p) => {
-        // While the window is unfocused, drop change events entirely. Windows throttles
-        // our process aggressively, and accumulated events saturate the libuv I/O pool —
-        // a 109-second open() was traced to this exact pattern. The catch-up pass on
-        // refocus stat's all active sessions and processes any that changed.
-        if (!this._windowFocused) { this._dirtyWhileUnfocused = true; return; }
+        // While unfocused, coalesce into _pendingPaths (dedup'd by path) instead
+        // of per-event debouncing. A busy session firing 1000 events in 10s only
+        // triggers one processFile per drain — same end result, far less I/O queue
+        // pressure under Windows background-throttling.
+        if (!this._windowFocused) { this._pendingPaths.add(p); return; }
         // MaxWait debounce: trailing 500ms after writes settle, but forced to
         // fire within CHANGE_FORCE_FLUSH_MS so continuously-streaming transcripts
         // still get processed and transcript panels stay live.
@@ -443,8 +445,10 @@ export class AgentService {
       for (const t of this.pendingDrops.values()) clearTimeout(t);
       this.pendingDrops.clear();
       this.processFileInFlight.clear();
+      this.processFileStartedAt.clear();
       this.processFileLastReadMs.clear();
       this.evictedSessions.clear();
+      this._pendingPaths.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
@@ -604,8 +608,9 @@ export class AgentService {
     const waiterCount = this.processFileWaiters.length;
     while (this.processFileWaiters.length > 0) this.processFileWaiters.shift()?.();
     const staleCount = this.checkStaleOperations();
-    this._dirtyWhileUnfocused = false;
-    logInfo('flushQueue', `cleared debounced=${debouncedCount} drops=${dropCount} waiters=${waiterCount} stale=${staleCount}`);
+    const pendingCount = this._pendingPaths.size;
+    this._pendingPaths.clear();
+    logInfo('flushQueue', `cleared debounced=${debouncedCount} drops=${dropCount} waiters=${waiterCount} stale=${staleCount} pending=${pendingCount}`);
   }
 
   private async processFileImpl(filePath: string, stats?: fs.Stats): Promise<void> {
@@ -999,11 +1004,14 @@ export class AgentService {
   dispose(): void {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
+    if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
+    if (this._unfocusedBatchTimer) clearInterval(this._unfocusedBatchTimer);
     this.cancelDiscovery();
     for (const t of this.pendingDrops.values()) clearTimeout(t);
     this.pendingDrops.clear();
     for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
     this.changeDebounce.clear();
+    this._pendingPaths.clear();
     this.watcher?.close();
     this._onDidChange.dispose();
     this._onDidDrop.dispose();
