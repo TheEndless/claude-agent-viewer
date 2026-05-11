@@ -493,9 +493,6 @@ export class AgentService {
             .map(f => subagentDir + '/' + f)
             .filter(f => !this.agents.has(sessionIdFromPath(f)));
           if (newFiles.length > 0) {
-            if (this.watcher) {
-              for (const f of newFiles) this.watcher.add(f);
-            }
             await Promise.all(newFiles.map(f => this.processFile(f)));
             this.scheduleEmit();
           }
@@ -541,11 +538,6 @@ export class AgentService {
         .map(f => subagentDir + '/' + f)
         .filter(f => !this.agents.has(sessionIdFromPath(f)));
       if (newFiles.length > 0) {
-        // Watch each file individually — more reliable than the dir glob on Windows
-        // for detecting ongoing changes to an already-discovered subagent file.
-        if (this.watcher) {
-          for (const f of newFiles) this.watcher.add(f);
-        }
         await Promise.all(newFiles.map(f => this.processFile(f)));
         this.scheduleEmit();
       }
@@ -578,10 +570,11 @@ export class AgentService {
     this.watchedSubagentDirs.delete(subDir);
     this.watchedSubagentDirLastRead.delete(subDir);
     this._subagentPollFailures.delete(subDir);
-    // Only unwatch the subagent dir glob (added explicitly). Do NOT unwatch
-    // agent.transcriptPath — top-level sessions are covered by the initial shallow
-    // glob and unwatching them stops change events for sessions that later become
-    // active again (e.g. a long-running parent that spawns more subagents later).
+    // Unwatch the subagent dir glob. Individual file watchers are NOT added (the dir
+    // glob covers all *.jsonl files), so there is nothing else to unwatch here.
+    // Do NOT unwatch agent.transcriptPath — top-level sessions are covered by the
+    // initial shallow glob and unwatching stops events for sessions that later
+    // become active again.
     if (this.watcher) this.watcher.unwatch(subDir + '/*.jsonl');
   }
 
@@ -638,7 +631,9 @@ export class AgentService {
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
       // Heartbeat every ~5 min so we can distinguish "quiet (all done)" from a true hang.
       if (reason === 'tick' && ++this._tickCount % 60 === 0) {
-        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileActive} waiters=${this.processFileWaiters.length} withSubagents=${this._agentsWithSubagents.size} watchedSubDirs=${this.watchedSubagentDirs.size}`);
+        const watchedPaths = this.watcher ? Object.keys((this.watcher as unknown as { _watched: Record<string, unknown> })._watched ?? {}).length : -1;
+        const mem = process.memoryUsage();
+        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileActive} waiters=${this.processFileWaiters.length} withSubagents=${this._agentsWithSubagents.size} watchedSubDirs=${this.watchedSubagentDirs.size} watcherPaths=${watchedPaths} rss=${Math.round(mem.rss/1024/1024)}MB heap=${Math.round(mem.heapUsed/1024/1024)}MB`);
       }
       if (reason === 'change' || reason === 'background' || anyChanged) {
         let treeMs = 0;
