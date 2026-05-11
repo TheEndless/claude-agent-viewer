@@ -17,7 +17,7 @@ import chokidar from 'chokidar';
 import { Agent, AgentDetails, AgentState, RawEvent, ToolCallSummary } from './types';
 import { buildTree, parentSessionIdFromPath } from './agentTree';
 import { logError, logInfo } from './logger';
-import { readFileSlice } from './fileUtils';
+import { readFileSlice, tfs, getFsCounts, trackedFs } from './fileUtils';
 
 const PROJECTS_ROOT = path.join(os.homedir(), '.claude', 'projects');
 const TAIL_BYTES = 64 * 1024;
@@ -309,13 +309,13 @@ export class AgentService {
   private async runIoControlProbe(): Promise<void> {
     try {
       const t0 = Date.now();
-      const handle = await fsp.open(__filename, 'r');
+      const handle = await trackedFs('open', fsp.open(__filename, 'r'));
       const tOpen = Date.now() - t0;
       const buf = Buffer.allocUnsafe(4096);
       const tRead0 = Date.now();
-      await handle.read(buf, 0, 4096, 0);
+      await trackedFs('read', handle.read(buf, 0, 4096, 0));
       const tRead = Date.now() - tRead0;
-      await handle.close();
+      await trackedFs('close', handle.close());
       const total = Date.now() - t0;
       // Always log — comparing control timings against transcript timings is the
       // diagnostic. If control stays fast while transcripts slow down, the issue
@@ -323,8 +323,12 @@ export class AgentService {
       // Also include active-handle counts so we can spot file-handle leaks.
       const activeHandles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles?.()?.length ?? -1;
       const activeRequests = (process as unknown as { _getActiveRequests?: () => unknown[] })._getActiveRequests?.()?.length ?? -1;
+      const ourActive = getFsCounts().active;
+      const ourActiveTotal = Object.values(ourActive).reduce((a, b) => a + b, 0);
+      const ourBreakdown = Object.entries(ourActive).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(',') || 'none';
+      const externalRequests = Math.max(0, activeRequests - ourActiveTotal);
       const tag = total > 50 ? 'SLOW' : 'ok';
-      logInfo('ioProbe', `[${tag}] open=${tOpen}ms read=${tRead}ms total=${total}ms handles=${activeHandles} requests=${activeRequests}`);
+      logInfo('ioProbe', `[${tag}] open=${tOpen}ms read=${tRead}ms total=${total}ms handles=${activeHandles} requests=${activeRequests} ours=${ourActiveTotal} (${ourBreakdown}) external=${externalRequests}`);
       // Use the probe as an additional throttling signal — it catches libuv pool
       // saturation earlier and more reliably than waiting for 3 consecutive tick
       // lags. >500ms on a 4KB read of our own source file means I/O threads are
@@ -385,7 +389,7 @@ export class AgentService {
       const statResults: Array<{ path: string; stat: fs.Stats } | null> = [];
       for (let i = 0; i < allFiles.length; i += STAT_BATCH) {
         const batch = await Promise.all(allFiles.slice(i, i + STAT_BATCH).map(async (f) => {
-          try { return { path: f, stat: await fsp.stat(f) }; }
+          try { return { path: f, stat: await tfs.stat(f) }; }
           catch (err) { logError(`stat(${f})`, err); return null; }
         }));
         statResults.push(...batch);
@@ -659,7 +663,7 @@ export class AgentService {
     const base = path.basename(filePath);
     try {
       const t0 = Date.now();
-      const stat = stats ?? await fsp.stat(filePath);
+      const stat = stats ?? await tfs.stat(filePath);
       const statMs = Date.now() - t0;
       if (statMs > 500) logInfo('processFileImpl', `slow stat: ${statMs}ms for ${base}`);
 
@@ -773,7 +777,7 @@ export class AgentService {
     for (let i = 0; i < pending.length; i += AgentService.MAX_CONCURRENT_PROCESS) {
       await Promise.all(pending.slice(i, i + AgentService.MAX_CONCURRENT_PROCESS).map(async ({ sessionId, subagentDir }) => {
         try {
-          const files = await fsp.readdir(subagentDir);
+          const files = await tfs.readdir(subagentDir);
           const jsonlFiles = files.filter(f => f.endsWith('.jsonl'));
           // Only mark confirmed once a .jsonl file actually exists. An empty dir means
           // the subagent process hasn't written yet — keep polling. Marking it confirmed
@@ -831,7 +835,7 @@ export class AgentService {
     this.watchedSubagentDirLastRead.set(subagentDir, Date.now());
 
     try {
-      const files = await fsp.readdir(subagentDir);
+      const files = await tfs.readdir(subagentDir);
       // Dir confirmed to exist — register with chokidar once so new files fire 'add' events.
       // watcher.add is deferred until here rather than called speculatively on every invoke:
       // chokidar does not reliably watch a glob pointing at a non-existent directory, so
@@ -1071,7 +1075,7 @@ function subagentDirPath(transcriptPath: string, sessionId: string): string {
 
 /** Returns all .jsonl file paths under rootDir at any depth. Throws if rootDir is unreadable. */
 async function findJsonlFiles(rootDir: string): Promise<string[]> {
-  const entries = await fsp.readdir(rootDir, { recursive: true, withFileTypes: true });
+  const entries = await trackedFs<fs.Dirent[]>('readdirRecursive', fsp.readdir(rootDir, { recursive: true, withFileTypes: true }) as Promise<fs.Dirent[]>);
   return entries
     .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
     .map(e => {
@@ -1088,7 +1092,7 @@ async function findJsonlFiles(rootDir: string): Promise<string[]> {
  * from the full session + subagent tree on every 5-minute discovery run.
  */
 async function findTopLevelJsonlFiles(rootDir: string): Promise<string[]> {
-  const projectDirs = await fsp.readdir(rootDir, { withFileTypes: true });
+  const projectDirs = await tfs.readdirTypes(rootDir);
   const dirs = projectDirs.filter(d => d.isDirectory());
   const results: string[] = [];
   // Batched readdirs — not Promise.all over all dirs. With 3000+ project directories,
@@ -1100,7 +1104,7 @@ async function findTopLevelJsonlFiles(rootDir: string): Promise<string[]> {
     await Promise.all(dirs.slice(i, i + BATCH).map(async d => {
       const dirPath = path.join(rootDir, d.name);
       try {
-        const files = await fsp.readdir(dirPath);
+        const files = await tfs.readdir(dirPath);
         for (const f of files) {
           if (f.endsWith('.jsonl')) results.push(path.join(dirPath, f));
         }

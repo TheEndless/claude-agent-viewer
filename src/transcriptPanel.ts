@@ -13,7 +13,7 @@ import MarkdownIt from 'markdown-it';
 import { Agent, Turn, TurnEntry, TurnAttachment } from './types';
 import { parseTranscriptWithState, parseTranscriptDelta, ParseState } from './transcriptParser';
 import { logError } from './logger';
-import { readFileSlice } from './fileUtils';
+import { readFileSlice, tfs } from './fileUtils';
 
 const md     = new MarkdownIt({ html: false, linkify: true, typographer: true });
 const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: true, breaks: true });
@@ -328,7 +328,7 @@ async function handleExportMarkdown(agent: Agent, panel: vscode.WebviewPanel): P
       }
     }
 
-    await fsp.writeFile(saveUri.fsPath, lines.join('\n'), 'utf-8');
+    await tfs.writeFile(saveUri.fsPath, lines.join('\n'), 'utf-8');
     vscode.window.showInformationMessage(`Transcript exported to ${saveUri.fsPath}`);
   } catch (err) {
     logError('exportMarkdown', err);
@@ -359,7 +359,7 @@ export function evict(sessionId: string): void {
 async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number; lastTurnUpdated: boolean }> {
   let bytes = 0;
   try {
-    const stat = await fsp.stat(agent.transcriptPath);
+    const stat = await tfs.stat(agent.transcriptPath);
     bytes = stat.size;
   } catch (err) { logError(`getTurns stat(${agent.transcriptPath})`, err); }
 
@@ -396,7 +396,7 @@ async function getTurns(agent: Agent): Promise<{ turns: Turn[]; bytes: number; l
 
   // Full parse: first load, cache miss, or delta error fallback.
   let text: string;
-  try { text = await fsp.readFile(agent.transcriptPath, 'utf-8'); }
+  try { text = await tfs.readFile(agent.transcriptPath, 'utf-8'); }
   catch (err) { logError(`getTurns readFile(${agent.transcriptPath})`, err); return { turns: [], bytes: 0, lastTurnUpdated: false }; }
   const { turns, state } = await parseTranscriptWithState(text);
   parseCacheSet(agent.sessionId, { turns, size: bytes, state });
