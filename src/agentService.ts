@@ -179,6 +179,32 @@ export class AgentService {
     this._lastTickMs = now;
     this.scheduleEmit('tick');
     void this.scanPendingSubagentDirs();
+    // Every 6th tick (~30s), time a small control read on this file itself. If THIS
+    // gets slow, the libuv I/O thread pool is starved — the slowness is pool-wide,
+    // not specific to the transcripts. If it stays fast, the issue is file-specific
+    // (e.g. file handle accumulation against transcript paths).
+    if (this._tickCount % 6 === 0) void this.runIoControlProbe();
+  }
+
+  /** Times a small read of our own source file to diagnose libuv thread pool health. */
+  private async runIoControlProbe(): Promise<void> {
+    try {
+      const t0 = Date.now();
+      const handle = await fsp.open(__filename, 'r');
+      const tOpen = Date.now() - t0;
+      const buf = Buffer.allocUnsafe(4096);
+      const tRead0 = Date.now();
+      await handle.read(buf, 0, 4096, 0);
+      const tRead = Date.now() - tRead0;
+      await handle.close();
+      const total = Date.now() - t0;
+      if (total > 50) {
+        logInfo('ioProbe', `slow control I/O: open=${tOpen}ms read=${tRead}ms total=${total}ms (own source file — libuv pool likely starved)`);
+      } else if (this._tickCount % 60 === 0) {
+        // Log healthy probes every ~5 min for baseline reference.
+        logInfo('ioProbe', `control I/O healthy: open=${tOpen}ms read=${tRead}ms total=${total}ms`);
+      }
+    } catch (err) { logError('ioProbe', err); }
   }
 
   /** Begins the initial directory scan and starts the file watcher. */
