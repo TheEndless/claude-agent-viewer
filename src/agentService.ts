@@ -81,7 +81,10 @@ export class AgentService {
   // causes all reads to queue up, making even simple stat() calls take seconds.
   private processFileActive = 0;
   private readonly processFileWaiters: Array<() => void> = [];
-  private static readonly MAX_CONCURRENT_PROCESS = 4;
+  // Keep at 2 so Windows Defender (which can block fsp.open for 20-68s on active
+  // JSONL files) never monopolizes all 4 libuv I/O threads, leaving threads free
+  // for VS Code's own file I/O and preventing full event-loop freezes.
+  private static readonly MAX_CONCURRENT_PROCESS = 2;
   // Hard cap on the waiter queue. Without this, a single stuck fsp.stat (Windows
   // file lock / antivirus) can cause thousands of closures to pile up indefinitely.
   // Dropped entries are retried on the next chokidar event or periodic scan.
@@ -262,6 +265,7 @@ export class AgentService {
       if (a.state === 'done') initDoneCount++; else initActiveCount++;
     }
     logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded (${initSubCount} subagents | ${initActiveCount} active, ${initDoneCount} done/hidden)`);
+    logInfo('initialize', `TIP: If you see slow I/O (20-68s reads), add a Windows Defender exclusion for: ${PROJECTS_ROOT}`);
     void this.backgroundScanTitles();
     // Watch for ongoing changes. ignoreInitial: true since we already scanned above.
     // Use a SHALLOW glob (*/*.jsonl, not **/*.jsonl) so chokidar's internal readdirp
@@ -554,7 +558,7 @@ export class AgentService {
             .map(f => subagentDir + '/' + f)
             .filter(f => !this.agents.has(sessionIdFromPath(f)));
           if (newFiles.length > 0) {
-            await Promise.all(newFiles.map(f => this.processFile(f)));
+            for (const f of newFiles) await this.processFile(f);
             this.scheduleEmit();
           }
         } catch { /* dir doesn't exist yet — normal */ }
@@ -599,7 +603,10 @@ export class AgentService {
         .map(f => subagentDir + '/' + f)
         .filter(f => !this.agents.has(sessionIdFromPath(f)));
       if (newFiles.length > 0) {
-        await Promise.all(newFiles.map(f => this.processFile(f)));
+        // Serial — not Promise.all. Multiple new subagent files discovered at once
+        // would otherwise each grab a concurrency slot simultaneously, leaving no
+        // threads free for the parent session or VS Code's own I/O under Defender.
+        for (const f of newFiles) await this.processFile(f);
         this.scheduleEmit();
       }
     } catch {
