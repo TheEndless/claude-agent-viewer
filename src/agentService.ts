@@ -364,11 +364,14 @@ export class AgentService {
    */
   private async discoverNewFiles(): Promise<void> {
     try {
+      const t0 = Date.now();
       const newFiles = await findTopLevelJsonlFiles(PROJECTS_ROOT);
+      const scanMs = Date.now() - t0;
       const missing = newFiles.filter(f => {
         const sid = sessionIdFromPath(f);
         return !this.agents.has(sid) && !this.evictedSessions.has(sid);
       });
+      logInfo('discoverNewFiles', `scanned ${newFiles.length} files in ${scanMs}ms — ${missing.length} new`);
       if (missing.length > 0) {
         await Promise.all(missing.map(f => this.processFile(f)));
         this.scheduleEmit();
@@ -710,14 +713,15 @@ export class AgentService {
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
 
-      // Evict done top-level sessions older than 3× doneAgeMs. Only runs on tick (not
-      // on file-change) since eligibility only changes on the hour-scale. Evicted sessions
-      // re-enter the map automatically when their file is next written to.
+      // Evict done top-level sessions older than 10× doneAgeMs. Only runs on tick (not
+      // on file-change) since eligibility only changes on the hour-scale. At the default
+      // 1-hour doneAge, this keeps up to ~10 hours of history in memory — a full working
+      // day. 3× was too aggressive and left users with "Show 2 hidden" after minutes.
       if (reason === 'tick') {
         let evictCount = 0;
         for (const [sid, agent] of this.agents) {
           if (agent.state !== 'done' || agent.parentSessionId) continue;
-          if (now - agent.mtimeMs <= doneAgeMs * 3) continue;
+          if (now - agent.mtimeMs <= doneAgeMs * 10) continue;
           for (const sub of agent.subagents) {
             this.pruneSubagentState(sub.sessionId); // releases tracking maps + chokidar watcher
             this.agents.delete(sub.sessionId);
@@ -731,7 +735,7 @@ export class AgentService {
           evictCount++;
         }
         if (evictCount > 0) {
-          logInfo('evict', `evicted ${evictCount} done sessions (>3× doneAge) from memory; remaining=${this.agents.size}`);
+          logInfo('evict', `evicted ${evictCount} done sessions (>10× doneAge) from memory; remaining=${this.agents.size}`);
           buildTree(this.agents);
           assignTaskDescriptions(this.agents); // buildTree without assignTaskDescriptions leaves taskDescription stale
           this._structureChanged = false;
@@ -851,16 +855,24 @@ async function findJsonlFiles(rootDir: string): Promise<string[]> {
  */
 async function findTopLevelJsonlFiles(rootDir: string): Promise<string[]> {
   const projectDirs = await fsp.readdir(rootDir, { withFileTypes: true });
+  const dirs = projectDirs.filter(d => d.isDirectory());
   const results: string[] = [];
-  await Promise.all(projectDirs.filter(d => d.isDirectory()).map(async d => {
-    const dirPath = path.join(rootDir, d.name);
-    try {
-      const files = await fsp.readdir(dirPath);
-      for (const f of files) {
-        if (f.endsWith('.jsonl')) results.push(path.join(dirPath, f));
-      }
-    } catch { /* skip unreadable dirs */ }
-  }));
+  // Batched readdirs — not Promise.all over all dirs. With 3000+ project directories,
+  // firing 3000 concurrent readdirs floods the libuv I/O thread pool and creates a
+  // massive microtask queue that can block the event loop for seconds when they all
+  // resolve simultaneously.
+  const BATCH = 50;
+  for (let i = 0; i < dirs.length; i += BATCH) {
+    await Promise.all(dirs.slice(i, i + BATCH).map(async d => {
+      const dirPath = path.join(rootDir, d.name);
+      try {
+        const files = await fsp.readdir(dirPath);
+        for (const f of files) {
+          if (f.endsWith('.jsonl')) results.push(path.join(dirPath, f));
+        }
+      } catch { /* skip unreadable dirs */ }
+    }));
+  }
   return results;
 }
 
