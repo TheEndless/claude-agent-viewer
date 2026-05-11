@@ -32,6 +32,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   // is re-enabled so the next reveal starts from the top again.
   private _doneLoaded = 0;
   private static readonly DONE_PAGE_SIZE = 100;
+  // Tracks the last time a postMessage was successfully delivered. Used to detect
+  // zombie webview state where postMessage silently returns false indefinitely.
+  private _lastDeliveredMs = 0;
 
   constructor(private readonly agentService: AgentService) { }
 
@@ -44,11 +47,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     webviewView.onDidChangeVisibility(() => {
       this.agentService.setVisible(webviewView.visible);
+      if (webviewView.visible) this.postAgents();
     });
 
     webviewView.onDidDispose(() => {
       this.agentService.setVisible(false);
       this._subscription?.dispose();
+      this._subscription = undefined;
+      if (this._view === webviewView) this._view = undefined;
     });
 
     const d1 = this.agentService.onDidChange((agents) => {
@@ -76,7 +82,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
    * costs ~2MB of JSON transfer + parse even though the webview discards almost
    * all of it. Filtering here keeps the payload to the handful of live sessions.
    */
-  private postAgents(): void {
+  private async postAgents(): Promise<void> {
     if (!this._view) return;
     const serialize = (a: Agent): object => ({
       sessionId: a.sessionId,
@@ -130,7 +136,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const payload = agentsToSend.map(serialize);
     const serializeMs = Date.now() - t0;
     logInfo('postAgents', `sending=${payload.length}/${allAgents.length} doneHidden=${excludedDoneIds.size} serializeMs=${serializeMs}ms`);
-    this._view.webview.postMessage({ command: 'render', agents: payload, ready, now: Date.now(), doneParentCount, remainingDone });
+    const delivered = await this._view?.webview.postMessage({ command: 'render', agents: payload, ready, now: Date.now(), doneParentCount, remainingDone });
+    if (delivered) {
+      this._lastDeliveredMs = Date.now();
+    } else if (this._view && this._lastDeliveredMs > 0 && Date.now() - this._lastDeliveredMs > 30_000) {
+      // Webview has been unresponsive for >30s — force-reload to recover from zombie iframe.
+      logInfo('postAgents', 'webview unresponsive for >30s — forcing reload');
+      this._lastDeliveredMs = Date.now(); // prevent reload storm
+      this._view.webview.html = this.getHtml();
+    }
   }
 
   /** Dispatches messages from the webview to the appropriate action handler. */
@@ -1176,7 +1190,47 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     // Refresh relative timestamps (e.g. "now" → "5m") on a client-side clock so
     // ages stay accurate even when the extension host sends no new render messages
     // (which only happen on state changes — stable done/idle agents never trigger one).
-    setInterval(() => { if (lastGroups) reconcile(lastGroups, Date.now()); }, 10_000);
+    // Only updates text nodes and the stuck badge — avoids the full DOM re-ordering
+    // cost of reconcile() which was causing webview sluggishness over extended periods.
+    function tickTimestamps(now) {
+      if (!lastGroups) return;
+      for (const [, group] of lastGroups) {
+        for (const agent of group.agents) {
+          const cardEl = cardEls.get(agent.sessionId);
+          if (!cardEl) continue;
+
+          const timeEl = cardEl.querySelector('.card-time');
+          if (timeEl) timeEl.textContent = relTimeShort(parentMaxMtime(agent), now);
+
+          const actTimes = cardEl.querySelectorAll('.act-time');
+          const history = agent.activityHistory || [];
+          for (let i = 0; i < actTimes.length && i < history.length; i++) {
+            actTimes[i].textContent = relTimeShort(history[i].at, now);
+          }
+
+          const effState = parentEffectiveState(agent);
+          const existingBadge = cardEl.querySelector('.stuck-badge');
+          const newBadge = renderStuckBadge(agent.activityHistory, effState, now);
+          if (existingBadge && newBadge) existingBadge.outerHTML = newBadge;
+          else if (existingBadge && !newBadge) existingBadge.remove();
+          else if (!existingBadge && newBadge) {
+            const tl = cardEl.querySelector('.activity-timeline');
+            if (tl) tl.insertAdjacentHTML('afterend', newBadge);
+          }
+
+          const subRows = cardEl.querySelectorAll('.sub-row');
+          const subMap = new Map((agent.subagents||[]).map(s => [s.sessionId, s]));
+          for (const subRow of subRows) {
+            const sid = subRow.getAttribute('data-sid');
+            const sub = sid && subMap.get(sid);
+            if (!sub) continue;
+            const subTime = subRow.querySelector('.sub-time');
+            if (subTime) subTime.textContent = relTimeShort(sub.mtimeMs, now);
+          }
+        }
+      }
+    }
+    setInterval(() => tickTimestamps(Date.now()), 10_000);
 
     // Sync persisted preferences with the extension host. Uses 'syncPrefs' (not
     // 'refresh') so the extension host only updates its filter state and re-sends
