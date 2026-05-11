@@ -198,12 +198,14 @@ export class AgentService {
       const tRead = Date.now() - tRead0;
       await handle.close();
       const total = Date.now() - t0;
-      if (total > 50) {
-        logInfo('ioProbe', `slow control I/O: open=${tOpen}ms read=${tRead}ms total=${total}ms (own source file — libuv pool likely starved)`);
-      } else if (this._tickCount % 60 === 0) {
-        // Log healthy probes every ~5 min for baseline reference.
-        logInfo('ioProbe', `control I/O healthy: open=${tOpen}ms read=${tRead}ms total=${total}ms`);
-      }
+      // Always log — comparing control timings against transcript timings is the
+      // diagnostic. If control stays fast while transcripts slow down, the issue
+      // is path-specific. If control also slows, libuv pool is starved process-wide.
+      // Also include active-handle counts so we can spot file-handle leaks.
+      const activeHandles = (process as unknown as { _getActiveHandles?: () => unknown[] })._getActiveHandles?.()?.length ?? -1;
+      const activeRequests = (process as unknown as { _getActiveRequests?: () => unknown[] })._getActiveRequests?.()?.length ?? -1;
+      const tag = total > 50 ? 'SLOW' : 'ok';
+      logInfo('ioProbe', `[${tag}] open=${tOpen}ms read=${tRead}ms total=${total}ms handles=${activeHandles} requests=${activeRequests}`);
     } catch (err) { logError('ioProbe', err); }
   }
 
