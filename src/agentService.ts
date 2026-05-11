@@ -431,9 +431,17 @@ export class AgentService {
       await this.processFileImpl(filePath, stats);
     } finally {
       const _ioMs = Date.now() - _ioT0;
-      this.processFileLastReadMs.set(filePath, Date.now());
+      // Adaptive cooldown: if this read was very slow (likely Defender scanning a
+      // large file), back off proportionally rather than always waiting 8s. A 30s
+      // read means the file is large and the next read will also be slow — waiting
+      // only 8s would just start another long read immediately.
+      const adaptiveCooldown = Math.max(
+        AgentService.MIN_FILE_READ_COOLDOWN_MS,
+        Math.min(_ioMs * 2, 5 * 60 * 1000), // 2× read time, capped at 5 min
+      );
+      this.processFileLastReadMs.set(filePath, Date.now() + adaptiveCooldown - AgentService.MIN_FILE_READ_COOLDOWN_MS);
       if (_ioMs > 1_000) {
-        logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+        logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)} (next read in ${Math.round(adaptiveCooldown / 1000)}s)`);
       } else {
         logInfo('processFile', `I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
       }
@@ -444,8 +452,13 @@ export class AgentService {
   }
 
   private async processFileImpl(filePath: string, stats?: fs.Stats): Promise<void> {
+    const base = path.basename(filePath);
     try {
+      const t0 = Date.now();
       const stat = stats ?? await fsp.stat(filePath);
+      const statMs = Date.now() - t0;
+      if (statMs > 500) logInfo('processFileImpl', `slow stat: ${statMs}ms for ${base}`);
+
       const sessionId = sessionIdFromPath(filePath);
       const doneAgeMs = this.getDoneAgeMs();
       const isArchive = Date.now() - stat.mtimeMs > doneAgeMs;
@@ -460,7 +473,10 @@ export class AgentService {
           cached = { customTitle: null, aiTitle: null, lastPrompt: null, firstUserPrompt: null };
           // Intentionally NOT stored in titleCache so backgroundScanTitles knows to scan it.
         } else {
+          const tTitle = Date.now();
           cached = await scanFullFileForTitles(filePath);
+          const titleMs = Date.now() - tTitle;
+          if (titleMs > 500) logInfo('processFileImpl', `slow title scan: ${titleMs}ms for ${base}`);
           this.titleCache.set(sessionId, cached);
         }
       }
@@ -481,8 +497,15 @@ export class AgentService {
         }
         return;
       }
+      const tTail = Date.now();
       const events = isArchive ? [] : await this.tailEvents(filePath, stat.size);
+      const tailMs = Date.now() - tTail;
+      if (tailMs > 500) logInfo('processFileImpl', `slow tail read: ${tailMs}ms for ${base} (size=${stat.size})`);
+
+      const tBuild = Date.now();
       const agent = buildAgent(filePath, stat.mtimeMs, events, cached, doneAgeMs, this.getRunningWindowMs());
+      const buildMs = Date.now() - tBuild;
+      if (buildMs > 100) logInfo('processFileImpl', `slow buildAgent: ${buildMs}ms for ${base} (events=${events.length})`);
       // Sticky: once a session has ever had Agent tool_use calls, remember it permanently
       // so watchAndDiscoverSubagents keeps firing even after those events age out of the tail.
       if ((agent.agentCallDescs ?? []).length > 0) {
