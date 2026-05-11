@@ -61,14 +61,13 @@ export class AgentService {
   // that actively-streaming transcripts still get processed and panels stay live.
   private changeDebounce = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
   private static readonly CHANGE_FORCE_FLUSH_MS = 2_000;
-  // Session IDs explicitly evicted by tick-based age logic. Prevents discoverNewFiles()
-  // from immediately re-adding sessions that were just evicted — without this, the
-  // 5-minute discovery tick re-discovers all 2375+ evicted sessions as "missing" files,
-  // fills the processFile queue, and causes a continuous evict→discover→evict loop.
-  // Cleared on refresh() so a manual refresh still re-scans everything.
-  // Chokidar change events (user resumes an old session) bypass this — processFile()
-  // is called directly from the watcher and will re-add the session normally.
+  // Session IDs evicted by tick-based age logic. Prevents discoverNewFiles() from
+  // immediately re-adding sessions that were just evicted, which would cause a
+  // continuous evict→discover→evict loop. Chokidar 'change' events bypass this
+  // (user resuming an old session re-adds it normally via the watcher).
+  // Insertion-order bounded — see MAX_EVICTED_SESSIONS.
   private readonly evictedSessions = new Set<string>();
+  private static readonly MAX_EVICTED_SESSIONS = 10_000;
   // Session IDs that have ever had Agent tool_use calls. Pruned when sessions go
   // done/dropped so scanPendingSubagentDirs doesn't probe dead dirs indefinitely.
   private _agentsWithSubagents = new Set<string>();
@@ -83,35 +82,19 @@ export class AgentService {
   // busy parent session doesn't issue a readdir on every file-change event.
   private watchedSubagentDirLastRead = new Map<string, number>();
   private static readonly SUBAGENT_READDIR_THROTTLE_MS = 10_000;
-  // Concurrency gate for processFile: prevents more than MAX_CONCURRENT_PROCESS
-  // simultaneous reads from saturating the libuv I/O thread pool (default 4 threads).
-  // With many active agents all debouncing at the same time, uncapped concurrency
-  // causes all reads to queue up, making even simple stat() calls take seconds.
-  private processFileActive = 0;
-  private readonly processFileWaiters: Array<() => void> = [];
-  // Keep at 2 so Windows Defender (which can block fsp.open for 20-68s on active
-  // JSONL files) never monopolizes all 4 libuv I/O threads, leaving threads free
-  // for VS Code's own file I/O and preventing full event-loop freezes.
-  private static readonly MAX_CONCURRENT_PROCESS = 2;
-  // Hard cap on the waiter queue. Without this, a single stuck fsp.stat (Windows
-  // file lock / antivirus) can cause thousands of closures to pile up indefinitely.
+  // processFile concurrency gate. Kept low (2) so a stuck/slow read can't
+  // monopolize all 4 libuv I/O threads — leaves headroom for VS Code's own I/O.
   // Dropped entries are retried on the next chokidar event or periodic scan.
-  private static readonly MAX_WAITER_QUEUE = 200;
-  // Per-file in-flight guard. Prevents multiple concurrent reads of the same path
-  // when chokidar fires change events faster than a slow read can complete (e.g. an
-  // active session transcript taking 20s+ to read under Windows Defender). A new
-  // chokidar event will re-trigger after the file is next written to, so no data is lost.
+  // processFileInFlight doubles as the active-count source (size = active).
+  // processFileStartedAt feeds the stale-op sweep that reclaims hung slots.
+  // processFileNextReadAt is the per-file adaptive cooldown (2× last duration).
+  private readonly processFileWaiters: Array<() => void> = [];
   private readonly processFileInFlight = new Set<string>();
-  // Tracks start time of each in-flight processFile so we can detect and abandon
-  // operations that have been stuck for too long (e.g. fsp.open hanging on a file
-  // locked by another process). Auto-flush periodically reclaims stuck slots.
   private readonly processFileStartedAt = new Map<string, number>();
+  private readonly processFileNextReadAt = new Map<string, number>();
+  private static readonly MAX_CONCURRENT_PROCESS = 2;
+  private static readonly MAX_WAITER_QUEUE = 200;
   private static readonly STALE_OPERATION_MS = 60_000;
-  // Per-file cooldown: timestamp of the last completed read. Prevents immediately
-  // re-reading the same file after a slow Defender-blocked read completes. Without
-  // this, completing a 21-second read clears the in-flight guard, and the next
-  // queued chokidar event starts a brand-new 21-second read — compounding forever.
-  private readonly processFileLastReadMs = new Map<string, number>();
   private static readonly MIN_FILE_READ_COOLDOWN_MS = 8_000;
   // Throttle change-triggered emits: after firing, hold off for this long before
   // firing again. Prevents rapid file writes from rebuilding the agent tree on
@@ -126,21 +109,20 @@ export class AgentService {
   // builds up a backlog in the libuv I/O thread pool that takes minutes to drain
   // when focus returns. We drop change events while unfocused and do a single
   // catch-up stat pass on refocus instead.
+  // Window focus tracking. When unfocused, Windows aggressively throttles the
+  // extension host process — per-event processing accumulates into a backlog
+  // faster than libuv can drain. We batch events instead.
   private _windowFocused = true;
-  // While unfocused OR throttled, change/add events go into this Set instead of
-  // firing processFile immediately. Drained every BATCH_DRAIN_MS by a batch timer
-  // and immediately on refocus / throttle-clear. Dedup'd by path so a busy session
-  // that fires 1000 events in 10s only triggers one processFile per drain.
+  // Coalesced change/add events while in batch mode (unfocused or throttled).
+  // Drained every BATCH_DRAIN_MS or immediately on focus/throttle recovery.
   private readonly _pendingPaths = new Set<string>();
   private _batchTimer?: NodeJS.Timeout;
   private static readonly BATCH_DRAIN_MS = 10_000;
-  // Debounce for focus changes so a quick alt-tab doesn't trigger a drain.
   private _focusDebounceTimer?: NodeJS.Timeout;
   private static readonly FOCUS_DEBOUNCE_MS = 1_000;
-  // Throttling detection: tracks the last N tick lag samples to distinguish a
-  // transient spike from sustained OS-level throttling. When throttled, we batch
-  // events even if the window is focused — this catches the case where the user
-  // IS focused but the system is under load (or the OS chose to throttle anyway).
+  // Throttling detection from event-loop lag samples. Triggers batch mode even
+  // when focused, catching system overload / OS-imposed throttling we wouldn't
+  // otherwise see.
   private _recentLagMs: number[] = [];
   private _throttled = false;
   private static readonly LAG_SAMPLE_COUNT = 3;
@@ -428,7 +410,6 @@ export class AgentService {
       if (a.state === 'done') initDoneCount++; else initActiveCount++;
     }
     logInfo('initialize', `Initial scan complete — ${this.agents.size} sessions loaded (${initSubCount} subagents | ${initActiveCount} active, ${initDoneCount} done/hidden)`);
-    logInfo('initialize', `TIP: If you see slow I/O (20-68s reads), add a Windows Defender exclusion for: ${PROJECTS_ROOT}`);
     void this.backgroundScanTitles();
     // Watch for ongoing changes. ignoreInitial: true since we already scanned above.
     // Use a SHALLOW glob (*/*.jsonl, not **/*.jsonl) so chokidar's internal readdirp
@@ -447,9 +428,6 @@ export class AgentService {
     });
     this.watcher
       .on('add',    (p) => {
-        // While in batch mode (unfocused or throttled), coalesce 'add' events into
-        // _pendingPaths. The batch drainer processes them every 10s, keeping the
-        // sidebar roughly fresh without flooding the libuv pool.
         if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
         // Cancel any pending drop for this path (atomic-write rename sequence).
         const t = this.pendingDrops.get(p);
@@ -457,10 +435,6 @@ export class AgentService {
         void this.processFile(p);
       })
       .on('change', (p) => {
-        // While in batch mode, coalesce into _pendingPaths (dedup'd by path) instead
-        // of per-event debouncing. A busy session firing 1000 events in 10s only
-        // triggers one processFile per drain — same end result, far less I/O queue
-        // pressure under throttling.
         if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
         // MaxWait debounce: trailing 500ms after writes settle, but forced to
         // fire within CHANGE_FORCE_FLUSH_MS so continuously-streaming transcripts
@@ -499,15 +473,11 @@ export class AgentService {
     try {
       if (this.debounceTimer) { clearTimeout(this.debounceTimer); this.debounceTimer = undefined; }
       this.cancelDiscovery();
-      for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
-      this.changeDebounce.clear();
-      for (const t of this.pendingDrops.values()) clearTimeout(t);
-      this.pendingDrops.clear();
+      this.clearTransientQueues();
       this.processFileInFlight.clear();
       this.processFileStartedAt.clear();
-      this.processFileLastReadMs.clear();
+      this.processFileNextReadAt.clear();
       this.evictedSessions.clear();
-      this._pendingPaths.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
@@ -563,64 +533,33 @@ export class AgentService {
    * Runs through a concurrency gate to prevent I/O pool saturation.
    */
   private async processFile(filePath: string, stats?: fs.Stats): Promise<void> {
-    // Drop duplicate triggers for the same file while a read is already in-flight.
-    // Active sessions fire chokidar change events faster than a slow read can complete,
-    // causing up to MAX_CONCURRENT_PROCESS simultaneous reads of the same path, each
-    // blocking an I/O thread for 20+ seconds under Windows Defender. Chokidar will
-    // re-fire when the file is next written to, so no content is missed.
     if (this.processFileInFlight.has(filePath)) return;
+    if (Date.now() < (this.processFileNextReadAt.get(filePath) ?? 0)) return;
 
-    // Per-file cooldown: if we just finished a read for this file, don't start another
-    // for MIN_FILE_READ_COOLDOWN_MS. This prevents the compounding pattern where a
-    // 21-second Defender-blocked read completes, clears the in-flight guard, and then
-    // immediately starts another 21-second read. Chokidar will re-fire naturally when
-    // the file is next written to, ensuring no content is permanently missed.
-    const now = Date.now();
-    const lastRead = this.processFileLastReadMs.get(filePath) ?? 0;
-    if (now - lastRead < AgentService.MIN_FILE_READ_COOLDOWN_MS) {
-      return;
-    }
-
-    if (this.processFileActive >= AgentService.MAX_CONCURRENT_PROCESS) {
+    if (this.processFileInFlight.size >= AgentService.MAX_CONCURRENT_PROCESS) {
       if (this.processFileWaiters.length >= AgentService.MAX_WAITER_QUEUE) {
         logInfo('processFile', `queue full (${AgentService.MAX_WAITER_QUEUE}) — dropping: ${path.basename(filePath)}`);
         return;
       }
-      // Only log post-init — during the startup batch scan, queuing is expected and not useful signal.
-      if (!this._initializing) logInfo('processFile', `queued (active=${this.processFileActive} waiting=${this.processFileWaiters.length}): ${path.basename(filePath)}`);
+      if (!this._initializing) logInfo('processFile', `queued (active=${this.processFileInFlight.size} waiting=${this.processFileWaiters.length}): ${path.basename(filePath)}`);
       await new Promise<void>(resolve => this.processFileWaiters.push(resolve));
     }
     this.processFileInFlight.add(filePath);
     this.processFileStartedAt.set(filePath, Date.now());
-    this.processFileActive++;
     const _ioT0 = Date.now();
-    // Capture so we can detect if our slot was already reclaimed by the stale-op sweep.
-    // If reclaimed, we mustn't double-decrement processFileActive or double-shift waiters.
-    const inflightAtStart = this.processFileInFlight.has(filePath);
     try {
       await this.processFileImpl(filePath, stats);
     } finally {
       const _ioMs = Date.now() - _ioT0;
-      // Adaptive cooldown: if this read was very slow (likely Defender scanning a
-      // large file), back off proportionally rather than always waiting 8s. A 30s
-      // read means the file is large and the next read will also be slow — waiting
-      // only 8s would just start another long read immediately.
-      const adaptiveCooldown = Math.max(
-        AgentService.MIN_FILE_READ_COOLDOWN_MS,
-        Math.min(_ioMs * 2, 5 * 60 * 1000), // 2× read time, capped at 5 min
-      );
-      this.processFileLastReadMs.set(filePath, Date.now() + adaptiveCooldown - AgentService.MIN_FILE_READ_COOLDOWN_MS);
+      const cooldownMs = Math.max(AgentService.MIN_FILE_READ_COOLDOWN_MS, Math.min(_ioMs * 2, 5 * 60 * 1000));
+      this.processFileNextReadAt.set(filePath, Date.now() + cooldownMs);
       if (_ioMs > 1_000) {
-        logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)} (next read in ${Math.round(adaptiveCooldown / 1000)}s)`);
-      } else {
-        logInfo('processFile', `I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+        logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)} (next read in ${Math.round(cooldownMs / 1000)}s)`);
       }
-      // Only release the slot if it wasn't already reclaimed by a stale-op sweep.
-      // The sweep removes the path from processFileInFlight when it gives up waiting.
-      if (inflightAtStart && this.processFileInFlight.has(filePath)) {
+      // Skip release if our slot was reclaimed by the stale-op sweep.
+      if (this.processFileInFlight.has(filePath)) {
         this.processFileInFlight.delete(filePath);
         this.processFileStartedAt.delete(filePath);
-        this.processFileActive--;
         this.processFileWaiters.shift()?.();
       }
     }
@@ -634,15 +573,14 @@ export class AgentService {
    * was reclaimed and exits without double-releasing.
    */
   private checkStaleOperations(): number {
+    if (this.processFileStartedAt.size === 0) return 0;
     const now = Date.now();
     let reclaimed = 0;
     for (const [filePath, startedAt] of this.processFileStartedAt) {
       if (now - startedAt < AgentService.STALE_OPERATION_MS) continue;
-      const ageMs = now - startedAt;
-      logInfo('checkStaleOperations', `reclaiming slot for ${path.basename(filePath)} stuck ${Math.round(ageMs / 1000)}s`);
+      logInfo('checkStaleOperations', `reclaiming slot for ${path.basename(filePath)} stuck ${Math.round((now - startedAt) / 1000)}s`);
       this.processFileInFlight.delete(filePath);
       this.processFileStartedAt.delete(filePath);
-      this.processFileActive = Math.max(0, this.processFileActive - 1);
       this.processFileWaiters.shift()?.();
       reclaimed++;
     }
@@ -650,26 +588,36 @@ export class AgentService {
   }
 
   /**
-   * Manually clears the change-event queue and resets in-flight tracking. Useful
-   * when the extension has accumulated a backlog (e.g. after a long unfocused
-   * period) and the user wants an immediate clean slate without a full refresh.
-   * Does NOT clear the agents Map or title cache — only the transient queues.
+   * Clears all transient queues: pending debounces, drop timers, waiters,
+   * and batched paths. Does NOT touch the agents Map or title cache. Shared
+   * between refresh(), flushQueue(), and dispose().
    */
-  flushQueue(): void {
+  private clearTransientQueues(): { debounced: number; drops: number; waiters: number; pending: number } {
+    const counts = {
+      debounced: this.changeDebounce.size,
+      drops: this.pendingDrops.size,
+      waiters: this.processFileWaiters.length,
+      pending: this._pendingPaths.size,
+    };
     for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
-    const debouncedCount = this.changeDebounce.size;
     this.changeDebounce.clear();
     for (const t of this.pendingDrops.values()) clearTimeout(t);
-    const dropCount = this.pendingDrops.size;
     this.pendingDrops.clear();
-    // Wake up any waiters so they exit their await and check the cooldown again
-    // (most will be skipped by the cooldown since their files were just touched).
-    const waiterCount = this.processFileWaiters.length;
+    // Resolve waiters so their awaiting callers exit cleanly — they'll re-check
+    // the cooldown on resume and skip if their file was just touched.
     while (this.processFileWaiters.length > 0) this.processFileWaiters.shift()?.();
-    const staleCount = this.checkStaleOperations();
-    const pendingCount = this._pendingPaths.size;
     this._pendingPaths.clear();
-    logInfo('flushQueue', `cleared debounced=${debouncedCount} drops=${dropCount} waiters=${waiterCount} stale=${staleCount} pending=${pendingCount}`);
+    return counts;
+  }
+
+  /**
+   * Manual clean-slate for the queue without a full agent refresh.
+   * Reachable via the agentViewer.flushQueue command.
+   */
+  flushQueue(): void {
+    const counts = this.clearTransientQueues();
+    const stale = this.checkStaleOperations();
+    logInfo('flushQueue', `cleared debounced=${counts.debounced} drops=${counts.drops} waiters=${counts.waiters} stale=${stale} pending=${counts.pending}`);
   }
 
   private async processFileImpl(filePath: string, stats?: fs.Stats): Promise<void> {
@@ -862,15 +810,35 @@ export class AgentService {
         .map(f => subagentDir + '/' + f)
         .filter(f => !this.agents.has(sessionIdFromPath(f)));
       if (newFiles.length > 0) {
-        // Serial — not Promise.all. Multiple new subagent files discovered at once
-        // would otherwise each grab a concurrency slot simultaneously, leaving no
-        // threads free for the parent session or VS Code's own I/O under Defender.
+        // Serial so multiple new subagent files don't all grab concurrency slots at once.
         for (const f of newFiles) await this.processFile(f);
         this.scheduleEmit();
       }
     } catch {
       // Directory doesn't exist yet — normal if subagents haven't been spawned yet.
     }
+  }
+
+  /**
+   * Removes a session from in-memory state, releasing all per-session tracking.
+   * Records it in evictedSessions (bounded) so discoverNewFiles doesn't immediately
+   * re-add it on the next 5-min tick.
+   */
+  private evictSession(sessionId: string, transcriptPath: string): void {
+    this.pruneSubagentState(sessionId);
+    this.agents.delete(sessionId);
+    this.titleCache.delete(sessionId);
+    this.processFileNextReadAt.delete(transcriptPath);
+    this.processFileInFlight.delete(transcriptPath);
+    this.processFileStartedAt.delete(transcriptPath);
+    // Cap evictedSessions at a sane size — drop oldest entries via insertion-order
+    // iteration. A session evicted long ago becoming "rediscovered" is harmless;
+    // unbounded growth is not.
+    if (this.evictedSessions.size >= AgentService.MAX_EVICTED_SESSIONS) {
+      const oldest = this.evictedSessions.values().next().value;
+      if (oldest) this.evictedSessions.delete(oldest);
+    }
+    this.evictedSessions.add(sessionId);
   }
 
   /** Removes a deleted transcript file's agent and title cache entries, then fires onDidDrop. */
@@ -957,25 +925,16 @@ export class AgentService {
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
 
-      // Evict done top-level sessions older than 10× doneAgeMs. Only runs on tick (not
-      // on file-change) since eligibility only changes on the hour-scale. At the default
-      // 1-hour doneAge, this keeps up to ~10 hours of history in memory — a full working
-      // day. 3× was too aggressive and left users with "Show 2 hidden" after minutes.
+      // Evict done top-level sessions older than 10× doneAgeMs. Only runs on tick
+      // (eligibility only changes on the hour-scale). At default doneAge of 1h, this
+      // keeps ~10 hours of history in memory.
       if (reason === 'tick') {
         let evictCount = 0;
         for (const [sid, agent] of this.agents) {
           if (agent.state !== 'done' || agent.parentSessionId) continue;
           if (now - agent.mtimeMs <= doneAgeMs * 10) continue;
-          for (const sub of agent.subagents) {
-            this.pruneSubagentState(sub.sessionId); // releases tracking maps + chokidar watcher
-            this.agents.delete(sub.sessionId);
-            this.titleCache.delete(sub.sessionId);
-            this.evictedSessions.add(sub.sessionId);
-          }
-          this.pruneSubagentState(sid);
-          this.agents.delete(sid);
-          this.titleCache.delete(sid);
-          this.evictedSessions.add(sid);
+          for (const sub of agent.subagents) this.evictSession(sub.sessionId, sub.transcriptPath);
+          this.evictSession(sid, agent.transcriptPath);
           evictCount++;
         }
         if (evictCount > 0) {
@@ -991,7 +950,7 @@ export class AgentService {
       if (reason === 'tick' && ++this._tickCount % 60 === 0) {
         const watchedPaths = this.watcher ? Object.keys((this.watcher as unknown as { _watched: Record<string, unknown> })._watched ?? {}).length : -1;
         const mem = process.memoryUsage();
-        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileActive} waiters=${this.processFileWaiters.length} withSubagents=${this._agentsWithSubagents.size} watchedSubDirs=${this.watchedSubagentDirs.size} watcherPaths=${watchedPaths} rss=${Math.round(mem.rss/1024/1024)}MB heap=${Math.round(mem.heapUsed/1024/1024)}MB`);
+        logInfo('heartbeat', `tick=${this._tickCount} agents=${this.agents.size} ready=${this._ready} processFileActive=${this.processFileInFlight.size} waiters=${this.processFileWaiters.length} withSubagents=${this._agentsWithSubagents.size} watchedSubDirs=${this.watchedSubagentDirs.size} watcherPaths=${watchedPaths} rss=${Math.round(mem.rss/1024/1024)}MB heap=${Math.round(mem.heapUsed/1024/1024)}MB`);
       }
       if (reason === 'change' || reason === 'background' || anyChanged) {
         let treeMs = 0;
@@ -1048,10 +1007,7 @@ export class AgentService {
       scanned++;
       updated++;
       if (updated % 200 === 0) this.scheduleEmit('background');
-      // Yield 10ms between reads so background title scans don't monopolize the
-      // libuv I/O thread pool. With Defender scanning each file, even 0ms reads
-      // can block a thread for seconds — leaving threads free for chokidar and
-      // VS Code's own I/O keeps event-loop lag tolerable.
+      // Yield between reads so background scans don't monopolize the libuv pool.
       await new Promise<void>(r => setTimeout(r, 10));
     }
 
@@ -1066,11 +1022,7 @@ export class AgentService {
     if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
     if (this._batchTimer) clearInterval(this._batchTimer);
     this.cancelDiscovery();
-    for (const t of this.pendingDrops.values()) clearTimeout(t);
-    this.pendingDrops.clear();
-    for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
-    this.changeDebounce.clear();
-    this._pendingPaths.clear();
+    this.clearTransientQueues();
     this.watcher?.close();
     this._onDidChange.dispose();
     this._onDidDrop.dispose();
