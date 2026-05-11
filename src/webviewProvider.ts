@@ -144,17 +144,17 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         this._consecutiveDeliveryFailures = 0;
       }
       this._lastDeliveredMs = Date.now();
-    } else if (this._view) {
+    } else {
       this._consecutiveDeliveryFailures++;
       const gapMs = this._lastDeliveredMs > 0 ? Date.now() - this._lastDeliveredMs : -1;
       if (this._consecutiveDeliveryFailures === 1) {
         logInfo('postAgents', `postMessage returned false — first failure, last success ${gapMs}ms ago`);
       }
-      if (this._lastDeliveredMs > 0 && Date.now() - this._lastDeliveredMs > 30_000) {
+      if (gapMs > 30_000) {
         logInfo('postAgents', `webview unresponsive for >30s (${this._consecutiveDeliveryFailures} failures) — forcing reload`);
         this._consecutiveDeliveryFailures = 0;
         this._lastDeliveredMs = Date.now();
-        this._view.webview.html = this.getHtml();
+        this._view!.webview.html = this.getHtml();
       }
     }
   }
@@ -1079,6 +1079,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         root.innerHTML = '<div class="scanning-label"><span class="spinner"></span>Scanning…</div>';
         rootIsEmpty = true;
         if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+        __diag.lastRenderDurationMs = Math.round(performance.now() - _renderT0);
         return;
       }
       if (!agents || agents.length === 0) {
@@ -1089,6 +1090,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         rootIsEmpty = true;
         updateHideDoneBtn(lastDoneParentCount);
         if (loadMoreBtn) loadMoreBtn.style.display = 'none';
+        __diag.lastRenderDurationMs = Math.round(performance.now() - _renderT0);
         return;
       }
       if (rootIsEmpty) { root.innerHTML = ''; rootIsEmpty = false; }
@@ -1232,7 +1234,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       for (const [, group] of lastGroups) {
         for (const agent of group.agents) {
           const cardEl = cardEls.get(agent.sessionId);
-          if (!cardEl || !cardEl.offsetParent) continue; // skip cards in collapsed/hidden groups
+          if (!cardEl || !cardEl.closest('.proj-group.open')) continue; // skip cards in collapsed groups
 
           const timeEl = cardEl.querySelector('.card-time');
           if (timeEl) timeEl.textContent = relTimeShort(parentMaxMtime(agent), now);
@@ -1246,7 +1248,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           const effState = parentEffectiveState(agent);
           const existingBadge = cardEl.querySelector('.stuck-badge');
           const newBadge = renderStuckBadge(agent.activityHistory, effState, now);
-          if (existingBadge && newBadge) existingBadge.outerHTML = newBadge;
+          if (existingBadge && newBadge) { if (existingBadge.outerHTML !== newBadge) existingBadge.outerHTML = newBadge; }
           else if (existingBadge && !newBadge) existingBadge.remove();
           else if (!existingBadge && newBadge) {
             const tl = cardEl.querySelector('.activity-timeline');

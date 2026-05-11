@@ -634,8 +634,7 @@ export class AgentService {
     const cooldown = this._lastChangeEmitMs + AgentService.MIN_CHANGE_EMIT_MS - Date.now();
     const delay = reason === 'change' && cooldown > DEBOUNCE_MS ? cooldown : DEBOUNCE_MS;
     this.debounceTimer = setTimeout(() => {
-      const emitT0 = Date.now();
-      const now = emitT0;
+      const now = Date.now();
       const doneAgeMs = this.getDoneAgeMs();
       const runningWindowMs = this.getRunningWindowMs();
       let anyChanged = false;
@@ -654,29 +653,31 @@ export class AgentService {
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
 
-      // Evict done top-level sessions older than 3× doneAgeMs. Keeps the in-memory map
-      // bounded during multi-day runs — the agents Map otherwise accumulates every session
-      // ever discovered, making every tick O(total-ever) not O(active). Evicted sessions
+      // Evict done top-level sessions older than 3× doneAgeMs. Only runs on tick (not
+      // on file-change) since eligibility only changes on the hour-scale. Evicted sessions
       // re-enter the map automatically when their file is next written to.
-      let evictCount = 0;
-      for (const [sid, agent] of this.agents) {
-        if (agent.state !== 'done' || agent.parentSessionId) continue;
-        if (now - agent.mtimeMs <= doneAgeMs * 3) continue;
-        for (const sub of agent.subagents) {
-          this.agents.delete(sub.sessionId);
-          this.titleCache.delete(sub.sessionId);
-          this._agentsWithSubagents.delete(sub.sessionId);
+      if (reason === 'tick') {
+        let evictCount = 0;
+        for (const [sid, agent] of this.agents) {
+          if (agent.state !== 'done' || agent.parentSessionId) continue;
+          if (now - agent.mtimeMs <= doneAgeMs * 3) continue;
+          for (const sub of agent.subagents) {
+            this.pruneSubagentState(sub.sessionId); // releases tracking maps + chokidar watcher
+            this.agents.delete(sub.sessionId);
+            this.titleCache.delete(sub.sessionId);
+          }
+          this.pruneSubagentState(sid);
+          this.agents.delete(sid);
+          this.titleCache.delete(sid);
+          evictCount++;
         }
-        this.agents.delete(sid);
-        this.titleCache.delete(sid);
-        this._agentsWithSubagents.delete(sid);
-        evictCount++;
-      }
-      if (evictCount > 0) {
-        logInfo('evict', `evicted ${evictCount} done sessions (>3× doneAge) from memory; remaining=${this.agents.size}`);
-        buildTree(this.agents);
-        this._structureChanged = false;
-        anyChanged = true;
+        if (evictCount > 0) {
+          logInfo('evict', `evicted ${evictCount} done sessions (>3× doneAge) from memory; remaining=${this.agents.size}`);
+          buildTree(this.agents);
+          assignTaskDescriptions(this.agents); // buildTree without assignTaskDescriptions leaves taskDescription stale
+          this._structureChanged = false;
+          anyChanged = true;
+        }
       }
 
       // Heartbeat every ~5 min so we can distinguish "quiet (all done)" from a true hang.
@@ -705,7 +706,7 @@ export class AgentService {
         logInfo('emit', `agents=${this.agents.size} subagents=${subCount} treeMs=${treeMs}ms reason=${reason}`);
         this._onDidChange.fire(this.getAgents());
       }
-      const emitMs = Date.now() - emitT0;
+      const emitMs = Date.now() - now;
       if (emitMs > 200) logInfo('scheduleEmit', `slow callback: ${emitMs}ms for ${this.agents.size} agents reason=${reason}`);
     }, delay);
   }
