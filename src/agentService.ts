@@ -61,6 +61,14 @@ export class AgentService {
   // that actively-streaming transcripts still get processed and panels stay live.
   private changeDebounce = new Map<string, { timer: NodeJS.Timeout; firstAt: number }>();
   private static readonly CHANGE_FORCE_FLUSH_MS = 2_000;
+  // Session IDs explicitly evicted by tick-based age logic. Prevents discoverNewFiles()
+  // from immediately re-adding sessions that were just evicted — without this, the
+  // 5-minute discovery tick re-discovers all 2375+ evicted sessions as "missing" files,
+  // fills the processFile queue, and causes a continuous evict→discover→evict loop.
+  // Cleared on refresh() so a manual refresh still re-scans everything.
+  // Chokidar change events (user resumes an old session) bypass this — processFile()
+  // is called directly from the watcher and will re-add the session normally.
+  private readonly evictedSessions = new Set<string>();
   // Session IDs that have ever had Agent tool_use calls. Pruned when sessions go
   // done/dropped so scanPendingSubagentDirs doesn't probe dead dirs indefinitely.
   private _agentsWithSubagents = new Set<string>();
@@ -333,6 +341,7 @@ export class AgentService {
       this.pendingDrops.clear();
       this.processFileInFlight.clear();
       this.processFileLastReadMs.clear();
+      this.evictedSessions.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
@@ -356,7 +365,10 @@ export class AgentService {
   private async discoverNewFiles(): Promise<void> {
     try {
       const newFiles = await findTopLevelJsonlFiles(PROJECTS_ROOT);
-      const missing = newFiles.filter(f => !this.agents.has(sessionIdFromPath(f)));
+      const missing = newFiles.filter(f => {
+        const sid = sessionIdFromPath(f);
+        return !this.agents.has(sid) && !this.evictedSessions.has(sid);
+      });
       if (missing.length > 0) {
         await Promise.all(missing.map(f => this.processFile(f)));
         this.scheduleEmit();
@@ -710,10 +722,12 @@ export class AgentService {
             this.pruneSubagentState(sub.sessionId); // releases tracking maps + chokidar watcher
             this.agents.delete(sub.sessionId);
             this.titleCache.delete(sub.sessionId);
+            this.evictedSessions.add(sub.sessionId);
           }
           this.pruneSubagentState(sid);
           this.agents.delete(sid);
           this.titleCache.delete(sid);
+          this.evictedSessions.add(sid);
           evictCount++;
         }
         if (evictCount > 0) {
