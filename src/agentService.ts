@@ -251,7 +251,7 @@ export class AgentService {
     const t0 = Date.now();
     const paths = [...this._pendingPaths];
     this._pendingPaths.clear();
-    for (const p of paths) await this.processFile(p);
+    for (const p of paths) await this.processFile(p, undefined, { bypassBatch: true });
     logInfo('drain', `${reason}: processed ${paths.length} pending paths in ${Date.now() - t0}ms`);
   }
 
@@ -315,6 +315,15 @@ export class AgentService {
       const activeRequests = (process as unknown as { _getActiveRequests?: () => unknown[] })._getActiveRequests?.()?.length ?? -1;
       const tag = total > 50 ? 'SLOW' : 'ok';
       logInfo('ioProbe', `[${tag}] open=${tOpen}ms read=${tRead}ms total=${total}ms handles=${activeHandles} requests=${activeRequests}`);
+      // Use the probe as an additional throttling signal — it catches libuv pool
+      // saturation earlier and more reliably than waiting for 3 consecutive tick
+      // lags. >500ms on a 4KB read of our own source file means I/O threads are
+      // monopolized; >5000ms is severe.
+      if (!this._throttled && total > 500) {
+        this._throttled = true;
+        logInfo('throttle', `detected via ioProbe (${total}ms) — switching to ${AgentService.BATCH_DRAIN_MS / 1000}s batch drains`);
+        this.updateBatchTimerState();
+      }
     } catch (err) { logError('ioProbe', err); }
   }
 
@@ -428,13 +437,15 @@ export class AgentService {
     });
     this.watcher
       .on('add',    (p) => {
-        if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
         // Cancel any pending drop for this path (atomic-write rename sequence).
+        // processFile internally handles batch-mode coalescing.
         const t = this.pendingDrops.get(p);
         if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
         void this.processFile(p);
       })
       .on('change', (p) => {
+        // Hot-path short-circuit: avoid the debounce machinery when we're going to
+        // batch anyway. processFile would also coalesce, but this saves the timer churn.
         if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
         // MaxWait debounce: trailing 500ms after writes settle, but forced to
         // fire within CHANGE_FORCE_FLUSH_MS so continuously-streaming transcripts
@@ -532,9 +543,17 @@ export class AgentService {
    * Agent into the in-memory map. Title scan runs once per session and is cached.
    * Runs through a concurrency gate to prevent I/O pool saturation.
    */
-  private async processFile(filePath: string, stats?: fs.Stats): Promise<void> {
+  private async processFile(filePath: string, stats?: fs.Stats, opts?: { bypassBatch?: boolean }): Promise<void> {
     if (this.processFileInFlight.has(filePath)) return;
     if (Date.now() < (this.processFileNextReadAt.get(filePath) ?? 0)) return;
+
+    // Central batching gate: every caller honors batch mode, not just chokidar
+    // handlers. The drain path passes bypassBatch:true so its calls actually run
+    // (otherwise they'd just be re-added to _pendingPaths and the drain would loop).
+    if (this.shouldBatch() && !opts?.bypassBatch) {
+      this._pendingPaths.add(filePath);
+      return;
+    }
 
     if (this.processFileInFlight.size >= AgentService.MAX_CONCURRENT_PROCESS) {
       if (this.processFileWaiters.length >= AgentService.MAX_WAITER_QUEUE) {
