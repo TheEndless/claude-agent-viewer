@@ -91,6 +91,12 @@ export class AgentService {
   // active session transcript taking 20s+ to read under Windows Defender). A new
   // chokidar event will re-trigger after the file is next written to, so no data is lost.
   private readonly processFileInFlight = new Set<string>();
+  // Per-file cooldown: timestamp of the last completed read. Prevents immediately
+  // re-reading the same file after a slow Defender-blocked read completes. Without
+  // this, completing a 21-second read clears the in-flight guard, and the next
+  // queued chokidar event starts a brand-new 21-second read — compounding forever.
+  private readonly processFileLastReadMs = new Map<string, number>();
+  private static readonly MIN_FILE_READ_COOLDOWN_MS = 8_000;
   // Throttle change-triggered emits: after firing, hold off for this long before
   // firing again. Prevents rapid file writes from rebuilding the agent tree on
   // every individual write when multiple sessions are active simultaneously.
@@ -322,6 +328,7 @@ export class AgentService {
       for (const t of this.pendingDrops.values()) clearTimeout(t);
       this.pendingDrops.clear();
       this.processFileInFlight.clear();
+      this.processFileLastReadMs.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
@@ -378,6 +385,17 @@ export class AgentService {
     // re-fire when the file is next written to, so no content is missed.
     if (this.processFileInFlight.has(filePath)) return;
 
+    // Per-file cooldown: if we just finished a read for this file, don't start another
+    // for MIN_FILE_READ_COOLDOWN_MS. This prevents the compounding pattern where a
+    // 21-second Defender-blocked read completes, clears the in-flight guard, and then
+    // immediately starts another 21-second read. Chokidar will re-fire naturally when
+    // the file is next written to, ensuring no content is permanently missed.
+    const now = Date.now();
+    const lastRead = this.processFileLastReadMs.get(filePath) ?? 0;
+    if (now - lastRead < AgentService.MIN_FILE_READ_COOLDOWN_MS) {
+      return;
+    }
+
     if (this.processFileActive >= AgentService.MAX_CONCURRENT_PROCESS) {
       if (this.processFileWaiters.length >= AgentService.MAX_WAITER_QUEUE) {
         logInfo('processFile', `queue full (${AgentService.MAX_WAITER_QUEUE}) — dropping: ${path.basename(filePath)}`);
@@ -394,7 +412,12 @@ export class AgentService {
       await this.processFileImpl(filePath, stats);
     } finally {
       const _ioMs = Date.now() - _ioT0;
-      if (_ioMs > 1_000) logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+      this.processFileLastReadMs.set(filePath, Date.now());
+      if (_ioMs > 1_000) {
+        logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+      } else {
+        logInfo('processFile', `I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+      }
       this.processFileInFlight.delete(filePath);
       this.processFileActive--;
       this.processFileWaiters.shift()?.();
