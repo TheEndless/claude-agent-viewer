@@ -35,6 +35,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   // Tracks the last time a postMessage was successfully delivered. Used to detect
   // zombie webview state where postMessage silently returns false indefinitely.
   private _lastDeliveredMs = 0;
+  private _consecutiveDeliveryFailures = 0;
 
   constructor(private readonly agentService: AgentService) { }
 
@@ -138,12 +139,23 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     logInfo('postAgents', `sending=${payload.length}/${allAgents.length} doneHidden=${excludedDoneIds.size} serializeMs=${serializeMs}ms`);
     const delivered = await this._view?.webview.postMessage({ command: 'render', agents: payload, ready, now: Date.now(), doneParentCount, remainingDone });
     if (delivered) {
+      if (this._consecutiveDeliveryFailures > 0) {
+        logInfo('postAgents', `delivery restored after ${this._consecutiveDeliveryFailures} consecutive failures`);
+        this._consecutiveDeliveryFailures = 0;
+      }
       this._lastDeliveredMs = Date.now();
-    } else if (this._view && this._lastDeliveredMs > 0 && Date.now() - this._lastDeliveredMs > 30_000) {
-      // Webview has been unresponsive for >30s — force-reload to recover from zombie iframe.
-      logInfo('postAgents', 'webview unresponsive for >30s — forcing reload');
-      this._lastDeliveredMs = Date.now(); // prevent reload storm
-      this._view.webview.html = this.getHtml();
+    } else if (this._view) {
+      this._consecutiveDeliveryFailures++;
+      const gapMs = this._lastDeliveredMs > 0 ? Date.now() - this._lastDeliveredMs : -1;
+      if (this._consecutiveDeliveryFailures === 1) {
+        logInfo('postAgents', `postMessage returned false — first failure, last success ${gapMs}ms ago`);
+      }
+      if (this._lastDeliveredMs > 0 && Date.now() - this._lastDeliveredMs > 30_000) {
+        logInfo('postAgents', `webview unresponsive for >30s (${this._consecutiveDeliveryFailures} failures) — forcing reload`);
+        this._consecutiveDeliveryFailures = 0;
+        this._lastDeliveredMs = Date.now();
+        this._view.webview.html = this.getHtml();
+      }
     }
   }
 
@@ -632,6 +644,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     let lastNow = Date.now();
     let lastReady = false;
 
+    // Diagnostic state — inspect via window.__agentViewerDiag in the webview DevTools console.
+    const __diag = window.__agentViewerDiag = {
+      renderCount: 0, lastRenderMs: 0, lastRenderDurationMs: 0,
+      tickCount: 0,   lastTickMs: 0,   lastTickDurationMs: 0,
+      msgGapWarnings: 0,
+    };
+
     function esc(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
@@ -1050,6 +1069,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     function render(agents, now, ready, doneParentCount, remainingDone) {
+      const _renderT0 = performance.now();
+      __diag.renderCount++;
+      __diag.lastRenderMs = Date.now();
       lastAgents = agents; lastNow = now; lastReady = ready;
       lastDoneParentCount = doneParentCount || 0;
       if (!ready) {
@@ -1084,6 +1106,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           loadMoreBtn.style.display = 'none';
         }
       }
+      const _renderMs = performance.now() - _renderT0;
+      __diag.lastRenderDurationMs = Math.round(_renderMs);
+      if (_renderMs > 200) console.warn('[agent-viewer] slow render: ' + Math.round(_renderMs) + 'ms for ' + (agents?.length ?? 0) + ' agents (renderCount=' + __diag.renderCount + ')');
     }
 
     root.addEventListener('click', (e) => {
@@ -1174,6 +1199,13 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener('message', (event) => {
       const { command, agents, ready, now, doneParentCount, remainingDone } = event.data;
+      if (command === 'render' && __diag.lastRenderMs > 0) {
+        const gapMs = Date.now() - __diag.lastRenderMs;
+        if (gapMs > 60_000) {
+          __diag.msgGapWarnings++;
+          console.warn('[agent-viewer] render message received after ' + Math.round(gapMs / 1000) + 's gap (warning #' + __diag.msgGapWarnings + ')');
+        }
+      }
       if (command === 'reset') {
         root.className = 'empty-global';
         root.innerHTML = '<div class="scanning-label"><span class="spinner"></span>Scanning…</div>';
@@ -1193,6 +1225,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     // Only updates text nodes and the stuck badge — avoids the full DOM re-ordering
     // cost of reconcile() which was causing webview sluggishness over extended periods.
     function tickTimestamps(now) {
+      const _tickT0 = performance.now();
+      __diag.tickCount++;
+      __diag.lastTickMs = now;
       if (!lastGroups) return;
       for (const [, group] of lastGroups) {
         for (const agent of group.agents) {
@@ -1229,8 +1264,20 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           }
         }
       }
+      const _tickMs = performance.now() - _tickT0;
+      __diag.lastTickDurationMs = Math.round(_tickMs);
+      if (_tickMs > 100) console.warn('[agent-viewer] slow tickTimestamps: ' + Math.round(_tickMs) + 'ms (tickCount=' + __diag.tickCount + ')');
     }
-    setInterval(() => tickTimestamps(Date.now()), 10_000);
+    setInterval(() => {
+      const now = Date.now();
+      tickTimestamps(now);
+      // Staleness check: if render messages stopped arriving while the panel is visible,
+      // something upstream is broken. Log to the webview console so DevTools shows it.
+      if (__diag.lastRenderMs > 0 && now - __diag.lastRenderMs > 120_000) {
+        __diag.msgGapWarnings++;
+        console.warn('[agent-viewer] no render message for ' + Math.round((now - __diag.lastRenderMs) / 1000) + 's (renderCount=' + __diag.renderCount + ', warning #' + __diag.msgGapWarnings + ')');
+      }
+    }, 10_000);
 
     // Sync persisted preferences with the extension host. Uses 'syncPrefs' (not
     // 'refresh') so the extension host only updates its filter state and re-sends

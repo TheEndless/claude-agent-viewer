@@ -93,6 +93,9 @@ export class AgentService {
   private static readonly MIN_CHANGE_EMIT_MS = 2_000;
   private _discoveryVisible = true;
   private _discoveryGen = 0;
+  // Used to measure event-loop lag: actual tick interval vs. scheduled interval.
+  private _lastTickMs = 0;
+  private _tickIntervalMs = STATE_TICK_MS;
   private _ready = false;
   private _initializing = false;
   private _tickCount = 0;
@@ -116,10 +119,11 @@ export class AgentService {
    */
   setVisible(visible: boolean): void {
     this._discoveryVisible = visible;
+    this._tickIntervalMs = visible ? STATE_TICK_MS : STATE_TICK_MS_HIDDEN;
     if (this.tickTimer) clearInterval(this.tickTimer);
     this.tickTimer = setInterval(
       () => this.onTick(),
-      visible ? STATE_TICK_MS : STATE_TICK_MS_HIDDEN,
+      this._tickIntervalMs,
     );
     // Restart the self-rearming discovery loop at the new cadence.
     this.cancelDiscovery();
@@ -145,6 +149,12 @@ export class AgentService {
 
   /** Combines the state-reclassification tick with a proactive subagent dir scan. */
   private onTick(): void {
+    const now = Date.now();
+    if (this._lastTickMs > 0) {
+      const lag = now - this._lastTickMs - this._tickIntervalMs;
+      if (lag > 2_000) logInfo('tick', `event-loop lag: ${lag}ms behind schedule (expected every ${this._tickIntervalMs}ms)`);
+    }
+    this._lastTickMs = now;
     this.scheduleEmit('tick');
     void this.scanPendingSubagentDirs();
   }
@@ -365,9 +375,12 @@ export class AgentService {
       await new Promise<void>(resolve => this.processFileWaiters.push(resolve));
     }
     this.processFileActive++;
+    const _ioT0 = Date.now();
     try {
       await this.processFileImpl(filePath, stats);
     } finally {
+      const _ioMs = Date.now() - _ioT0;
+      if (_ioMs > 1_000) logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
       this.processFileActive--;
       this.processFileWaiters.shift()?.();
     }
@@ -621,7 +634,8 @@ export class AgentService {
     const cooldown = this._lastChangeEmitMs + AgentService.MIN_CHANGE_EMIT_MS - Date.now();
     const delay = reason === 'change' && cooldown > DEBOUNCE_MS ? cooldown : DEBOUNCE_MS;
     this.debounceTimer = setTimeout(() => {
-      const now = Date.now();
+      const emitT0 = Date.now();
+      const now = emitT0;
       const doneAgeMs = this.getDoneAgeMs();
       const runningWindowMs = this.getRunningWindowMs();
       let anyChanged = false;
@@ -691,6 +705,8 @@ export class AgentService {
         logInfo('emit', `agents=${this.agents.size} subagents=${subCount} treeMs=${treeMs}ms reason=${reason}`);
         this._onDidChange.fire(this.getAgents());
       }
+      const emitMs = Date.now() - emitT0;
+      if (emitMs > 200) logInfo('scheduleEmit', `slow callback: ${emitMs}ms for ${this.agents.size} agents reason=${reason}`);
     }, delay);
   }
 
