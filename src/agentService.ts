@@ -761,31 +761,33 @@ export class AgentService {
     if (agents.length === 0) return;
     logInfo('backgroundScanTitles', `scanning ${agents.length} deferred archive titles`);
 
-    const CONCURRENT = 4;
-    let idx = 0;
     let scanned = 0;
+    let skipped = 0;
     let updated = 0;
 
-    const worker = async (): Promise<void> => {
-      while (idx < agents.length) {
-        const agent = agents[idx++];
-        if (this.titleCache.has(agent.sessionId)) continue;
-        const cached = await scanFullFileForTitles(agent.transcriptPath);
-        this.titleCache.set(agent.sessionId, cached);
-        agent.details.customTitle = cached.customTitle ?? agent.details.customTitle;
-        agent.details.aiTitle = cached.aiTitle ?? agent.details.aiTitle;
-        agent.details.lastPrompt = cached.lastPrompt ?? agent.details.lastPrompt;
-        agent.details.latestUserPrompt = agent.details.latestUserPrompt ?? cached.firstUserPrompt;
-        scanned++;
-        updated++;
-        if (updated % 200 === 0) this.scheduleEmit('background');
-        await new Promise<void>(r => setImmediate(r));
-      }
-    };
+    for (const agent of agents) {
+      // Skip sessions evicted from memory since this scan started (tick-based
+      // eviction can remove thousands of old sessions before we finish scanning).
+      if (!this.agents.has(agent.sessionId)) { skipped++; continue; }
+      if (this.titleCache.has(agent.sessionId)) { skipped++; continue; }
+      const cached = await scanFullFileForTitles(agent.transcriptPath);
+      this.titleCache.set(agent.sessionId, cached);
+      agent.details.customTitle = cached.customTitle ?? agent.details.customTitle;
+      agent.details.aiTitle = cached.aiTitle ?? agent.details.aiTitle;
+      agent.details.lastPrompt = cached.lastPrompt ?? agent.details.lastPrompt;
+      agent.details.latestUserPrompt = agent.details.latestUserPrompt ?? cached.firstUserPrompt;
+      scanned++;
+      updated++;
+      if (updated % 200 === 0) this.scheduleEmit('background');
+      // Yield 10ms between reads so background title scans don't monopolize the
+      // libuv I/O thread pool. With Defender scanning each file, even 0ms reads
+      // can block a thread for seconds — leaving threads free for chokidar and
+      // VS Code's own I/O keeps event-loop lag tolerable.
+      await new Promise<void>(r => setTimeout(r, 10));
+    }
 
-    await Promise.all(Array.from({ length: CONCURRENT }, () => worker()));
     if (updated > 0) this.scheduleEmit('background');
-    logInfo('backgroundScanTitles', `scanned ${scanned} archive titles`);
+    logInfo('backgroundScanTitles', `scanned ${scanned} archive titles (${skipped} skipped/evicted)`);
   }
 
   /** Stops all timers and the file watcher. Call on extension deactivation. */
