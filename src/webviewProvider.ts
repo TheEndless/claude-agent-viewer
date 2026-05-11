@@ -1197,7 +1197,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       for (const [, group] of lastGroups) {
         for (const agent of group.agents) {
           const cardEl = cardEls.get(agent.sessionId);
-          if (!cardEl) continue;
+          if (!cardEl || !cardEl.offsetParent) continue; // skip cards in collapsed/hidden groups
 
           const timeEl = cardEl.querySelector('.card-time');
           if (timeEl) timeEl.textContent = relTimeShort(parentMaxMtime(agent), now);

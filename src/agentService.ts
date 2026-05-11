@@ -82,6 +82,10 @@ export class AgentService {
   private processFileActive = 0;
   private readonly processFileWaiters: Array<() => void> = [];
   private static readonly MAX_CONCURRENT_PROCESS = 4;
+  // Hard cap on the waiter queue. Without this, a single stuck fsp.stat (Windows
+  // file lock / antivirus) can cause thousands of closures to pile up indefinitely.
+  // Dropped entries are retried on the next chokidar event or periodic scan.
+  private static readonly MAX_WAITER_QUEUE = 200;
   // Throttle change-triggered emits: after firing, hold off for this long before
   // firing again. Prevents rapid file writes from rebuilding the agent tree on
   // every individual write when multiple sessions are active simultaneously.
@@ -300,6 +304,8 @@ export class AgentService {
       this.cancelDiscovery();
       for (const { timer } of this.changeDebounce.values()) clearTimeout(timer);
       this.changeDebounce.clear();
+      for (const t of this.pendingDrops.values()) clearTimeout(t);
+      this.pendingDrops.clear();
       this.agents.clear();
       this.titleCache.clear();
       this._agentsWithSubagents.clear();
@@ -350,6 +356,10 @@ export class AgentService {
    */
   private async processFile(filePath: string, stats?: fs.Stats): Promise<void> {
     if (this.processFileActive >= AgentService.MAX_CONCURRENT_PROCESS) {
+      if (this.processFileWaiters.length >= AgentService.MAX_WAITER_QUEUE) {
+        logInfo('processFile', `queue full (${AgentService.MAX_WAITER_QUEUE}) — dropping: ${path.basename(filePath)}`);
+        return;
+      }
       // Only log post-init — during the startup batch scan, queuing is expected and not useful signal.
       if (!this._initializing) logInfo('processFile', `queued (active=${this.processFileActive} waiting=${this.processFileWaiters.length}): ${path.basename(filePath)}`);
       await new Promise<void>(resolve => this.processFileWaiters.push(resolve));
@@ -629,6 +639,32 @@ export class AgentService {
         }
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
+
+      // Evict done top-level sessions older than 3× doneAgeMs. Keeps the in-memory map
+      // bounded during multi-day runs — the agents Map otherwise accumulates every session
+      // ever discovered, making every tick O(total-ever) not O(active). Evicted sessions
+      // re-enter the map automatically when their file is next written to.
+      let evictCount = 0;
+      for (const [sid, agent] of this.agents) {
+        if (agent.state !== 'done' || agent.parentSessionId) continue;
+        if (now - agent.mtimeMs <= doneAgeMs * 3) continue;
+        for (const sub of agent.subagents) {
+          this.agents.delete(sub.sessionId);
+          this.titleCache.delete(sub.sessionId);
+          this._agentsWithSubagents.delete(sub.sessionId);
+        }
+        this.agents.delete(sid);
+        this.titleCache.delete(sid);
+        this._agentsWithSubagents.delete(sid);
+        evictCount++;
+      }
+      if (evictCount > 0) {
+        logInfo('evict', `evicted ${evictCount} done sessions (>3× doneAge) from memory; remaining=${this.agents.size}`);
+        buildTree(this.agents);
+        this._structureChanged = false;
+        anyChanged = true;
+      }
+
       // Heartbeat every ~5 min so we can distinguish "quiet (all done)" from a true hang.
       if (reason === 'tick' && ++this._tickCount % 60 === 0) {
         const watchedPaths = this.watcher ? Object.keys((this.watcher as unknown as { _watched: Record<string, unknown> })._watched ?? {}).length : -1;
