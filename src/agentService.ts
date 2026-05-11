@@ -127,16 +127,26 @@ export class AgentService {
   // when focus returns. We drop change events while unfocused and do a single
   // catch-up stat pass on refocus instead.
   private _windowFocused = true;
-  // While unfocused, change/add events go into this Set instead of firing
-  // processFile immediately. Drained every UNFOCUSED_DRAIN_MS by a batch timer
-  // and immediately on refocus. Dedup'd by path so a busy session that fires
-  // 1000 events in 10s only triggers one processFile per drain.
+  // While unfocused OR throttled, change/add events go into this Set instead of
+  // firing processFile immediately. Drained every BATCH_DRAIN_MS by a batch timer
+  // and immediately on refocus / throttle-clear. Dedup'd by path so a busy session
+  // that fires 1000 events in 10s only triggers one processFile per drain.
   private readonly _pendingPaths = new Set<string>();
-  private _unfocusedBatchTimer?: NodeJS.Timeout;
-  private static readonly UNFOCUSED_DRAIN_MS = 10_000;
+  private _batchTimer?: NodeJS.Timeout;
+  private static readonly BATCH_DRAIN_MS = 10_000;
   // Debounce for focus changes so a quick alt-tab doesn't trigger a drain.
   private _focusDebounceTimer?: NodeJS.Timeout;
   private static readonly FOCUS_DEBOUNCE_MS = 1_000;
+  // Throttling detection: tracks the last N tick lag samples to distinguish a
+  // transient spike from sustained OS-level throttling. When throttled, we batch
+  // events even if the window is focused — this catches the case where the user
+  // IS focused but the system is under load (or the OS chose to throttle anyway).
+  private _recentLagMs: number[] = [];
+  private _throttled = false;
+  private static readonly LAG_SAMPLE_COUNT = 3;
+  private static readonly THROTTLED_LAG_MS = 2_000;     // 3 consecutive samples above → throttled
+  private static readonly SEVERE_LAG_MS = 10_000;       // any single sample above → immediately throttled
+  private static readonly UNTHROTTLED_LAG_MS = 500;     // 3 consecutive samples below → recovered
   // Used to measure event-loop lag: actual tick interval vs. scheduled interval.
   private _lastTickMs = 0;
   private _tickIntervalMs = STATE_TICK_MS;
@@ -176,39 +186,85 @@ export class AgentService {
   }
 
   /**
-   * Called when the VS Code window's focus changes. While unfocused, change
-   * events are coalesced into _pendingPaths (deduplicated by path) and drained
-   * in batches every UNFOCUSED_DRAIN_MS — keeps the second-monitor sidebar
-   * roughly fresh without flooding the libuv pool. On refocus, drain immediately
-   * and resume normal per-event processing. Debounced so quick alt-tabs don't
-   * thrash the drain timer.
+   * Called when the VS Code window's focus changes. Debounced so quick alt-tabs
+   * don't thrash. Actual batching decision is in shouldBatch() — focus is one of
+   * two inputs (the other being detected throttling).
    */
   setWindowFocused(focused: boolean): void {
     if (focused === this._windowFocused) return;
     if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
     this._focusDebounceTimer = setTimeout(() => {
       this._windowFocused = focused;
-      logInfo('focus', focused ? 'window focused — resuming normal processing' : `window unfocused — switching to ${AgentService.UNFOCUSED_DRAIN_MS / 1000}s batch drains`);
-      if (focused) {
-        if (this._unfocusedBatchTimer) { clearInterval(this._unfocusedBatchTimer); this._unfocusedBatchTimer = undefined; }
-        void this.drainPendingPaths('refocus');
-      } else {
-        // Start the periodic batch drainer. Idempotent — only fires when there
-        // are pending paths, so an idle unfocused state does no work.
-        if (!this._unfocusedBatchTimer) {
-          this._unfocusedBatchTimer = setInterval(() => void this.drainPendingPaths('batch'), AgentService.UNFOCUSED_DRAIN_MS);
-        }
-      }
+      logInfo('focus', focused ? 'window focused' : 'window unfocused');
+      this.updateBatchTimerState();
+      if (focused) void this.drainPendingPaths('refocus');
     }, AgentService.FOCUS_DEBOUNCE_MS);
+  }
+
+  /**
+   * Returns true when chokidar events should be coalesced into _pendingPaths
+   * instead of fired immediately. Two triggers: window unfocused (proactive —
+   * we know Windows will throttle us) or sustained event-loop lag (reactive —
+   * the OS IS throttling us, even though we're focused).
+   */
+  private shouldBatch(): boolean {
+    return !this._windowFocused || this._throttled;
+  }
+
+  /**
+   * Starts or stops the periodic batch drainer based on shouldBatch(). The timer
+   * itself is cheap (only fires when there are pending paths), but we want it
+   * stopped when we're in immediate mode so its existence is a clean signal.
+   */
+  private updateBatchTimerState(): void {
+    if (this.shouldBatch() && !this._batchTimer) {
+      this._batchTimer = setInterval(() => void this.drainPendingPaths('batch'), AgentService.BATCH_DRAIN_MS);
+    } else if (!this.shouldBatch() && this._batchTimer) {
+      clearInterval(this._batchTimer);
+      this._batchTimer = undefined;
+    }
+  }
+
+  /**
+   * Detects sustained throttling from event-loop lag samples. Triggers batch mode
+   * when the OS is squeezing our process even though we're focused (busy system,
+   * background scheduler decisions, etc.). The reverse condition restores
+   * immediate mode once lag returns to normal — which also drains accumulated
+   * paths, catching us up to current state.
+   */
+  private detectThrottling(): void {
+    const samples = this._recentLagMs;
+    if (this._throttled) {
+      // Clear only when we have a full window of low-lag samples — avoids flapping.
+      if (samples.length >= AgentService.LAG_SAMPLE_COUNT &&
+          samples.every(l => l < AgentService.UNTHROTTLED_LAG_MS)) {
+        this._throttled = false;
+        logInfo('throttle', `cleared (samples: ${samples.join(',')}ms) — resuming immediate processing`);
+        this.updateBatchTimerState();
+        void this.drainPendingPaths('throttle-clear');
+      }
+    } else {
+      // Detect on either sustained moderate lag OR a single severe spike.
+      const last = samples[samples.length - 1] ?? 0;
+      const sustained = samples.length >= AgentService.LAG_SAMPLE_COUNT &&
+        samples.every(l => l > AgentService.THROTTLED_LAG_MS);
+      const severe = last > AgentService.SEVERE_LAG_MS;
+      if (sustained || severe) {
+        this._throttled = true;
+        const why = severe ? `severe (${last}ms single sample)` : `sustained (samples: ${samples.join(',')}ms)`;
+        logInfo('throttle', `detected ${why} — switching to ${AgentService.BATCH_DRAIN_MS / 1000}s batch drains`);
+        this.updateBatchTimerState();
+      }
+    }
   }
 
   /**
    * Processes all paths that accumulated in _pendingPaths since the last drain.
    * Serial (not Promise.all) so we don't fill our concurrency slots all at once
-   * — leaves headroom for the focused-state work to resume cleanly. Idempotent
+   * — leaves headroom for the immediate-mode work to resume cleanly. Idempotent
    * and no-op when the set is empty.
    */
-  private async drainPendingPaths(reason: 'batch' | 'refocus'): Promise<void> {
+  private async drainPendingPaths(reason: 'batch' | 'refocus' | 'throttle-clear'): Promise<void> {
     if (this._pendingPaths.size === 0) return;
     const t0 = Date.now();
     const paths = [...this._pendingPaths];
@@ -237,8 +293,11 @@ export class AgentService {
   private onTick(): void {
     const now = Date.now();
     if (this._lastTickMs > 0) {
-      const lag = now - this._lastTickMs - this._tickIntervalMs;
+      const lag = Math.max(0, now - this._lastTickMs - this._tickIntervalMs);
       if (lag > 2_000) logInfo('tick', `event-loop lag: ${lag}ms behind schedule (expected every ${this._tickIntervalMs}ms)`);
+      this._recentLagMs.push(lag);
+      if (this._recentLagMs.length > AgentService.LAG_SAMPLE_COUNT) this._recentLagMs.shift();
+      this.detectThrottling();
     }
     this._lastTickMs = now;
     this.scheduleEmit('tick');
@@ -388,21 +447,21 @@ export class AgentService {
     });
     this.watcher
       .on('add',    (p) => {
-        // While unfocused, coalesce 'add' events into _pendingPaths. The batch
-        // drainer processes them every 10s, keeping the second-monitor view roughly
-        // fresh without flooding the libuv pool with per-event processFile calls.
-        if (!this._windowFocused) { this._pendingPaths.add(p); return; }
+        // While in batch mode (unfocused or throttled), coalesce 'add' events into
+        // _pendingPaths. The batch drainer processes them every 10s, keeping the
+        // sidebar roughly fresh without flooding the libuv pool.
+        if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
         // Cancel any pending drop for this path (atomic-write rename sequence).
         const t = this.pendingDrops.get(p);
         if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
         void this.processFile(p);
       })
       .on('change', (p) => {
-        // While unfocused, coalesce into _pendingPaths (dedup'd by path) instead
+        // While in batch mode, coalesce into _pendingPaths (dedup'd by path) instead
         // of per-event debouncing. A busy session firing 1000 events in 10s only
         // triggers one processFile per drain — same end result, far less I/O queue
-        // pressure under Windows background-throttling.
-        if (!this._windowFocused) { this._pendingPaths.add(p); return; }
+        // pressure under throttling.
+        if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
         // MaxWait debounce: trailing 500ms after writes settle, but forced to
         // fire within CHANGE_FORCE_FLUSH_MS so continuously-streaming transcripts
         // still get processed and transcript panels stay live.
@@ -1005,7 +1064,7 @@ export class AgentService {
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.tickTimer) clearInterval(this.tickTimer);
     if (this._focusDebounceTimer) clearTimeout(this._focusDebounceTimer);
-    if (this._unfocusedBatchTimer) clearInterval(this._unfocusedBatchTimer);
+    if (this._batchTimer) clearInterval(this._batchTimer);
     this.cancelDiscovery();
     for (const t of this.pendingDrops.values()) clearTimeout(t);
     this.pendingDrops.clear();
