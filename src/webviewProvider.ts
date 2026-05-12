@@ -573,6 +573,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       border-radius: 3px; padding: 0 5px; height: 14px; font-size: 9px;
       color: var(--vscode-textLink-foreground, #4fc1ff); white-space: nowrap; flex-shrink: 0;
     }
+    .sub-model { height: 12px; padding: 0 4px; font-size: 8px; }
     .meta-sep { color: var(--vscode-input-border); flex-shrink: 0; }
     .ctx-wrap { display: flex; align-items: center; gap: 4px; }
     .ctx-bar-bg { width: 40px; height: 3px; border-radius: 2px; background: rgba(128,128,128,.2); overflow: hidden; }
@@ -785,9 +786,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const doneCls = sub.state==='done' ? ' done-sub' : '';
       const stopBtn = sub.state==='running'
         ? '<button class="action-btn danger" data-act="stop" title="Stop">■</button>' : '';
+      const modelChip = sub.model ? '<span class="model-chip sub-model">'+esc(sub.model)+'</span>' : '';
       return '<div class="sub-row'+doneCls+'" data-sid="'+esc(sub.sessionId)+'">'
            + '<span class="status-dot '+esc(sub.state)+'"></span>'
            + '<span class="sub-name">'+esc(task)+'</span>'
+           + modelChip
            + '<div class="card-slot">'
            +   '<span class="sub-time">'+relTimeShort(sub.mtimeMs,now)+'</span>'
            +   '<div class="sub-actions">'+renderActionBtns(stopBtn)+'</div>'
