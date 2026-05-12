@@ -27,8 +27,9 @@ const DEFAULT_DONE_AGE_MS       = 1 * 60 * 60 * 1000; // configurable via agentV
 const DEBOUNCE_MS = 200;
 const STATE_TICK_MS         =  5_000;
 const STATE_TICK_MS_HIDDEN  = 60_000;
-// Discovery runs infrequently — it's only a backstop for chokidar misses.
-// The targeted watchAndDiscoverSubagents handles the common case immediately.
+// Discovery runs infrequently — it's a backstop. The reconciler's per-tick stat scan
+// catches most missed updates; discovery only adds value for genuinely new top-level
+// sessions in dirs the root watcher missed somehow.
 const DISCOVERY_TICK_MS         =  5 * 60 * 1000;  // 5 min visible
 const DISCOVERY_TICK_MS_HIDDEN  = 30 * 60 * 1000;  // 30 min hidden
 const INIT_BATCH_SIZE = 20; // max concurrent processFile calls per batch in initialize()
@@ -328,8 +329,12 @@ export class AgentService {
    * resumed in a directory we'd stopped watching.
    */
   private async scanKnownAgentsForChanges(): Promise<void> {
+    // Skip subagents: their parent's recursive watcher covers them, so we'd be
+    // double-stat'ing files we'd catch via chokidar anyway. Only top-level sessions
+    // benefit from this safety-net stat (active ones in case chokidar dropped events,
+    // done ones in case they were resumed without a chokidar event firing).
     const t0 = Date.now();
-    const candidates = [...this.agents.values()];
+    const candidates = [...this.agents.values()].filter(a => !a.parentSessionId);
     const BATCH = 20;
     let stale = 0;
     for (let i = 0; i < candidates.length; i += BATCH) {
@@ -340,7 +345,7 @@ export class AgentService {
             stale++;
             await this.processFile(agent.transcriptPath, stat, { bypassBatch: true });
           }
-        } catch { /* file gone — dropFile handler will clean up via watcher unlink */ }
+        } catch { /* file gone — drop handler will clean up via watcher unlink */ }
       }));
     }
     if (stale > 0) {
@@ -354,43 +359,52 @@ export class AgentService {
    * events through this one watcher, eliminating the need for separate subagent-dir
    * watching.
    */
+  private static readonly CHANGE_TRAIL_MS = 500;
+  private static readonly UNLINK_GRACE_MS = 500;
+
+  /** Shared chokidar 'add' handler for any per-project watcher. */
+  private onJsonlAdd(p: string): void {
+    if (!p.endsWith('.jsonl')) return;
+    const t = this.pendingDrops.get(p);
+    if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
+    void this.processFile(p);
+  }
+
+  /** Shared chokidar 'change' handler — debounced, batch-aware. */
+  private onJsonlChange(p: string): void {
+    if (!p.endsWith('.jsonl')) return;
+    if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
+    const existing = this.changeDebounce.get(p);
+    if (existing) {
+      clearTimeout(existing.timer);
+    } else {
+      this.changeDebounce.set(p, { timer: undefined as unknown as NodeJS.Timeout, firstAt: Date.now() });
+    }
+    const entry = this.changeDebounce.get(p)!;
+    const elapsed = Date.now() - entry.firstAt;
+    const remaining = Math.max(0, AgentService.CHANGE_FORCE_FLUSH_MS - elapsed);
+    entry.timer = setTimeout(() => {
+      this.changeDebounce.delete(p);
+      void this.processFile(p);
+    }, Math.min(AgentService.CHANGE_TRAIL_MS, remaining));
+  }
+
+  /** Shared chokidar 'unlink' handler — deferred to absorb atomic-rename sequences. */
+  private onJsonlUnlink(p: string): void {
+    if (!p.endsWith('.jsonl')) return;
+    const t = setTimeout(() => {
+      this.pendingDrops.delete(p);
+      this.dropFile(p);
+    }, AgentService.UNLINK_GRACE_MS);
+    this.pendingDrops.set(p, t);
+  }
+
   private addProjectWatcher(dir: string): void {
     if (this.projectWatchers.has(dir)) return;
-    const w = chokidar.watch(dir, {
-      ignoreInitial: true,
-      persistent: true,
-    });
-    w.on('add', (p) => {
-      if (!p.endsWith('.jsonl')) return;
-      const t = this.pendingDrops.get(p);
-      if (t) { clearTimeout(t); this.pendingDrops.delete(p); }
-      void this.processFile(p);
-    });
-    w.on('change', (p) => {
-      if (!p.endsWith('.jsonl')) return;
-      if (this.shouldBatch()) { this._pendingPaths.add(p); return; }
-      const existing = this.changeDebounce.get(p);
-      if (existing) {
-        clearTimeout(existing.timer);
-      } else {
-        this.changeDebounce.set(p, { timer: undefined as unknown as NodeJS.Timeout, firstAt: Date.now() });
-      }
-      const entry = this.changeDebounce.get(p)!;
-      const elapsed = Date.now() - entry.firstAt;
-      const remaining = Math.max(0, AgentService.CHANGE_FORCE_FLUSH_MS - elapsed);
-      entry.timer = setTimeout(() => {
-        this.changeDebounce.delete(p);
-        void this.processFile(p);
-      }, Math.min(500, remaining));
-    });
-    w.on('unlink', (p) => {
-      if (!p.endsWith('.jsonl')) return;
-      const t = setTimeout(() => {
-        this.pendingDrops.delete(p);
-        this.dropFile(p);
-      }, 500);
-      this.pendingDrops.set(p, t);
-    });
+    const w = chokidar.watch(dir, { ignoreInitial: true, persistent: true });
+    w.on('add', (p) => this.onJsonlAdd(p));
+    w.on('change', (p) => this.onJsonlChange(p));
+    w.on('unlink', (p) => this.onJsonlUnlink(p));
     w.on('error', (err) => logError(`projectWatcher(${dir})`, err));
     this.projectWatchers.set(dir, w);
   }
@@ -495,10 +509,16 @@ export class AgentService {
     // always runs on a consistent snapshot, never interleaved with async file reads.
     this.tickTimer = setInterval(() => this.onTick(), STATE_TICK_MS);
     this.armDiscovery();
-    // Re-classify when the user changes the done-age threshold.
+    // Re-classify when the user changes the done-age threshold; re-arm the reconciler
+    // timer when its interval setting changes (otherwise the new value is silently
+    // ignored until the next extension reload).
     vscode.workspace.onDidChangeConfiguration(e => {
       if (e.affectsConfiguration('agentViewer.doneAgeHours') ||
           e.affectsConfiguration('agentViewer.runningWindowMinutes')) this.scheduleEmit();
+      if (e.affectsConfiguration('agentViewer.reconcileIntervalSeconds')) {
+        if (this.reconcileTimer) clearInterval(this.reconcileTimer);
+        this.reconcileTimer = setInterval(() => this.runReconciler(), this.getReconcileIntervalMs());
+      }
     });
     void this.initialize();
   }
@@ -605,14 +625,18 @@ export class AgentService {
     this.reconcileTimer = setInterval(() => this.runReconciler(), this.getReconcileIntervalMs());
   }
 
-  /** Scans a newly-created project dir for jsonl files and processes any found. */
+  /**
+   * Scans a newly-created project dir for jsonl files, processes any found, and adds
+   * a watcher immediately so file changes between now and the next reconciler tick
+   * are not lost.
+   */
   private async scanNewProjectDir(dir: string): Promise<void> {
     try {
+      // Add watcher first so changes during/after processFile aren't missed.
+      this.addProjectWatcher(dir);
       const files = await tfs.readdir(dir);
       for (const f of files) {
-        if (f.endsWith('.jsonl')) {
-          void this.processFile(path.join(dir, f));
-        }
+        if (f.endsWith('.jsonl')) void this.processFile(path.join(dir, f));
       }
     } catch (err) { logError(`scanNewProjectDir(${dir})`, err); }
   }
@@ -945,8 +969,6 @@ export class AgentService {
           }
           this._subagentPollFailures.delete(subagentDir);
           this.watchedSubagentDirs.add(subagentDir);
-          // No watcher.add here — the per-project recursive watcher (added by runReconciler
-          // when the parent session is active) already covers this subagent dir.
           const newFiles = jsonlFiles
             .map(f => subagentDir + '/' + f)
             .filter(f => !this.agents.has(sessionIdFromPath(f)));
@@ -983,14 +1005,7 @@ export class AgentService {
 
     try {
       const files = await tfs.readdir(subagentDir);
-      // Dir confirmed to exist — register with chokidar once so new files fire 'add' events.
-      // watcher.add is deferred until here rather than called speculatively on every invoke:
-      // chokidar does not reliably watch a glob pointing at a non-existent directory, so
-      // calling it before the dir exists would silently miss all subsequent file creations.
-      if (!this.watchedSubagentDirs.has(subagentDir)) {
-        this.watchedSubagentDirs.add(subagentDir);
-        // No watcher.add — per-project recursive watcher (added by runReconciler) covers this.
-      }
+      this.watchedSubagentDirs.add(subagentDir);
       const newFiles = files
         .filter(f => f.endsWith('.jsonl'))
         .map(f => subagentDir + '/' + f)
@@ -1051,11 +1066,6 @@ export class AgentService {
     this.watchedSubagentDirs.delete(subDir);
     this.watchedSubagentDirLastRead.delete(subDir);
     this._subagentPollFailures.delete(subDir);
-    // Unwatch the subagent dir glob. Individual file watchers are NOT added (the dir
-    // glob covers all *.jsonl files), so there is nothing else to unwatch here.
-    // Nothing to unwatch — subagent dirs aren't registered with the root watcher
-    // anymore. The per-project recursive watcher is removed by runReconciler when
-    // the parent session goes done.
   }
 
   /**
