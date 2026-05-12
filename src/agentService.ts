@@ -584,19 +584,22 @@ export class AgentService {
       await this.processFileImpl(filePath, stats);
     } finally {
       const _ioMs = Date.now() - _ioT0;
-      // Only set a cooldown for slow reads. Fast reads need to allow near-realtime
-      // updates so the transcript panel stays current. The in-flight guard plus
-      // chokidar's debounce already prevent thrashing under normal operation; the
-      // cooldown only matters when a slow read would otherwise immediately retry.
-      if (_ioMs > 1_000) {
+      // Cooldown only for catastrophically-slow reads (>5s). Normal slow reads (1-5s)
+      // from large files don't need throttling — the in-flight guard plus chokidar's
+      // debounce keep things sane. Cooldown is purely a safety net for the case where
+      // a 60s+ read would otherwise immediately retry. For fast/normal reads, real-time
+      // transcript updates depend on the agent's mtime being refreshed promptly.
+      if (_ioMs > 5_000) {
         const cooldownMs = Math.min(_ioMs * 2, 5 * 60 * 1000);
         this.processFileNextReadAt.set(filePath, Date.now() + cooldownMs);
         logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)} (next read in ${Math.round(cooldownMs / 1000)}s)`);
       } else {
-        // Fast read: ensure no stale cooldown lingers (e.g. after a previously-slow
-        // file recovers). Without this, the file would be locked out for the
-        // remainder of a stale cooldown set by a prior slow read.
+        // Always clear any prior cooldown — a fast/normal read means the file is
+        // responsive again, so we should let chokidar drive read frequency.
         this.processFileNextReadAt.delete(filePath);
+        if (_ioMs > 1_000) {
+          logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)}`);
+        }
       }
       // Skip release if our slot was reclaimed by the stale-op sweep.
       if (this.processFileInFlight.has(filePath)) {
