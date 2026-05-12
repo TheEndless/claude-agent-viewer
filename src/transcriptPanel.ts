@@ -200,16 +200,15 @@ async function sendTurnsUpdate(webview: vscode.Webview, agent: Agent): Promise<v
   const first = turns[0]?.timestamp;
   const last  = turns[turns.length - 1]?.timestamp;
   const kb = (bytes / 1024).toFixed(1);
-  const diagHtml = `<div class="diag">${turns.length} turns · ${kb} KB · <span data-iso="${esc(first ?? '')}"></span> → <span data-iso="${esc(last ?? '')}"></span></div>`;
+  const diagHtml = `<div class="diag">${turns.length} turns · ${kb} KB · <span data-iso="${esc(first ?? '')}"></span> → <span data-iso="${esc(last ?? '')}"></span> · <span class="diag-sid">${esc(agent.sessionId)}</span></div>`;
 
   const prev = renderedCount.get(agent.sessionId) ?? 0;
   // If turn count went down (file replaced) or we have no prior render, do full replace.
   const needsFullRender = prev === 0 || turns.length < prev;
 
   if (needsFullRender) {
-    // Initial or full re-render: pass diagHtml into flushInChunks so it can be
-    // combined with the first chunk — keeps "Loading…" visible until real content arrives.
-    await flushInChunks(webview, turns, 0, diagHtml);
+    postUpdate(webview, diagHtml, 'diag');
+    await flushInChunks(webview, turns, 0, true);
   } else if (lastTurnUpdated && prev > 0) {
     // The previously-rendered last turn was extended by the delta (e.g. tool results
     // arrived for an in-progress assistant turn). Replace it in the DOM, then append
@@ -240,23 +239,24 @@ const INITIAL_TAIL = 30;            // render last N turns first for fast initia
  * replace so the user sees real content immediately; older history is then
  * prepended in reverse-order chunks while the viewport stays stable.
  */
-async function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: number, replaceDiag = ''): Promise<void> {
+async function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: number, isInitialRender = false): Promise<void> {
   const yld = () => new Promise<void>(resolve => setImmediate(resolve));
   const total = turns.length;
 
   if (startIdx > 0 || total <= INITIAL_TAIL) {
     // Incremental append or small session: simple forward pass.
-    if (replaceDiag) postUpdate(webview, replaceDiag, 'replace');
+    // On initial render, the first post replaces the "Loading…" placeholder.
     let buf = '';
     for (let i = startIdx; i < total; i++) {
       buf += renderTurn(turns[i]) + '\n';
       if (buf.length >= CHUNK_BYTE_LIMIT) {
-        postUpdate(webview, buf, 'append');
+        postUpdate(webview, buf, isInitialRender ? 'replace' : 'append');
+        isInitialRender = false;
         buf = '';
         await yld();
       }
     }
-    if (buf) postUpdate(webview, buf, 'append');
+    if (buf) postUpdate(webview, buf, isInitialRender ? 'replace' : 'append');
     return;
   }
 
@@ -264,32 +264,25 @@ async function flushInChunks(webview: vscode.Webview, turns: Turn[], startIdx: n
   // Phase 1: render the last INITIAL_TAIL turns as one batch and replace Loading…
   // atomically — user sees the most recent content in a single paint, no mid-load flicker.
   const tailStart = total - INITIAL_TAIL;
-  let tailBuf = replaceDiag || '';
+  let tailBuf = '';
   for (let i = tailStart; i < total; i++) {
     tailBuf += renderTurn(turns[i]) + '\n';
   }
-  postUpdate(webview, tailBuf, replaceDiag ? 'replace' : 'append');
+  postUpdate(webview, tailBuf, isInitialRender ? 'replace' : 'append');
   await yld();
 
-  // Phase 2: render earlier turns in forward-order chunks, then prepend them in
-  // reverse order so the oldest chunk ends up at the top. Yield between chunks
-  // to keep the extension host event loop responsive while history loads.
-  const chunks: string[] = [];
-  let buf = '';
+  // Phase 2: accumulate all earlier turns into one string, then send as a single
+  // prepend. Multiple sequential prepends each trigger a layout and scroll
+  // adjustment, causing the content to visually dance even with overflow-anchor.
+  // One atomic prepend means one layout, so the viewport stays stable.
+  // Yield periodically during the build to keep the extension host event loop
+  // responsive, but the DOM insertion itself is a single operation.
+  let prependBuf = '';
   for (let i = 0; i < tailStart; i++) {
-    buf += renderTurn(turns[i]) + '\n';
-    if (buf.length >= CHUNK_BYTE_LIMIT) {
-      chunks.push(buf);
-      buf = '';
-      await yld();
-    }
+    prependBuf += renderTurn(turns[i]) + '\n';
+    if (i % 50 === 49) await yld();
   }
-  if (buf) chunks.push(buf);
-
-  for (let i = chunks.length - 1; i >= 0; i--) {
-    postUpdate(webview, chunks[i], 'prepend');
-    await yld();
-  }
+  if (prependBuf) postUpdate(webview, prependBuf, 'prepend');
 }
 
 /** Formats the agent's transcript as markdown and prompts the user to save it. */
@@ -637,6 +630,11 @@ function buildWebviewHtml(agent: Agent): string {
   const toolbarHtml = `<div class="toolbar">
   <button class="tb-btn" id="tb-search-btn" title="Search (Ctrl+F)">\ud83d\udd0d Search</button>
   <input class="tb-search-input" id="tb-search-input" placeholder="Search\u2026" />
+  <span class="tb-search-nav" id="tb-search-nav">
+    <button class="tb-btn tb-nav-btn" id="tb-prev-btn" title="Previous match">\u2191</button>
+    <span class="tb-match-count" id="tb-match-count"></span>
+    <button class="tb-btn tb-nav-btn" id="tb-next-btn" title="Next match">\u2193</button>
+  </span>
   <button class="tb-btn tb-jump" id="tb-jump-btn" title="Jump to latest">\u2193 Latest</button>
   <button class="tb-btn" id="tb-export-btn" title="Export as markdown">\ud83d\udcbe Export</button>
   <button class="tb-btn tb-copy" data-copy="${esc(transcriptPath)}" title="Copy file path">\ud83d\udccb Path</button>
@@ -651,7 +649,7 @@ function buildWebviewHtml(agent: Agent): string {
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:;">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; }
+html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 13px; display: flex; flex-direction: column; }
 
 :root {
   --json-key:  var(--vscode-symbolIcon-variableForeground, #9cdcfe);
@@ -660,14 +658,16 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
   --json-bool: var(--vscode-debugTokenExpression-boolean, var(--vscode-symbolIcon-keywordForeground, #569cd6));
 }
 
-.scroll { height: 100vh; overflow-y: auto; padding: 8px 0 40px; }
+.scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 0 40px; }
 .scroll::-webkit-scrollbar { width: 8px; }
 .scroll::-webkit-scrollbar-track { background: transparent; }
 .scroll::-webkit-scrollbar-thumb { background: var(--vscode-scrollbarSlider-background); }
 
 .empty-state { padding: 32px 14px; color: var(--vscode-descriptionForeground); font-size: 12px; }
 .empty-state.loading { opacity: 0.5; }
-.diag { padding: 6px 14px; font-size: 10px; color: var(--vscode-descriptionForeground); border-bottom: 1px solid var(--vscode-input-border); font-family: "Cascadia Code",Consolas,monospace; opacity: 0.6; }
+.diag-footer { flex-shrink: 0; }
+.diag { padding: 5px 14px; font-size: 10px; color: var(--vscode-descriptionForeground); border-top: 1px solid var(--vscode-input-border); font-family: "Cascadia Code",Consolas,monospace; opacity: 0.6; }
+.diag-sid { opacity: 0.7; user-select: all; }
 
 .turn { padding: 10px 14px; }
 .turn-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
@@ -872,9 +872,14 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 }
 .tb-search-input.visible { display: block; }
 .tb-search-input:focus { border-color: var(--vscode-focusBorder); }
+.tb-search-nav { display: none; align-items: center; gap: 2px; }
+.tb-search-nav.visible { display: flex; }
+.tb-nav-btn { padding: 2px 5px; }
+.tb-match-count { font-size: 10px; color: var(--vscode-descriptionForeground); white-space: nowrap; min-width: 3em; text-align: center; }
 .tb-jump { display: none; margin-left: auto; }
 .tb-jump.visible { display: inline-block; }
-.search-highlight { background: rgba(255,215,0,0.3); border-radius: 2px; }
+.search-highlight { background: rgba(255,200,0,0.35); border-radius: 2px; color: inherit; }
+.search-highlight-active { background: rgba(255,160,0,0.75); color: #000; }
 .copy-btn {
   display: none; background: none; border: none; cursor: pointer;
   color: var(--vscode-descriptionForeground); padding: 1px 4px;
@@ -947,6 +952,7 @@ ${toolbarHtml}
 <div class="scroll" id="scroll">
 ${turnsHtml}
 </div>
+<div class="diag-footer" id="diag-footer"></div>
 
 <script>
   const scroll = document.getElementById('scroll');
@@ -1096,14 +1102,8 @@ ${turnsHtml}
     if (!['replace', 'append', 'prepend', 'diag', 'replace_last_turn'].includes(e.data.mode)) return;
     const wasAtBottom = !userScrolled;
     if (e.data.mode === 'diag') {
-      // Replace just the diagnostic banner, leave content intact.
-      const existing = scroll.querySelector('.diag');
-      if (existing) {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = e.data.html;
-        const fresh = tmp.firstElementChild;
-        if (fresh) existing.replaceWith(fresh);
-      }
+      const footer = document.getElementById('diag-footer');
+      if (footer) footer.innerHTML = e.data.html;
       stampTimestamps();
       return;
     }
@@ -1127,6 +1127,7 @@ ${turnsHtml}
       stampTimestamps();
       if (wasAtBottom) scrollToBottom();
       updateJumpVisibility();
+      reapplySearch();
       return;
     }
     if (e.data.mode === 'replace') {
@@ -1164,6 +1165,7 @@ ${turnsHtml}
     stampTimestamps();
     if (wasAtBottom) scrollToBottom();
     updateJumpVisibility();
+    reapplySearch();
   });
 
   stampTimestamps();
@@ -1171,6 +1173,11 @@ ${turnsHtml}
 
   const searchBtn   = document.getElementById('tb-search-btn');
   const searchInput = document.getElementById('tb-search-input');
+  const searchNav   = document.getElementById('tb-search-nav');
+  const prevBtn     = document.getElementById('tb-prev-btn');
+  const nextBtn     = document.getElementById('tb-next-btn');
+  const matchCount  = document.getElementById('tb-match-count');
+  let _matchIdx = 0;
 
   function clearHighlights() {
     const marks = scroll.querySelectorAll('.search-highlight');
@@ -1179,25 +1186,56 @@ ${turnsHtml}
     scroll.normalize();
   }
 
+  function updateMatchCount(all) {
+    if (!all.length) { matchCount.textContent = 'No matches'; return; }
+    matchCount.textContent = (_matchIdx + 1) + ' / ' + all.length;
+  }
+
+  function scrollToMatch(all, idx) {
+    all.forEach(el => el.classList.remove('search-highlight-active'));
+    if (!all.length) return;
+    _matchIdx = (idx + all.length) % all.length;
+    all[_matchIdx].classList.add('search-highlight-active');
+    all[_matchIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    updateMatchCount(all);
+  }
+
   function highlightText(query) {
     clearHighlights();
-    if (!query) return;
+    _matchIdx = 0;
+    if (!query) { searchNav.classList.remove('visible'); return; }
     const walker = document.createTreeWalker(scroll, NodeFilter.SHOW_TEXT, null);
     const nodes = [];
     while (walker.nextNode()) nodes.push(walker.currentNode);
     const lq = query.toLowerCase();
     for (const node of nodes) {
-      const idx = node.textContent.toLowerCase().indexOf(lq);
-      if (idx === -1) continue;
-      const mark = document.createElement('mark');
-      mark.className = 'search-highlight';
-      const after = node.splitText(idx);
-      after.splitText(query.length);
-      mark.appendChild(after.cloneNode(true));
-      after.replaceWith(mark);
+      let cur = node;
+      while (cur && cur.textContent) {
+        const idx = cur.textContent.toLowerCase().indexOf(lq);
+        if (idx === -1) break;
+        const matchNode = cur.splitText(idx);
+        const rest = matchNode.splitText(query.length);
+        const span = document.createElement('span');
+        span.className = 'search-highlight';
+        span.appendChild(matchNode);
+        rest.parentNode.insertBefore(span, rest);
+        cur = rest;
+      }
     }
-    const first = scroll.querySelector('.search-highlight');
-    if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const all = [...scroll.querySelectorAll('.search-highlight')];
+    searchNav.classList.toggle('visible', all.length > 0);
+    scrollToMatch(all, 0);
+  }
+
+  function navigateMatch(dir) {
+    const all = [...scroll.querySelectorAll('.search-highlight')];
+    if (!all.length) return;
+    scrollToMatch(all, _matchIdx + dir);
+  }
+
+  function reapplySearch() {
+    const q = searchInput && searchInput.classList.contains('visible') ? searchInput.value : '';
+    if (q) highlightText(q);
   }
 
   let _hlTimer;
@@ -1206,10 +1244,13 @@ ${turnsHtml}
     _hlTimer = setTimeout(() => highlightText(query), 200);
   }
 
+  prevBtn && prevBtn.addEventListener('click', () => navigateMatch(-1));
+  nextBtn && nextBtn.addEventListener('click', () => navigateMatch(1));
+
   searchBtn && searchBtn.addEventListener('click', () => {
     searchInput.classList.toggle('visible');
     if (searchInput.classList.contains('visible')) searchInput.focus();
-    else { clearHighlights(); searchInput.value = ''; }
+    else { clearHighlights(); searchInput.value = ''; searchNav.classList.remove('visible'); }
   });
 
   searchInput && searchInput.addEventListener('input', () => highlightDebounced(searchInput.value));
@@ -1217,8 +1258,10 @@ ${turnsHtml}
     if (e.key === 'Escape') {
       clearHighlights(); searchInput.value = '';
       searchInput.classList.remove('visible');
+      searchNav.classList.remove('visible');
       searchInput.blur();
     }
+    if (e.key === 'Enter') navigateMatch(e.shiftKey ? -1 : 1);
   });
 
   document.addEventListener('keydown', (e) => {

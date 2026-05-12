@@ -588,12 +588,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     /* ── meta-bar ── */
     .meta-bar { display: flex; align-items: center; gap: 6px; padding: 0 8px 5px 20px; font-size: 10px; color: var(--vscode-disabledForeground); }
     .model-chip {
-      display: inline-flex; align-items: center;
+      display: inline-block; vertical-align: middle;
       background: rgba(79,193,255,.08); border: 1px solid rgba(79,193,255,.15);
-      border-radius: 3px; padding: 0 5px; height: 14px; font-size: 9px;
+      border-radius: 3px; padding: 2px 5px; font-size: 9px; line-height: 1.2;
       color: var(--vscode-textLink-foreground, #4fc1ff); white-space: nowrap; flex-shrink: 0;
     }
-    .sub-model { height: 12px; padding: 0 4px; font-size: 8px; }
+    .sub-model { padding: 1px 4px; font-size: 8px; }
     .meta-sep { color: var(--vscode-input-border); flex-shrink: 0; }
     .ctx-wrap { display: flex; align-items: center; gap: 4px; }
     .ctx-bar-bg { width: 40px; height: 3px; border-radius: 2px; background: rgba(128,128,128,.2); overflow: hidden; }
@@ -785,7 +785,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     function renderMetaBar(agent) {
       if (!agent.model && !agent.turnCount && !agent.contextPct) return '';
       let html = '<div class="meta-bar">';
-      if (agent.model) html += '<span class="model-chip">⚡ '+esc(agent.model)+'</span>';
+      if (agent.model) html += '<span class="model-chip">'+esc(agent.model)+'</span>';
       if (agent.model && agent.turnCount) html += '<span class="meta-sep">\xb7</span>';
       if (agent.turnCount) html += '<span>'+agent.turnCount+' turn'+(agent.turnCount!==1?'s':'')+'</span>';
       if (agent.contextPct) {
@@ -883,7 +883,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
            + '</div>'
            + '<div class="card-path"><span class="proj-path">‎'+esc(parent.cwd)+'</span><span class="session-id">'+esc(parent.sessionId)+'</span></div>'
            + (effState !== 'done' ? renderMetaBar(parent) : '')
-           + (effState !== 'done' ? renderTimeline(parent.activityHistory, now) : '')
+           + (effState === 'running' ? renderTimeline(parent.activityHistory, now) : '')
            + renderStuckBadge(parent.activityHistory, effState, now)
            + subSection
            + '</div>';
@@ -912,7 +912,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
 
       const existingTimeline = cardEl.querySelector('.activity-timeline');
-      const newTimeline = effState !== 'done' ? renderTimeline(agent.activityHistory, now) : '';
+      const newTimeline = effState === 'running' ? renderTimeline(agent.activityHistory, now) : '';
       if (existingTimeline) existingTimeline.outerHTML = newTimeline || '';
       else if (newTimeline) {
         const metaEl = cardEl.querySelector('.meta-bar');
