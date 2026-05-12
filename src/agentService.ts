@@ -67,6 +67,9 @@ export class AgentService {
   // retries for permanently-inaccessible dirs (locked, AV scanning, etc.).
   private readonly _watcherFailBackoff = new Map<string, number>();
   private static readonly WATCHER_FAIL_BACKOFF_MS = 60_000;
+  // Reconciler heartbeat counter — every Nth tick we log the current state even
+  // when nothing changed, so it's visible that the reconciler is running.
+  private _reconcileTickCount = 0;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
   private discoveryTimer?: NodeJS.Timeout;
@@ -339,14 +342,9 @@ export class AgentService {
    * resumed in a directory we'd stopped watching.
    */
   private async scanKnownAgentsForChanges(): Promise<void> {
-    if (this._scanInFlight) return; // prior scan still running; skip this tick
+    if (this._scanInFlight) return;
     this._scanInFlight = true;
     try {
-      // Stat top-level sessions to catch resumed-done sessions and missed chokidar
-      // events. Subagents are normally covered by their parent's recursive watcher,
-      // but if a subagent outlives its parent's running window the parent dir watch
-      // can still be active (runReconciler keys off non-done subagents too), so the
-      // chokidar path covers them. Stat'ing every subagent every cycle is wasted I/O.
       const t0 = Date.now();
       const candidates = [...this.agents.values()].filter(a => !a.parentSessionId);
       const BATCH = 20;
@@ -362,9 +360,7 @@ export class AgentService {
           } catch { /* file gone — drop handler will clean up via watcher unlink */ }
         }));
       }
-      if (stale > 0) {
-        logInfo('scanKnownAgents', `${stale}/${candidates.length} sessions had newer mtime than known (${Date.now() - t0}ms)`);
-      }
+      logInfo('scanKnownAgents', `${stale}/${candidates.length} stale (${Date.now() - t0}ms)`);
     } finally {
       this._scanInFlight = false;
     }
@@ -1367,7 +1363,12 @@ function buildAgent(filePath: string, mtimeMs: number, events: RawEvent[], title
   const sessionId = sessionIdFromPath(filePath);
   const cwd = resolveCwd(filePath, events);
   const projectName = path.basename(cwd);
-  const terminated = events.some(isTerminator);
+  // Check the LAST event, not just any event. When a session is resumed after
+  // being marked done, Claude Code appends new events AFTER the old 'summary'
+  // terminator. events.some(isTerminator) would still find that old summary in
+  // the tail and incorrectly keep the session locked at state='done'.
+  const lastEvent = events[events.length - 1];
+  const terminated = lastEvent ? isTerminator(lastEvent) : false;
   const state = classifyState(mtimeMs, Date.now(), terminated, false, doneAgeMs, runningWindowMs);
   const activityHistory = buildActivityHistory(events, state);
   const { details, agentCallDescs, meta } = extractDetails(events);
