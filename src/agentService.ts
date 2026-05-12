@@ -561,10 +561,11 @@ export class AgentService {
     if (this.processFileInFlight.has(filePath)) return;
     if (Date.now() < (this.processFileNextReadAt.get(filePath) ?? 0)) return;
 
-    // Central batching gate: every caller honors batch mode, not just chokidar
-    // handlers. The drain path passes bypassBatch:true so its calls actually run
-    // (otherwise they'd just be re-added to _pendingPaths and the drain would loop).
-    if (this.shouldBatch() && !opts?.bypassBatch) {
+    // Central batching gate: every caller honors batch mode. Bypass during
+    // initialize() (everything must run, regardless of focus) and during drain
+    // (the drain explicitly wants to process — otherwise it loops back into
+    // _pendingPaths and never makes progress).
+    if (this.shouldBatch() && !opts?.bypassBatch && !this._initializing) {
       this._pendingPaths.add(filePath);
       return;
     }
