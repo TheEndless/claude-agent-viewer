@@ -95,7 +95,6 @@ export class AgentService {
   private static readonly MAX_CONCURRENT_PROCESS = 2;
   private static readonly MAX_WAITER_QUEUE = 200;
   private static readonly STALE_OPERATION_MS = 60_000;
-  private static readonly MIN_FILE_READ_COOLDOWN_MS = 8_000;
   // Throttle change-triggered emits: after firing, hold off for this long before
   // firing again. Prevents rapid file writes from rebuilding the agent tree on
   // every individual write when multiple sessions are active simultaneously.
@@ -585,10 +584,19 @@ export class AgentService {
       await this.processFileImpl(filePath, stats);
     } finally {
       const _ioMs = Date.now() - _ioT0;
-      const cooldownMs = Math.max(AgentService.MIN_FILE_READ_COOLDOWN_MS, Math.min(_ioMs * 2, 5 * 60 * 1000));
-      this.processFileNextReadAt.set(filePath, Date.now() + cooldownMs);
+      // Only set a cooldown for slow reads. Fast reads need to allow near-realtime
+      // updates so the transcript panel stays current. The in-flight guard plus
+      // chokidar's debounce already prevent thrashing under normal operation; the
+      // cooldown only matters when a slow read would otherwise immediately retry.
       if (_ioMs > 1_000) {
+        const cooldownMs = Math.min(_ioMs * 2, 5 * 60 * 1000);
+        this.processFileNextReadAt.set(filePath, Date.now() + cooldownMs);
         logInfo('processFile', `slow I/O: ${_ioMs}ms for ${path.basename(filePath)} (next read in ${Math.round(cooldownMs / 1000)}s)`);
+      } else {
+        // Fast read: ensure no stale cooldown lingers (e.g. after a previously-slow
+        // file recovers). Without this, the file would be locked out for the
+        // remainder of a stale cooldown set by a prior slow read.
+        this.processFileNextReadAt.delete(filePath);
       }
       // Skip release if our slot was reclaimed by the stale-op sweep.
       if (this.processFileInFlight.has(filePath)) {
