@@ -83,6 +83,12 @@
           "default": 15,
           "minimum": 1,
           "description": "How often known sessions are stat'd to detect resumed-from-done activity. Catches sessions written to without a corresponding chokidar event. Higher values reduce CPU at the cost of slower detection of resumed sessions."
+        },
+        "agentViewer.evictionAgeMultiplier": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Multiplier on doneAgeHours for when done sessions are evicted from memory. 0 (default) = never evict; all archived sessions remain browseable via 'Show N hidden'. Higher values trade browseability for lower memory use — e.g. 10 evicts sessions older than 10× doneAgeHours."
         }
       }
     }

@@ -499,6 +499,15 @@ export class AgentService {
     return Math.max(1, secs) * 1000;
   }
 
+  /**
+   * Multiplier on doneAgeMs for evicting done sessions from memory. 0 = never evict
+   * (default — all done sessions stay browseable via the webview's "Show N hidden"
+   * filter). Higher values trade browseability for lower memory.
+   */
+  private getEvictionMultiplier(): number {
+    return Math.max(0, this.getConfig().get<number>('evictionAgeMultiplier', 0));
+  }
+
   /** Combines the state-reclassification tick with a proactive subagent dir scan. */
   private onTick(): void {
     const now = Date.now();
@@ -1201,20 +1210,24 @@ export class AgentService {
       }
       if (transitions.length) logInfo('tick', `${transitions.length} transition(s): ${transitions.join(', ')}`);
 
-      // Evict done top-level sessions older than 10× doneAgeMs. Only runs on tick
-      // (eligibility only changes on the hour-scale). At default doneAge of 1h, this
-      // keeps ~10 hours of history in memory.
-      if (reason === 'tick') {
+      // Evict done top-level sessions if eviction is enabled. Default: disabled
+      // (multiplier=0) — all done sessions stay in memory and browseable via the
+      // webview's "Show N hidden" filter. The original eviction was added during
+      // freeze investigation to reduce agent count, but the actual freeze cause was
+      // chokidar I/O, not agent count. Eviction is preserved as an opt-in.
+      const evictMultiplier = this.getEvictionMultiplier();
+      if (reason === 'tick' && evictMultiplier > 0) {
+        const evictThresholdMs = doneAgeMs * evictMultiplier;
         let evictCount = 0;
         for (const [sid, agent] of this.agents) {
           if (agent.state !== 'done' || agent.parentSessionId) continue;
-          if (now - agent.mtimeMs <= doneAgeMs * 10) continue;
+          if (now - agent.mtimeMs <= evictThresholdMs) continue;
           for (const sub of agent.subagents) this.evictSession(sub.sessionId, sub.transcriptPath);
           this.evictSession(sid, agent.transcriptPath);
           evictCount++;
         }
         if (evictCount > 0) {
-          logInfo('evict', `evicted ${evictCount} done sessions (>10× doneAge) from memory; remaining=${this.agents.size}`);
+          logInfo('evict', `evicted ${evictCount} done sessions (>${evictMultiplier}× doneAge) from memory; remaining=${this.agents.size}`);
           buildTree(this.agents);
           assignTaskDescriptions(this.agents); // buildTree without assignTaskDescriptions leaves taskDescription stale
           this._structureChanged = false;
