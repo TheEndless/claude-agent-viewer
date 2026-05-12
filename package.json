@@ -71,6 +71,18 @@
           "default": 1,
           "minimum": 0.1,
           "description": "Sessions with no activity for this many hours are archived. Lower values reduce memory usage; increase if you want older sessions visible without a manual refresh."
+        },
+        "agentViewer.reconcileIntervalSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "How often the watcher reconciler runs. It adds file watchers for newly-active session directories and removes watchers for inactive ones. Lower values catch state transitions faster; higher values reduce CPU."
+        },
+        "agentViewer.activeStatScanIntervalSeconds": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "description": "How often known sessions are stat'd to detect resumed-from-done activity. Catches sessions written to without a corresponding chokidar event. Higher values reduce CPU at the cost of slower detection of resumed sessions."
         }
       }
     }
