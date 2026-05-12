@@ -434,12 +434,18 @@ export class AgentService {
     // Normalize separators to match what runReconciler uses as Map keys (forward slashes).
     dir = dir.replace(/\\/g, '/');
     if (this.projectWatchers.has(dir)) return;
-    const w = chokidar.watch(dir, { ignoreInitial: true, persistent: true });
-    w.on('add', (p) => this.onJsonlAdd(p));
-    w.on('change', (p) => this.onJsonlChange(p));
-    w.on('unlink', (p) => this.onJsonlUnlink(p));
-    w.on('error', (err) => logError(`projectWatcher(${dir})`, err));
-    this.projectWatchers.set(dir, w);
+    try {
+      const w = chokidar.watch(dir, { ignoreInitial: true, persistent: true });
+      w.on('add', (p) => this.onJsonlAdd(p));
+      w.on('change', (p) => this.onJsonlChange(p));
+      w.on('unlink', (p) => this.onJsonlUnlink(p));
+      w.on('error', (err) => logError(`projectWatcher(${dir})`, err));
+      this.projectWatchers.set(dir, w);
+    } catch (err) {
+      // chokidar.watch can throw synchronously if the dir disappeared between desired-set
+      // computation and now (race on Windows). Skip and let the next reconciler tick retry.
+      logError(`addProjectWatcher(${dir})`, err);
+    }
   }
 
   private getConfig() {
@@ -549,8 +555,13 @@ export class AgentService {
       if (e.affectsConfiguration('agentViewer.doneAgeHours') ||
           e.affectsConfiguration('agentViewer.runningWindowMinutes')) this.scheduleEmit();
       if (e.affectsConfiguration('agentViewer.reconcileIntervalSeconds')) {
-        if (this.reconcileTimer) clearInterval(this.reconcileTimer);
-        this.reconcileTimer = setInterval(() => this.runReconciler(), this.getReconcileIntervalMs());
+        // Only re-arm if a timer already exists. If initialize() hasn't finished yet,
+        // it will create the timer with the current config value when it does — no
+        // need to create one here that would then leak when initialize sets its own.
+        if (this.reconcileTimer) {
+          clearInterval(this.reconcileTimer);
+          this.reconcileTimer = setInterval(() => this.runReconciler(), this.getReconcileIntervalMs());
+        }
       }
     });
     void this.initialize();
@@ -643,11 +654,12 @@ export class AgentService {
       persistent: true,
       depth: 0,
     });
+    const projectsRootNormalized = PROJECTS_ROOT.replace(/\\/g, '/');
     this.watcher
       .on('addDir', (dir) => {
-        if (dir === PROJECTS_ROOT) return;
-        // A new project directory appeared. The reconciler will pick it up on its next
-        // tick after we process the new files. Trigger an immediate scan of that dir.
+        // Compare normalized — chokidar emits forward slashes on Windows while
+        // PROJECTS_ROOT from path.join has backslashes; raw === would never match.
+        if (dir.replace(/\\/g, '/') === projectsRootNormalized) return;
         void this.scanNewProjectDir(dir);
       })
       .on('error', (err) => logError('rootWatcher', err));
@@ -1171,6 +1183,10 @@ export class AgentService {
           assignTaskDescriptions(this.agents); // buildTree without assignTaskDescriptions leaves taskDescription stale
           this._structureChanged = false;
           anyChanged = true;
+          // Close watchers for evicted dirs synchronously so a stray chokidar 'change'
+          // event for an evicted file can't re-add the session in the window before
+          // the next reconciler tick fires.
+          this.runReconciler();
         }
       }
 
