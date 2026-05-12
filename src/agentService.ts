@@ -631,7 +631,7 @@ export class AgentService {
   }
 
   private getDiscoveryIntervalMs(): number {
-    const secs = this.getConfig().get<number>('discoveryIntervalSeconds', 30);
+    const secs = this.getConfig().get<number>('discoveryIntervalSeconds', 15);
     return Math.max(5, secs) * 1000;
   }
 

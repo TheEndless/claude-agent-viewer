@@ -92,7 +92,7 @@
         },
         "agentViewer.discoveryIntervalSeconds": {
           "type": "number",
-          "default": 30,
+          "default": 15,
           "minimum": 5,
           "description": "How often we scan ~/.claude/projects/ for newly-created top-level sessions. New sessions in project dirs without other active sessions can only be detected by this scan (others fire chokidar events). Lower values catch new sessions faster; the readdir cost is small."
         }
