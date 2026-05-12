@@ -420,9 +420,22 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       transition: transform 0.1s;
       opacity: 0.5;
     }
-    .card.subs-open .sub-caret { transform: rotate(90deg); }
+    .card.subs-open > .sub-toggle .sub-caret { transform: rotate(90deg); }
     .sub-list { display: none; }
     .card.subs-open .sub-list { display: block; }
+
+    /* Done-subagents nested collapsible inside .sub-list */
+    .done-subs { margin-top: 2px; }
+    .done-sub-toggle {
+      display: flex; align-items: center; gap: 4px;
+      padding: 2px 8px 2px 24px;
+      font-size: 10px; color: var(--vscode-disabledForeground);
+      cursor: pointer; user-select: none;
+    }
+    .done-sub-toggle:hover { color: var(--vscode-foreground); background: rgba(128,128,128,0.04); }
+    .done-subs.open > .done-sub-toggle .sub-caret { transform: rotate(90deg); }
+    .done-sub-list { display: none; }
+    .done-subs.open .done-sub-list { display: block; }
 
     .sub-row {
       position: relative;
@@ -781,6 +794,32 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
            + '<button class="action-btn danger" data-act="delete" title="Delete">✕</button>';
     }
 
+    /**
+     * Splits subagents into active (state !== 'done') and done. Active rows render
+     * inline; done rows go inside a nested collapsible "N done" subsection that's
+     * collapsed by default. Open/closed state is persisted in openSections keyed
+     * by doneKey so re-renders preserve user interaction.
+     */
+    function renderSubListInner(subs, doneKey, now) {
+      const sorted = subs.slice().sort((a,b)=>b.mtimeMs-a.mtimeMs);
+      const active = sorted.filter(s => s.state !== 'done');
+      const done = sorted.filter(s => s.state === 'done');
+      const doneOpen = openSections[doneKey] || false;
+      let html = active.map(s=>renderSubRow(s,now)).join('');
+      if (done.length > 0) {
+        html += '<div class="done-subs'+(doneOpen?' open':'')+'" data-done-sub-key="'+esc(doneKey)+'">'
+              + '<div class="done-sub-toggle">'
+              +   '<span class="sub-caret">▶</span>'
+              +   '<span>'+done.length+' done</span>'
+              + '</div>'
+              + '<div class="done-sub-list">'
+              + done.map(s=>renderSubRow(s,now)).join('')
+              + '</div>'
+              + '</div>';
+      }
+      return html;
+    }
+
     function renderSubRow(sub, now) {
       const task = stripTags(sub.taskDescription||(sub.details&&sub.details.latestUserPrompt)||sub.sessionId.slice(0,8));
       const doneCls = sub.state==='done' ? ' done-sub' : '';
@@ -810,6 +849,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       const stopBtn = effState==='running'
         ? '<button class="action-btn danger" data-act="stop" title="Stop">■</button>' : '';
 
+      const doneSubKey = 'proj:'+projectKey(parent.cwd)+':done-subs:'+parent.sessionId;
       const subSection = allSubs.length > 0
         ? '<div class="sub-toggle" data-sub-key="'+esc(key)+'">'
           + '<span class="sub-caret">▶</span>'
@@ -817,7 +857,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           + rollupSubagentDots(allSubs)
           + '</div>'
           + '<div class="sub-list">'
-          + allSubs.slice().sort((a,b)=>b.mtimeMs-a.mtimeMs).map(s=>renderSubRow(s,now)).join('')
+          + renderSubListInner(allSubs, doneSubKey, now)
           + '</div>'
         : '';
 
@@ -896,7 +936,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           + rollupSubagentDots(allSubs);
       }
       if (subListEl) {
-        subListEl.innerHTML = allSubs.slice().sort((a,b)=>b.mtimeMs-a.mtimeMs).map(s=>renderSubRow(s,now)).join('');
+        const doneSubKey = 'proj:'+projectKey(agent.cwd)+':done-subs:'+agent.sessionId;
+        subListEl.innerHTML = renderSubListInner(allSubs, doneSubKey, now);
       }
 
       const stopBtn = cardEl.querySelector('.card-actions [data-act="stop"]');
@@ -1152,6 +1193,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         const isOpen = groupEl.classList.toggle('open');
         const key = groupEl.dataset.projKey;
         if (key) openSections['proj:'+key] = isOpen;
+        return;
+      }
+
+      const doneSubToggle = target.closest('.done-sub-toggle');
+      if (doneSubToggle) {
+        const section = doneSubToggle.closest('.done-subs');
+        if (!section) return;
+        const isOpen = section.classList.toggle('open');
+        const key = section.dataset.doneSubKey;
+        if (key) openSections[key] = isOpen;
         return;
       }
 
