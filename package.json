@@ -89,6 +89,12 @@
           "default": 0,
           "minimum": 0,
           "description": "Multiplier on doneAgeHours for when done sessions are evicted from memory. 0 (default) = never evict; all archived sessions remain browseable via 'Show N hidden'. Higher values trade browseability for lower memory use — e.g. 10 evicts sessions older than 10× doneAgeHours."
+        },
+        "agentViewer.discoveryIntervalSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "description": "How often we scan ~/.claude/projects/ for newly-created top-level sessions. New sessions in project dirs without other active sessions can only be detected by this scan (others fire chokidar events). Lower values catch new sessions faster; the readdir cost is small."
         }
       }
     }

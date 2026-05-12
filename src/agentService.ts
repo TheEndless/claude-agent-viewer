@@ -595,6 +595,13 @@ export class AgentService {
           this.reconcileTimer = setInterval(() => this.runReconciler(), this.getReconcileIntervalMs());
         }
       }
+      if (e.affectsConfiguration('agentViewer.discoveryIntervalSeconds')) {
+        // Re-arm the discovery loop with the new interval. cancelDiscovery
+        // invalidates the in-flight generation so the new armDiscovery sets up
+        // a fresh single chain.
+        this.cancelDiscovery();
+        this.armDiscovery();
+      }
     });
     void this.initialize();
   }
@@ -606,7 +613,13 @@ export class AgentService {
    */
   private armDiscovery(): void {
     const gen = ++this._discoveryGen;
-    const delay = this._discoveryVisible ? DISCOVERY_TICK_MS : DISCOVERY_TICK_MS_HIDDEN;
+    // When the sidebar is hidden, scale up the interval so we don't waste cycles
+    // scanning a tree no one is looking at. When visible, use the configurable
+    // value (default 30s) since new sessions in previously-quiet project dirs
+    // can only be detected by this scan.
+    const delay = this._discoveryVisible
+      ? this.getDiscoveryIntervalMs()
+      : Math.max(this.getDiscoveryIntervalMs() * 6, DISCOVERY_TICK_MS_HIDDEN);
     this.discoveryTimer = setTimeout(() => {
       void this.discoverNewFiles().finally(() => {
         // Only re-arm if this generation is still current — prevents a stale
@@ -615,6 +628,11 @@ export class AgentService {
         if (gen === this._discoveryGen) this.armDiscovery();
       });
     }, delay);
+  }
+
+  private getDiscoveryIntervalMs(): number {
+    const secs = this.getConfig().get<number>('discoveryIntervalSeconds', 30);
+    return Math.max(5, secs) * 1000;
   }
 
   /** Cancels any pending discovery timer, invalidating any in-flight chain. */
