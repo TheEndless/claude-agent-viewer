@@ -63,6 +63,10 @@ export class AgentService {
   // Set while scanKnownAgentsForChanges is running so the next tick doesn't fire a
   // second concurrent scan (slow stats under load could otherwise pile up).
   private _scanInFlight = false;
+  // Per-dir timestamp of last failed chokidar.watch attempt. Used to back off
+  // retries for permanently-inaccessible dirs (locked, AV scanning, etc.).
+  private readonly _watcherFailBackoff = new Map<string, number>();
+  private static readonly WATCHER_FAIL_BACKOFF_MS = 60_000;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
   private discoveryTimer?: NodeJS.Timeout;
@@ -367,6 +371,25 @@ export class AgentService {
   }
 
   /**
+   * Closes per-project watchers for dirs that have no remaining non-done agents.
+   * Targeted version of the reconciler's add+remove pass — used after eviction so
+   * we don't trigger a stat scan as a side effect from inside scheduleEmit.
+   */
+  private closeOrphanedProjectWatchers(): void {
+    const stillNeeded = new Set<string>();
+    for (const agent of this.agents.values()) {
+      if (agent.state === 'done') continue;
+      stillNeeded.add(this.projectDirOf(agent.transcriptPath));
+    }
+    for (const [dir, w] of this.projectWatchers) {
+      if (!stillNeeded.has(dir)) {
+        void w.close();
+        this.projectWatchers.delete(dir);
+      }
+    }
+  }
+
+  /**
    * Returns the top-level project directory containing `transcriptPath`, normalized
    * to forward slashes so it can serve as a stable Map key. Both top-level sessions
    * and their nested subagent files map to the SAME project dir, which means a
@@ -434,6 +457,10 @@ export class AgentService {
     // Normalize separators to match what runReconciler uses as Map keys (forward slashes).
     dir = dir.replace(/\\/g, '/');
     if (this.projectWatchers.has(dir)) return;
+    // Skip if we recently failed to watch this dir. Without backoff, the reconciler
+    // retries every 5s forever and spams the log for a permanently-inaccessible dir.
+    const lastFailed = this._watcherFailBackoff.get(dir) ?? 0;
+    if (Date.now() - lastFailed < AgentService.WATCHER_FAIL_BACKOFF_MS) return;
     try {
       const w = chokidar.watch(dir, { ignoreInitial: true, persistent: true });
       w.on('add', (p) => this.onJsonlAdd(p));
@@ -441,9 +468,9 @@ export class AgentService {
       w.on('unlink', (p) => this.onJsonlUnlink(p));
       w.on('error', (err) => logError(`projectWatcher(${dir})`, err));
       this.projectWatchers.set(dir, w);
+      this._watcherFailBackoff.delete(dir);
     } catch (err) {
-      // chokidar.watch can throw synchronously if the dir disappeared between desired-set
-      // computation and now (race on Windows). Skip and let the next reconciler tick retry.
+      this._watcherFailBackoff.set(dir, Date.now());
       logError(`addProjectWatcher(${dir})`, err);
     }
   }
@@ -595,6 +622,10 @@ export class AgentService {
     this._initializing = true;
     const now = Date.now();
     try {
+      // First-run safety: PROJECTS_ROOT may not exist yet on a fresh Claude install.
+      // mkdir -p is idempotent and cheap, and ensures the root watcher we set up below
+      // actually attaches to a real dir instead of silently no-op'ing.
+      await fsp.mkdir(PROJECTS_ROOT, { recursive: true }).catch(() => undefined);
       const allFiles = await findJsonlFiles(PROJECTS_ROOT);
       const STAT_BATCH = 50;
       const statResults: Array<{ path: string; stat: fs.Stats } | null> = [];
@@ -654,12 +685,19 @@ export class AgentService {
       persistent: true,
       depth: 0,
     });
-    const projectsRootNormalized = PROJECTS_ROOT.replace(/\\/g, '/');
+    // Compare normalized — chokidar emits forward slashes on Windows while
+    // PROJECTS_ROOT from path.join has backslashes; raw === would never match.
+    // Drive-letter case can also differ (USERPROFILE=c:\… vs chokidar's C:\…),
+    // so we lowercase on Windows where the filesystem is case-insensitive.
+    const isWin = process.platform === 'win32';
+    const normRoot = (p: string) => {
+      const s = p.replace(/\\/g, '/');
+      return isWin ? s.toLowerCase() : s;
+    };
+    const projectsRootNormalized = normRoot(PROJECTS_ROOT);
     this.watcher
       .on('addDir', (dir) => {
-        // Compare normalized — chokidar emits forward slashes on Windows while
-        // PROJECTS_ROOT from path.join has backslashes; raw === would never match.
-        if (dir.replace(/\\/g, '/') === projectsRootNormalized) return;
+        if (normRoot(dir) === projectsRootNormalized) return;
         void this.scanNewProjectDir(dir);
       })
       .on('error', (err) => logError('rootWatcher', err));
@@ -708,9 +746,11 @@ export class AgentService {
       this.watchedSubagentDirLastRead.clear();
       this._ready = false;
       if (this.reconcileTimer) { clearInterval(this.reconcileTimer); this.reconcileTimer = undefined; }
-      // Close root watcher and all per-project watchers.
+      // Await all watcher closes — if a new watcher for the same path is created by
+      // initialize() while the old close is still draining, chokidar can fire
+      // duplicated 'add' events or throw EBUSY/EPERM on Windows.
       if (this.watcher) { await this.watcher.close(); this.watcher = undefined; }
-      for (const w of this.projectWatchers.values()) { void w.close(); }
+      await Promise.all([...this.projectWatchers.values()].map(w => w.close().catch(() => undefined)));
       this.projectWatchers.clear();
       this._lastActiveStatScanMs = 0;
       await this.initialize();
@@ -1183,10 +1223,11 @@ export class AgentService {
           assignTaskDescriptions(this.agents); // buildTree without assignTaskDescriptions leaves taskDescription stale
           this._structureChanged = false;
           anyChanged = true;
-          // Close watchers for evicted dirs synchronously so a stray chokidar 'change'
-          // event for an evicted file can't re-add the session in the window before
-          // the next reconciler tick fires.
-          this.runReconciler();
+          // Close watchers for dirs whose sessions all went done, so a stray chokidar
+          // event can't re-add an evicted session in the window before the next
+          // reconciler tick. Targeted close (vs full runReconciler) avoids triggering
+          // a stat-scan from inside the scheduleEmit callback.
+          this.closeOrphanedProjectWatchers();
         }
       }
 
