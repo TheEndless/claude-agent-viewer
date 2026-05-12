@@ -60,6 +60,9 @@ export class AgentService {
   private reconcileTimer?: NodeJS.Timeout;
   // Last time we ran the full stat-all-agents pass that detects resumed-done sessions.
   private _lastActiveStatScanMs = 0;
+  // Set while scanKnownAgentsForChanges is running so the next tick doesn't fire a
+  // second concurrent scan (slow stats under load could otherwise pile up).
+  private _scanInFlight = false;
   private debounceTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
   private discoveryTimer?: NodeJS.Timeout;
@@ -290,10 +293,13 @@ export class AgentService {
   private runReconciler(): void {
     // Compute desired set: dirs of all non-done parent sessions.
     const desired = new Set<string>();
+    // Include any non-done agent — both top-level and subagents — keyed by their
+    // top-level project dir. A subagent contributes the SAME project dir as its
+    // parent, so the Set dedupes. This ensures a still-running subagent keeps its
+    // watcher alive even when the parent has transitioned to done.
     for (const agent of this.agents.values()) {
       if (agent.state === 'done') continue;
-      if (agent.parentSessionId) continue; // subagents covered by their parent's recursive dir watch
-      desired.add(path.dirname(agent.transcriptPath));
+      desired.add(this.projectDirOf(agent.transcriptPath));
     }
 
     let added = 0;
@@ -329,28 +335,53 @@ export class AgentService {
    * resumed in a directory we'd stopped watching.
    */
   private async scanKnownAgentsForChanges(): Promise<void> {
-    // Skip subagents: their parent's recursive watcher covers them, so we'd be
-    // double-stat'ing files we'd catch via chokidar anyway. Only top-level sessions
-    // benefit from this safety-net stat (active ones in case chokidar dropped events,
-    // done ones in case they were resumed without a chokidar event firing).
-    const t0 = Date.now();
-    const candidates = [...this.agents.values()].filter(a => !a.parentSessionId);
-    const BATCH = 20;
-    let stale = 0;
-    for (let i = 0; i < candidates.length; i += BATCH) {
-      await Promise.all(candidates.slice(i, i + BATCH).map(async agent => {
-        try {
-          const stat = await tfs.stat(agent.transcriptPath);
-          if (stat.mtimeMs > agent.mtimeMs) {
-            stale++;
-            await this.processFile(agent.transcriptPath, stat, { bypassBatch: true });
-          }
-        } catch { /* file gone — drop handler will clean up via watcher unlink */ }
-      }));
+    if (this._scanInFlight) return; // prior scan still running; skip this tick
+    this._scanInFlight = true;
+    try {
+      // Stat top-level sessions to catch resumed-done sessions and missed chokidar
+      // events. Subagents are normally covered by their parent's recursive watcher,
+      // but if a subagent outlives its parent's running window the parent dir watch
+      // can still be active (runReconciler keys off non-done subagents too), so the
+      // chokidar path covers them. Stat'ing every subagent every cycle is wasted I/O.
+      const t0 = Date.now();
+      const candidates = [...this.agents.values()].filter(a => !a.parentSessionId);
+      const BATCH = 20;
+      let stale = 0;
+      for (let i = 0; i < candidates.length; i += BATCH) {
+        await Promise.all(candidates.slice(i, i + BATCH).map(async agent => {
+          try {
+            const stat = await tfs.stat(agent.transcriptPath);
+            if (stat.mtimeMs > agent.mtimeMs) {
+              stale++;
+              await this.processFile(agent.transcriptPath, stat, { bypassBatch: true });
+            }
+          } catch { /* file gone — drop handler will clean up via watcher unlink */ }
+        }));
+      }
+      if (stale > 0) {
+        logInfo('scanKnownAgents', `${stale}/${candidates.length} sessions had newer mtime than known (${Date.now() - t0}ms)`);
+      }
+    } finally {
+      this._scanInFlight = false;
     }
-    if (stale > 0) {
-      logInfo('scanKnownAgents', `${stale}/${candidates.length} sessions had newer mtime than known (${Date.now() - t0}ms)`);
-    }
+  }
+
+  /**
+   * Returns the top-level project directory containing `transcriptPath`, normalized
+   * to forward slashes so it can serve as a stable Map key. Both top-level sessions
+   * and their nested subagent files map to the SAME project dir, which means a
+   * subagent contributes the same key as its parent and the Set dedupes naturally.
+   * Without normalization, Windows paths from path.join (backslashes) would not
+   * match chokidar-emitted paths (forward slashes), causing the reconciler to
+   * close-and-reopen watchers every tick.
+   */
+  private projectDirOf(transcriptPath: string): string {
+    const root = PROJECTS_ROOT.replace(/\\/g, '/');
+    const normalized = transcriptPath.replace(/\\/g, '/');
+    if (!normalized.startsWith(root + '/')) return path.dirname(normalized);
+    const after = normalized.slice(root.length + 1);
+    const firstSlash = after.indexOf('/');
+    return firstSlash === -1 ? path.dirname(normalized) : root + '/' + after.slice(0, firstSlash);
   }
 
   /**
@@ -400,6 +431,8 @@ export class AgentService {
   }
 
   private addProjectWatcher(dir: string): void {
+    // Normalize separators to match what runReconciler uses as Map keys (forward slashes).
+    dir = dir.replace(/\\/g, '/');
     if (this.projectWatchers.has(dir)) return;
     const w = chokidar.watch(dir, { ignoreInitial: true, persistent: true });
     w.on('add', (p) => this.onJsonlAdd(p));
@@ -636,7 +669,7 @@ export class AgentService {
       this.addProjectWatcher(dir);
       const files = await tfs.readdir(dir);
       for (const f of files) {
-        if (f.endsWith('.jsonl')) void this.processFile(path.join(dir, f));
+        if (f.endsWith('.jsonl')) void this.processFile(path.join(dir, f).replace(/\\/g, '/'));
       }
     } catch (err) { logError(`scanNewProjectDir(${dir})`, err); }
   }
