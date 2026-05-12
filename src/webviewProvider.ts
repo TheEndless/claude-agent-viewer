@@ -1147,7 +1147,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       if (loadMoreBtn) {
         if (remainingDone > 0) {
           loadMoreBtn.style.display = '';
-          loadMoreBtn.textContent = 'Load ' + Math.min(remainingDone, 100) + ' more ended sessions (' + remainingDone + ' remaining)';
+          loadMoreBtn.textContent = 'Show ' + Math.min(remainingDone, 100) + ' more in Archived (' + remainingDone + ' still hidden)';
         } else {
           loadMoreBtn.style.display = 'none';
         }
@@ -1250,7 +1250,15 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     if (loadMoreBtn) {
-      loadMoreBtn.addEventListener('click', () => vscode.postMessage({ command: 'loadMoreDone' }));
+      loadMoreBtn.addEventListener('click', () => {
+        // Auto-expand the Archived section so the user sees where the newly-loaded
+        // sessions ended up. Most loaded sessions go into archived (their project
+        // has no active sessions left), so opening this is the right default.
+        openSections['archived'] = true;
+        const section = root.querySelector('.archived-section');
+        if (section) section.classList.add('open');
+        vscode.postMessage({ command: 'loadMoreDone' });
+      });
     }
 
     window.addEventListener('message', (event) => {
