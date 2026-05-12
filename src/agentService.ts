@@ -233,6 +233,10 @@ export class AgentService {
         logInfo('throttle', `cleared (samples: ${samples.join(',')}ms) — resuming immediate processing`);
         this.updateBatchTimerState();
         void this.drainPendingPaths('throttle-clear');
+        // Force a fresh emit so the webview state catches up after the throttled period.
+        // Chokidar may have missed events during the saturation, so we can't rely on
+        // change events alone to wake up the UI.
+        this._onDidChange.fire(this.getAgents());
       }
     } else {
       // Detect on either sustained moderate lag OR a single severe spike.
@@ -293,6 +297,11 @@ export class AgentService {
     this._lastTickMs = now;
     this.scheduleEmit('tick');
     void this.scanPendingSubagentDirs();
+    // Heartbeat fire every 6 ticks (~30s). Ensures the webview receives a refresh
+    // even when chokidar has gone silent (e.g. post-resume buffer overflow) — this
+    // is what triggers the zombie-webview detection and updateTranscriptPanels for
+    // transcript files we may have missed updates on.
+    if (this._tickCount % 6 === 0) this._onDidChange.fire(this.getAgents());
     // Reclaim slots from any processFile operation stuck >60s. The OS operation
     // continues on its libuv thread, but our concurrency slot is freed so new work
     // can run. Without this, a few hung opens permanently consume our 2 slots.
