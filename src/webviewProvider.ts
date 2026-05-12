@@ -533,6 +533,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     .proj-badge.running { background: rgba(63,185,80,.12); border: 1px solid rgba(63,185,80,.2); color: #3fb950; }
     .proj-badge.idle    { background: rgba(210,153,34,.1);  border: 1px solid rgba(210,153,34,.2); color: #d29922; }
     .proj-badge.done    { background: rgba(110,118,129,.1); border: 1px solid rgba(110,118,129,.2); color: #6e7681; }
+    @keyframes badge-flash {
+      0%   { background: rgba(79,193,255,.5); border-color: rgba(79,193,255,.8); color: #fff; }
+      100% { /* settles back to whatever the state class defines */ }
+    }
+    .proj-badge.flash { animation: badge-flash 1.6s ease-out; }
     .proj-body { display: none; }
     .proj-group.open .proj-body { display: block; }
     .proj-group.inactive { opacity: 0.75; }
@@ -652,6 +657,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     const openSections = {};
     const projGroupEls = new Map();
+    // Tracks last-seen agent count per group so we can flash the badge when it goes up
+    // (e.g. user clicks "Show more in Archived"). Without this, count changes among
+    // many similar-looking rows are easy to miss.
+    const lastGroupCounts = new Map();
     const cardEls = new Map();
     let archivedEl = null;
     let lastAgents = null;
@@ -952,6 +961,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
           }
           el.remove();
           projGroupEls.delete(key);
+          lastGroupCounts.delete(key);
         }
       }
 
@@ -1004,9 +1014,21 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         } else {
           const badgeEl = groupEl.querySelector('.proj-badge');
           const badge = groupBadge(group.agents);
-          if (badgeEl) { badgeEl.className = 'proj-badge '+badge.cls; badgeEl.textContent = badge.text; }
+          if (badgeEl) {
+            const prev = lastGroupCounts.get(group.key) || 0;
+            const grew = group.agents.length > prev;
+            badgeEl.className = 'proj-badge '+badge.cls;
+            badgeEl.textContent = badge.text;
+            if (grew) {
+              // Restart animation by removing + re-adding the class on next frame.
+              badgeEl.classList.remove('flash');
+              void badgeEl.offsetWidth; // force reflow so the next add re-triggers the animation
+              badgeEl.classList.add('flash');
+            }
+          }
           groupEl.classList.toggle('inactive', !isActive);
         }
+        lastGroupCounts.set(group.key, group.agents.length);
 
         if (isActive) {
           root.appendChild(groupEl);
