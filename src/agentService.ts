@@ -285,7 +285,10 @@ export class AgentService {
     const paths = [...this._pendingPaths];
     this._pendingPaths.clear();
     for (const p of paths) await this.processFile(p, undefined, { bypassBatch: true });
-    logInfo('drain', `${reason}: processed ${paths.length} pending paths in ${Date.now() - t0}ms`);
+    const elapsed = Date.now() - t0;
+    if (paths.length > 10 || elapsed > 500 || reason !== 'batch') {
+      logInfo('drain', `${reason}: processed ${paths.length} pending paths in ${elapsed}ms`);
+    }
   }
 
   /**
@@ -360,7 +363,10 @@ export class AgentService {
           } catch { /* file gone — drop handler will clean up via watcher unlink */ }
         }));
       }
-      logInfo('scanKnownAgents', `${stale}/${candidates.length} stale (${Date.now() - t0}ms)`);
+      const elapsed = Date.now() - t0;
+      if (stale > 0 || elapsed > 1_000) {
+        logInfo('scanKnownAgents', `${stale}/${candidates.length} stale (${elapsed}ms)`);
+      }
     } finally {
       this._scanInFlight = false;
     }
@@ -560,7 +566,11 @@ export class AgentService {
       const ourBreakdown = Object.entries(ourActive).filter(([, n]) => n > 0).map(([k, n]) => `${k}=${n}`).join(',') || 'none';
       const externalRequests = Math.max(0, activeRequests - ourActiveTotal);
       const tag = total > 50 ? 'SLOW' : 'ok';
-      logInfo('ioProbe', `[${tag}] open=${tOpen}ms read=${tRead}ms total=${total}ms handles=${activeHandles} requests=${activeRequests} ours=${ourActiveTotal} (${ourBreakdown}) external=${externalRequests}`);
+      // Suppress healthy probes — the heartbeat already proves we're alive. Log when
+      // slow, when we have outstanding fs work, or when libuv has unexpected externals.
+      if (tag === 'SLOW' || ourActiveTotal > 0 || externalRequests > 20) {
+        logInfo('ioProbe', `[${tag}] open=${tOpen}ms read=${tRead}ms total=${total}ms handles=${activeHandles} requests=${activeRequests} ours=${ourActiveTotal} (${ourBreakdown}) external=${externalRequests}`);
+      }
       // Use the probe as an additional throttling signal — it catches libuv pool
       // saturation earlier and more reliably than waiting for 3 consecutive tick
       // lags. >500ms on a 4KB read of our own source file means I/O threads are
@@ -797,7 +807,9 @@ export class AgentService {
         const sid = sessionIdFromPath(f);
         return !this.agents.has(sid) && !this.evictedSessions.has(sid);
       });
-      logInfo('discoverNewFiles', `scanned ${newFiles.length} files in ${scanMs}ms — ${missing.length} new`);
+      if (missing.length > 0 || scanMs > 1_000) {
+        logInfo('discoverNewFiles', `scanned ${newFiles.length} files in ${scanMs}ms — ${missing.length} new`);
+      }
       if (missing.length > 0) {
         await Promise.all(missing.map(f => this.processFile(f)));
         this.scheduleEmit();
@@ -1281,7 +1293,9 @@ export class AgentService {
         }
         let subCount = 0;
         for (const a of this.agents.values()) { if (a.parentSessionId) subCount++; }
-        logInfo('emit', `agents=${this.agents.size} subagents=${subCount} treeMs=${treeMs}ms reason=${reason}`);
+        if (treeMs > 50 || reason !== 'change') {
+          logInfo('emit', `agents=${this.agents.size} subagents=${subCount} treeMs=${treeMs}ms reason=${reason}`);
+        }
         this._onDidChange.fire(this.getAgents());
       }
       const emitMs = Date.now() - now;

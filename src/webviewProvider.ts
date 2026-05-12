@@ -136,7 +136,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const t0 = Date.now();
     const payload = agentsToSend.map(serialize);
     const serializeMs = Date.now() - t0;
-    logInfo('postAgents', `sending=${payload.length}/${allAgents.length} doneHidden=${excludedDoneIds.size} serializeMs=${serializeMs}ms`);
+    if (serializeMs > 100) {
+      logInfo('postAgents', `sending=${payload.length}/${allAgents.length} doneHidden=${excludedDoneIds.size} serializeMs=${serializeMs}ms`);
+    }
     const delivered = await this._view?.webview.postMessage({ command: 'render', agents: payload, ready, now: Date.now(), doneParentCount, remainingDone });
     if (delivered) {
       if (this._consecutiveDeliveryFailures > 0) {
