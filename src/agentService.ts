@@ -1509,8 +1509,12 @@ function resolveCwd(filePath: string, events: RawEvent[]): string {
   }
   // Fallback: decode dir name. Encoding is lossy (dashes → slashes), so this
   // is a best effort only when events lack a cwd field.
+  // Unix:    -home-user-project  → /home/user/project  (leading '-' = '/')
+  // Windows: C--Users-skean-Tmp  → C:/Users/skean/Tmp  ('--' = ':/')
   const dir = path.basename(path.dirname(filePath));
-  const raw = dir.startsWith('-') ? dir.replace(/-/g, '/') : dir;
+  const raw = dir.startsWith('-')
+    ? dir.replace(/-/g, '/')
+    : dir.replace('--', ':/').replace(/-/g, '/');
   return normalizeCwd(raw);
 }
 
