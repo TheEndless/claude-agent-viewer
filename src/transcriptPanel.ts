@@ -15,8 +15,8 @@ import { parseTranscriptWithState, parseTranscriptDelta, ParseState } from './tr
 import { logError } from './logger';
 import { readFileSlice, tfs } from './fileUtils';
 
-const md     = new MarkdownIt({ html: false, linkify: true, typographer: true });
-const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: true, breaks: true });
+const md     = new MarkdownIt({ html: false, linkify: true, typographer: false });
+const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: false, breaks: true });
 
 /** Derives the webview panel tab title from the session's best available name. */
 function transcriptTabTitle(agent: Agent): string {
@@ -878,6 +878,10 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .tb-match-count { font-size: 10px; color: var(--vscode-descriptionForeground); white-space: nowrap; min-width: 3em; text-align: center; }
 .tb-jump { display: none; margin-left: auto; }
 .tb-jump.visible { display: inline-block; }
+.ctx-menu { position: fixed; z-index: 9999; background: var(--vscode-menu-background, #1e1e1e); border: 1px solid var(--vscode-menu-border, #454545); border-radius: 4px; padding: 4px 0; box-shadow: 0 4px 12px rgba(0,0,0,0.4); display: none; min-width: 160px; }
+.ctx-menu.visible { display: block; }
+.ctx-menu-item { padding: 5px 12px; font-size: 12px; cursor: pointer; color: var(--vscode-menu-foreground, #ccc); white-space: nowrap; }
+.ctx-menu-item:hover { background: var(--vscode-menu-selectionBackground, #094771); color: var(--vscode-menu-selectionForeground, #fff); }
 .search-highlight { background: rgba(255,200,0,0.35); border-radius: 2px; color: inherit; }
 .search-highlight-active { background: rgba(255,160,0,0.75); color: #000; }
 .copy-btn {
@@ -940,6 +944,10 @@ body { display: flex; flex-direction: column; }
     <polyline points="11,4 15,8 11,12" stroke-width="1.7"/>
   </symbol>
 </svg>
+
+<div class="ctx-menu" id="ctx-menu">
+  <div class="ctx-menu-item" id="ctx-format-code">Format as code</div>
+</div>
 
 <div class="lightbox" id="lightbox">
   <button class="lb-nav lb-prev" id="lb-prev" title="Previous image">&#8249;</button>
@@ -1275,6 +1283,27 @@ ${turnsHtml}
       e.preventDefault();
       if (searchInput) { searchInput.classList.add('visible'); searchInput.focus(); }
     }
+  });
+
+  // Context menu — "Format as code"
+  const ctxMenu = document.getElementById('ctx-menu');
+  let ctxHideTimer;
+  function hideCtxMenu() { ctxMenu.classList.remove('visible'); }
+  document.addEventListener('contextmenu', e => {
+    if (!scroll.contains(e.target)) return;
+    e.preventDefault();
+    ctxMenu.style.left = e.clientX + 'px';
+    ctxMenu.style.top  = e.clientY + 'px';
+    ctxMenu.classList.add('visible');
+  });
+  document.addEventListener('click', hideCtxMenu);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') hideCtxMenu(); });
+  document.getElementById('ctx-format-code')?.addEventListener('click', () => {
+    hideCtxMenu();
+    const sel = window.getSelection()?.toString() || '';
+    const text = sel.trim() || scroll.innerText.trim();
+    const fence = '\x60\x60\x60';
+    navigator.clipboard.writeText(fence + '\n' + text + '\n' + fence).catch(() => {});
   });
 
   const vscode = acquireVsCodeApi();

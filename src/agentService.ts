@@ -1456,7 +1456,7 @@ async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
     const text = await readFileSlice(filePath, 0, TITLE_HEAD_BYTES);
     for (const line of text.split('\n')) {
       if (!line) continue;
-      if (!/"(custom-title|ai-title|last-prompt|user)"/.test(line)) continue;
+      if (!/"(custom-title|ai-title|last-prompt|user|queue-operation)"/.test(line)) continue;
       try {
         const evt = JSON.parse(line) as RawEvent;
         const t = typeof evt.type === 'string' ? evt.type : '';
@@ -1469,9 +1469,12 @@ async function scanFullFileForTitles(filePath: string): Promise<TitleCache> {
         } else if (t === 'user' && out.firstUserPrompt == null) {
           const userText = extractUserText(evt.message?.content);
           if (userText) out.firstUserPrompt = truncate(userText, 200);
+        } else if (t === 'queue-operation' && evt.operation === 'enqueue' && out.firstUserPrompt == null) {
+          const qText = typeof evt.content === 'string' ? evt.content.trim() : '';
+          if (qText) out.firstUserPrompt = truncate(qText, 200);
         }
       } catch { /* skip malformed line */ }
-      if (out.customTitle && out.aiTitle && out.lastPrompt && out.firstUserPrompt) break;
+      if (out.customTitle && out.aiTitle && out.lastPrompt && out.firstUserPrompt) break; // all fields found
     }
   } catch (err) { logError(`scanFullFileForTitles(${filePath})`, err); }
   return out;
@@ -1655,6 +1658,7 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
   const trail: ToolCallSummary[] = [];
   const files: string[] = [];
   let latestUserPrompt: string | null = null;
+  let queuePrompt: string | null = null;
   let lastPrompt: string | null = null;
   let customTitle: string | null = null;
   let aiTitle: string | null = null;
@@ -1694,6 +1698,10 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
       }
     }
 
+    if (type === 'queue-operation' && evt.operation === 'enqueue' && typeof evt.content === 'string' && evt.content.trim()) {
+      if (!queuePrompt) queuePrompt = truncate(evt.content.trim(), 200);
+    }
+
     if (type === 'user') {
       const text = extractUserText(content);
       if (text) latestUserPrompt = truncate(text, 200);
@@ -1718,7 +1726,7 @@ function extractDetails(events: RawEvent[]): { details: AgentDetails; agentCallD
     details: {
       recentToolCalls: trail.slice(-MAX_TRAIL).reverse(),
       recentFiles: dedupeLastN(files, MAX_FILES),
-      latestUserPrompt,
+      latestUserPrompt: latestUserPrompt ?? queuePrompt,
       lastPrompt,
       customTitle,
       aiTitle,
