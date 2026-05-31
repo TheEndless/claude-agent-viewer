@@ -15,8 +15,8 @@ import { parseTranscriptWithState, parseTranscriptDelta, ParseState } from './tr
 import { logError } from './logger';
 import { readFileSlice, tfs } from './fileUtils';
 
-const md     = new MarkdownIt({ html: false, linkify: true, typographer: true });
-const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: true, breaks: true });
+const md     = new MarkdownIt({ html: false, linkify: true, typographer: false });
+const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: false, breaks: true });
 
 /** Derives the webview panel tab title from the session's best available name. */
 function transcriptTabTitle(agent: Agent): string {
@@ -1293,6 +1293,7 @@ ${turnsHtml}
   const ctxMenu = document.getElementById('ctx-menu');
   let _ctxSel = '';
   let _ctxRange = null;
+  let _ctxTarget = null;
   function hideCtxMenu() { ctxMenu.classList.remove('visible'); }
   document.addEventListener('contextmenu', e => {
     if (!scroll.contains(e.target)) return;
@@ -1300,11 +1301,10 @@ ${turnsHtml}
     const s = window.getSelection();
     _ctxSel = s && !s.isCollapsed ? s.toString().trim() : '';
     _ctxRange = s && s.rangeCount > 0 && !s.isCollapsed ? s.getRangeAt(0).cloneRange() : null;
+    _ctxTarget = e.target;
     const copyItem = document.getElementById('ctx-copy');
-    const fmtItem = document.getElementById('ctx-format-code');
     const sep = ctxMenu.querySelector('.ctx-menu-sep');
     if (copyItem) copyItem.style.opacity = _ctxSel ? '1' : '0.4';
-    if (fmtItem) fmtItem.style.opacity = _ctxSel ? '1' : '0.4';
     if (sep) sep.style.display = _ctxSel ? '' : 'none';
     ctxMenu.style.left = e.clientX + 'px';
     ctxMenu.style.top  = e.clientY + 'px';
@@ -1318,14 +1318,29 @@ ${turnsHtml}
     hideCtxMenu();
     if (item.id === 'ctx-copy') {
       if (_ctxSel) vscode.postMessage({ command: 'clipboardWrite', text: _ctxSel });
-    } else if (item.id === 'ctx-format-code' && _ctxRange) {
-      const text = _ctxRange.toString();
-      _ctxRange.deleteContents();
+    } else if (item.id === 'ctx-format-code') {
+      const fmtCode = raw => {
+        try { return { html: jsonHlTs(JSON.stringify(JSON.parse(raw), null, 2)), isJson: true }; } catch {}
+        const esc2 = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        return { html: esc2(raw), isJson: false };
+      };
       const pre = document.createElement('pre');
-      pre.textContent = text;
       pre.style.cssText = 'background:var(--vscode-textCodeBlock-background,#1e1e1e);color:inherit;padding:8px 12px;border-radius:3px;overflow:auto;font-family:var(--vscode-editor-font-family,monospace);font-size:12px;margin:4px 0;white-space:pre-wrap;';
-      _ctxRange.insertNode(pre);
-      _ctxRange = null;
+      if (_ctxRange) {
+        const { html } = fmtCode(_ctxRange.toString());
+        _ctxRange.deleteContents();
+        pre.innerHTML = html;
+        _ctxRange.insertNode(pre);
+        _ctxRange = null;
+      } else if (_ctxTarget) {
+        const body = _ctxTarget.closest && (_ctxTarget.closest('.bubble-content') || _ctxTarget.closest('.entry-body-content') || _ctxTarget.closest('.turn-inner'));
+        if (body) {
+          const { html } = fmtCode(body.innerText);
+          body.innerHTML = '';
+          pre.innerHTML = html;
+          body.appendChild(pre);
+        }
+      }
     }
   });
 
