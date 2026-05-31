@@ -1302,7 +1302,7 @@ ${turnsHtml}
     hideCtxMenu();
     const sel = window.getSelection()?.toString() || '';
     const text = sel.trim() || scroll.innerText.trim();
-    const fence = '\x60\x60\x60';
+    const fence = String.fromCharCode(96,96,96);
     navigator.clipboard.writeText(fence + '\n' + text + '\n' + fence).catch(() => {});
   });
 
