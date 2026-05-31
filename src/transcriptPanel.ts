@@ -15,8 +15,8 @@ import { parseTranscriptWithState, parseTranscriptDelta, ParseState } from './tr
 import { logError } from './logger';
 import { readFileSlice, tfs } from './fileUtils';
 
-const md     = new MarkdownIt({ html: false, linkify: true, typographer: false });
-const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: false, breaks: true });
+const md     = new MarkdownIt({ html: false, linkify: true, typographer: true });
+const mdUser = new MarkdownIt({ html: false, linkify: true, typographer: true, breaks: true });
 
 /** Derives the webview panel tab title from the session's best available name. */
 function transcriptTabTitle(agent: Agent): string {
@@ -1285,9 +1285,7 @@ ${turnsHtml}
     }
   });
 
-  // Context menu — "Format as code"
   const ctxMenu = document.getElementById('ctx-menu');
-  let ctxHideTimer;
   function hideCtxMenu() { ctxMenu.classList.remove('visible'); }
   document.addEventListener('contextmenu', e => {
     if (!scroll.contains(e.target)) return;
@@ -1297,13 +1295,12 @@ ${turnsHtml}
     ctxMenu.classList.add('visible');
   });
   document.addEventListener('click', hideCtxMenu);
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') hideCtxMenu(); });
   document.getElementById('ctx-format-code')?.addEventListener('click', () => {
     hideCtxMenu();
     const sel = window.getSelection()?.toString() || '';
     const text = sel.trim() || scroll.innerText.trim();
     const fence = String.fromCharCode(96,96,96);
-    navigator.clipboard.writeText(fence + '\n' + text + '\n' + fence).catch(() => {});
+    navigator.clipboard.writeText(fence + '\\n' + text + '\\n' + fence).catch(() => {});
   });
 
   const vscode = acquireVsCodeApi();
