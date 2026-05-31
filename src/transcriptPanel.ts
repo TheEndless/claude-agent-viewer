@@ -113,6 +113,8 @@ export function openTranscriptPreview(agent: Agent): void {
       await handleExportMarkdown(agent, panel);
     } else if (msg.command === 'openJsonl') {
       await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(agent.transcriptPath));
+    } else if (msg.command === 'clipboardWrite' && typeof msg.text === 'string') {
+      await vscode.env.clipboard.writeText(msg.text);
     }
   });
   renderedCount.delete(agent.sessionId);
@@ -882,6 +884,7 @@ html, body { height: 100vh; overflow: hidden; background: var(--vscode-editor-ba
 .ctx-menu.visible { display: block; }
 .ctx-menu-item { padding: 5px 12px; font-size: 12px; cursor: pointer; color: var(--vscode-menu-foreground, #ccc); white-space: nowrap; }
 .ctx-menu-item:hover { background: var(--vscode-menu-selectionBackground, #094771); color: var(--vscode-menu-selectionForeground, #fff); }
+.ctx-menu-sep { height: 1px; background: var(--vscode-menu-separatorBackground, #454545); margin: 4px 0; }
 .search-highlight { background: rgba(255,200,0,0.35); border-radius: 2px; color: inherit; }
 .search-highlight-active { background: rgba(255,160,0,0.75); color: #000; }
 .copy-btn {
@@ -946,6 +949,8 @@ body { display: flex; flex-direction: column; }
 </svg>
 
 <div class="ctx-menu" id="ctx-menu">
+  <div class="ctx-menu-item" id="ctx-copy">Copy</div>
+  <div class="ctx-menu-sep"></div>
   <div class="ctx-menu-item" id="ctx-format-code">Format as code</div>
 </div>
 
@@ -1286,21 +1291,42 @@ ${turnsHtml}
   });
 
   const ctxMenu = document.getElementById('ctx-menu');
+  let _ctxSel = '';
+  let _ctxRange = null;
   function hideCtxMenu() { ctxMenu.classList.remove('visible'); }
   document.addEventListener('contextmenu', e => {
     if (!scroll.contains(e.target)) return;
     e.preventDefault();
+    const s = window.getSelection();
+    _ctxSel = s && !s.isCollapsed ? s.toString().trim() : '';
+    _ctxRange = s && s.rangeCount > 0 && !s.isCollapsed ? s.getRangeAt(0).cloneRange() : null;
+    const copyItem = document.getElementById('ctx-copy');
+    const fmtItem = document.getElementById('ctx-format-code');
+    const sep = ctxMenu.querySelector('.ctx-menu-sep');
+    if (copyItem) copyItem.style.opacity = _ctxSel ? '1' : '0.4';
+    if (fmtItem) fmtItem.style.opacity = _ctxSel ? '1' : '0.4';
+    if (sep) sep.style.display = _ctxSel ? '' : 'none';
     ctxMenu.style.left = e.clientX + 'px';
     ctxMenu.style.top  = e.clientY + 'px';
     ctxMenu.classList.add('visible');
   });
   document.addEventListener('click', hideCtxMenu);
-  document.getElementById('ctx-format-code')?.addEventListener('click', () => {
+  ctxMenu.addEventListener('click', e => {
+    const item = e.target.closest && e.target.closest('.ctx-menu-item');
+    if (!item) return;
+    e.stopPropagation();
     hideCtxMenu();
-    const sel = window.getSelection()?.toString() || '';
-    const text = sel.trim() || scroll.innerText.trim();
-    const fence = String.fromCharCode(96,96,96);
-    navigator.clipboard.writeText(fence + '\\n' + text + '\\n' + fence).catch(() => {});
+    if (item.id === 'ctx-copy') {
+      if (_ctxSel) vscode.postMessage({ command: 'clipboardWrite', text: _ctxSel });
+    } else if (item.id === 'ctx-format-code' && _ctxRange) {
+      const text = _ctxRange.toString();
+      _ctxRange.deleteContents();
+      const pre = document.createElement('pre');
+      pre.textContent = text;
+      pre.style.cssText = 'background:var(--vscode-textCodeBlock-background,#1e1e1e);color:inherit;padding:8px 12px;border-radius:3px;overflow:auto;font-family:var(--vscode-editor-font-family,monospace);font-size:12px;margin:4px 0;white-space:pre-wrap;';
+      _ctxRange.insertNode(pre);
+      _ctxRange = null;
+    }
   });
 
   const vscode = acquireVsCodeApi();
